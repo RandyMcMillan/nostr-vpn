@@ -83,9 +83,9 @@ Run a real cross-container signaling check (relay + 2 nodes):
 What it validates:
 
 - Relay container accepts Nostr websocket connections
-- Bob container listens on a network
-- Alice container announces on the same network
-- Bob receives Alice's announcement (asserted by script)
+- Alice and Bob containers exchange announcements over Nostr
+- Both containers bring up boringtun interfaces (`tunnel-up`)
+- Tunnel data plane works (`ping` over `10.44.0.1 <-> 10.44.0.2`)
 
 ## Notes
 

@@ -2708,8 +2708,11 @@ name = "nostr-vpn-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "boringtun",
  "clap",
  "dirs",
+ "hex",
  "nostr-vpn-core",
  "serde_json",
  "tokio",

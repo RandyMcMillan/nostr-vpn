@@ -1,8 +1,17 @@
+use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use boringtun::device::{DeviceConfig, DeviceHandle};
+use clap::{Args, Parser, Subcommand};
+use hex::encode as encode_hex;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, derive_network_id_from_participants, normalize_nostr_pubkey,
 };
@@ -76,6 +85,28 @@ enum Command {
         #[arg(long = "peer")]
         peers: Vec<String>,
     },
+    /// Bring up a boringtun interface (Linux) for e2e testing.
+    TunnelUp(TunnelUpArgs),
+}
+
+#[derive(Debug, Args)]
+struct TunnelUpArgs {
+    #[arg(long)]
+    iface: String,
+    #[arg(long)]
+    private_key: String,
+    #[arg(long)]
+    listen_port: u16,
+    #[arg(long)]
+    address: String,
+    #[arg(long)]
+    peer_public_key: String,
+    #[arg(long)]
+    peer_endpoint: String,
+    #[arg(long)]
+    peer_allowed_ip: String,
+    #[arg(long, default_value_t = 5)]
+    keepalive_secs: u16,
 }
 
 #[tokio::main]
@@ -211,6 +242,7 @@ async fn main() -> Result<()> {
 
             print!("{}", render_wireguard_config(&interface, &parsed_peers));
         }
+        Command::TunnelUp(args) => tunnel_up(&args)?,
     }
 
     Ok(())
@@ -317,4 +349,144 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+fn tunnel_up(args: &TunnelUpArgs) -> Result<()> {
+    if cfg!(not(target_os = "linux")) {
+        return Err(anyhow!("tunnel-up is currently supported on Linux only"));
+    }
+
+    if args.iface.trim().is_empty() {
+        return Err(anyhow!("--iface must not be empty"));
+    }
+
+    let private_key_hex = key_b64_to_hex(&args.private_key)?;
+    let peer_public_key_hex = key_b64_to_hex(&args.peer_public_key)?;
+
+    // Keep handle alive for process lifetime; dropping tears down the device.
+    let _handle = DeviceHandle::new(
+        &args.iface,
+        DeviceConfig {
+            n_threads: 2,
+            use_connected_socket: true,
+            #[cfg(target_os = "linux")]
+            use_multi_queue: false,
+            #[cfg(target_os = "linux")]
+            uapi_fd: -1,
+        },
+    )
+    .with_context(|| format!("failed to create boringtun interface {}", args.iface))?;
+
+    let uapi_socket = format!("/var/run/wireguard/{}.sock", args.iface);
+    wait_for_socket(&uapi_socket)?;
+
+    wg_set(
+        &uapi_socket,
+        &format!(
+            "private_key={private_key_hex}\nlisten_port={}",
+            args.listen_port
+        ),
+    )?;
+    wg_set(
+        &uapi_socket,
+        &format!(
+            "public_key={peer_public_key_hex}\nendpoint={}\nreplace_allowed_ips=true\nallowed_ip={}\npersistent_keepalive_interval={}",
+            args.peer_endpoint, args.peer_allowed_ip, args.keepalive_secs
+        ),
+    )?;
+
+    run_checked(
+        ProcessCommand::new("ip")
+            .arg("address")
+            .arg("add")
+            .arg(&args.address)
+            .arg("dev")
+            .arg(&args.iface),
+    )?;
+    run_checked(
+        ProcessCommand::new("ip")
+            .arg("link")
+            .arg("set")
+            .arg("mtu")
+            .arg("1380")
+            .arg("up")
+            .arg("dev")
+            .arg(&args.iface),
+    )?;
+    run_checked(
+        ProcessCommand::new("ip")
+            .arg("route")
+            .arg("replace")
+            .arg(&args.peer_allowed_ip)
+            .arg("dev")
+            .arg(&args.iface),
+    )?;
+
+    println!(
+        "boringtun interface {} up: {}, peer {} via {}",
+        args.iface, args.address, args.peer_allowed_ip, args.peer_endpoint
+    );
+
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+fn key_b64_to_hex(value: &str) -> Result<String> {
+    let bytes = STANDARD
+        .decode(value)
+        .with_context(|| "invalid base64 key encoding")?;
+    if bytes.len() != 32 {
+        return Err(anyhow!("expected 32-byte key material"));
+    }
+    Ok(encode_hex(bytes))
+}
+
+fn wait_for_socket(path: &str) -> Result<()> {
+    for _ in 0..50 {
+        if fs::metadata(path).is_ok() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(anyhow!("timed out waiting for uapi socket at {path}"))
+}
+
+fn wg_set(socket_path: &str, body: &str) -> Result<()> {
+    let mut socket =
+        UnixStream::connect(socket_path).with_context(|| format!("connect {socket_path}"))?;
+    write!(socket, "set=1\n{body}\n\n").context("failed to send uapi set")?;
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .context("failed to close uapi write half")?;
+
+    let mut response = String::new();
+    socket
+        .read_to_string(&mut response)
+        .context("failed to read uapi response")?;
+
+    if !response.contains("errno=0") {
+        return Err(anyhow!("uapi set failed: {}", response.trim()));
+    }
+
+    Ok(())
+}
+
+fn run_checked(command: &mut ProcessCommand) -> Result<()> {
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute {display}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "command failed: {display}\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
 }
