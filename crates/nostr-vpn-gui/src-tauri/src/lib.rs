@@ -704,7 +704,11 @@ impl NvpnBackend {
 
         self.schedule_autosave();
         self.ensure_peer_status_entries();
-        self.restart_relay_if_needed()?;
+        if self.session_active {
+            self.restart_relay_if_needed()?;
+        } else if !self.config.participants.is_empty() {
+            self.connect_session()?;
+        }
         self.maybe_refresh_lan_discovery();
 
         Ok(())
