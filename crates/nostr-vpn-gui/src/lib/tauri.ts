@@ -20,6 +20,7 @@ const mockState: UiState = {
   effectiveNetworkId: 'nostr-vpn',
   autoDisconnectRelaysWhenMeshReady: true,
   lanDiscoveryEnabled: true,
+  launchOnStartup: true,
   closeToTrayOnClose: true,
   connectedPeerCount: 0,
   expectedPeerCount: 0,
@@ -162,13 +163,16 @@ export const updateSettings = (patch: SettingsPatch) =>
         if (patch.lanDiscoveryEnabled !== undefined) {
           mockState.lanDiscoveryEnabled = patch.lanDiscoveryEnabled
         }
+        if (patch.launchOnStartup !== undefined) {
+          mockState.launchOnStartup = patch.launchOnStartup
+        }
         if (patch.closeToTrayOnClose !== undefined) {
           mockState.closeToTrayOnClose = patch.closeToTrayOnClose
         }
         return asResult()
       })()
 
-let mockAutostartEnabled = false
+let mockAutostartEnabled = true
 
 export const isAutostartEnabled = async () => {
   if (!isTauriRuntime()) {

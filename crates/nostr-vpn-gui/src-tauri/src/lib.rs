@@ -149,6 +149,7 @@ struct UiState {
     effective_network_id: String,
     auto_disconnect_relays_when_mesh_ready: bool,
     lan_discovery_enabled: bool,
+    launch_on_startup: bool,
     close_to_tray_on_close: bool,
     connected_peer_count: usize,
     expected_peer_count: usize,
@@ -169,6 +170,7 @@ struct SettingsPatch {
     network_id: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
     lan_discovery_enabled: Option<bool>,
+    launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
 }
 
@@ -263,6 +265,9 @@ impl NvpnBackend {
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
         backend.maybe_refresh_lan_discovery();
+        if !backend.config.participants.is_empty() {
+            let _ = backend.connect_session();
+        }
 
         Ok(backend)
     }
@@ -834,6 +839,9 @@ impl NvpnBackend {
         if let Some(lan_discovery_enabled) = patch.lan_discovery_enabled {
             self.config.lan_discovery_enabled = lan_discovery_enabled;
         }
+        if let Some(launch_on_startup) = patch.launch_on_startup {
+            self.config.launch_on_startup = launch_on_startup;
+        }
         if let Some(close_to_tray_on_close) = patch.close_to_tray_on_close {
             self.config.close_to_tray_on_close = close_to_tray_on_close;
         }
@@ -1296,6 +1304,7 @@ impl NvpnBackend {
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
             lan_discovery_enabled: self.config.lan_discovery_enabled,
+            launch_on_startup: self.config.launch_on_startup,
             close_to_tray_on_close: self.config.close_to_tray_on_close,
             connected_peer_count,
             expected_peer_count,
@@ -1672,13 +1681,27 @@ pub fn run() {
     let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
+    let launch_on_startup_default = backend.config.launch_on_startup;
     let app = tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             app.handle().plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
                 None,
             ))?;
+
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            {
+                use tauri_plugin_autostart::ManagerExt;
+
+                let auto = app.handle().autolaunch();
+                let currently_enabled = auto.is_enabled().unwrap_or(false);
+                if launch_on_startup_default && !currently_enabled {
+                    let _ = auto.enable();
+                } else if !launch_on_startup_default && currently_enabled {
+                    let _ = auto.disable();
+                }
+            }
 
             let open_item =
                 MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;

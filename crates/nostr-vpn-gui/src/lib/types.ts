@@ -47,6 +47,7 @@ export interface UiState {
   effectiveNetworkId: string
   autoDisconnectRelaysWhenMeshReady: boolean
   lanDiscoveryEnabled: boolean
+  launchOnStartup: boolean
   closeToTrayOnClose: boolean
   connectedPeerCount: number
   expectedPeerCount: number
@@ -65,5 +66,6 @@ export interface SettingsPatch {
   networkId?: string
   autoDisconnectRelaysWhenMeshReady?: boolean
   lanDiscoveryEnabled?: boolean
+  launchOnStartup?: boolean
   closeToTrayOnClose?: boolean
 }

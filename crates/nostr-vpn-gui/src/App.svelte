@@ -28,7 +28,6 @@
   let tunnelIpDraft = ''
   let listenPortDraft = ''
   let draftsInitialized = false
-  let autostartEnabled = false
   let autostartReady = false
   let autostartUpdating = false
 
@@ -116,21 +115,40 @@
   }
 
   async function refreshAutostart() {
-    autostartEnabled = await isAutostartEnabled()
+    if (!state) {
+      autostartReady = true
+      return
+    }
+
+    const runtimeEnabled = await isAutostartEnabled()
+    if (runtimeEnabled !== state.launchOnStartup) {
+      const ok = await setAutostartEnabled(state.launchOnStartup)
+      if (!ok) {
+        error = 'Failed to apply startup launch setting'
+      }
+    }
+
     autostartReady = true
   }
 
   async function onToggleAutostart(enabled: boolean) {
-    autostartUpdating = true
-    const ok = await setAutostartEnabled(enabled)
-    autostartUpdating = false
+    if (!state) {
+      return
+    }
 
-    if (ok) {
-      autostartEnabled = enabled
-    } else {
+    const previous = state.launchOnStartup
+    autostartUpdating = true
+    await onUpdateSettings({ launchOnStartup: enabled })
+    const ok = await setAutostartEnabled(enabled)
+
+    if (!ok) {
       error = 'Failed to update autostart setting'
+      await onUpdateSettings({ launchOnStartup: previous })
+    } else {
       await refreshAutostart()
     }
+
+    autostartUpdating = false
   }
 
   async function copyPubkey() {
@@ -376,7 +394,7 @@
         <input
           type="checkbox"
           data-testid="autostart-toggle"
-          checked={autostartEnabled}
+          checked={state.launchOnStartup}
           disabled={!autostartReady || autostartUpdating}
           on:change={(event) =>
             onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
