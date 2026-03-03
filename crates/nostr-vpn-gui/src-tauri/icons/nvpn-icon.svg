@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="NVPN icon">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090321" />
+      <stop offset="50%" stop-color="#12083c" />
+      <stop offset="100%" stop-color="#1b0b52" />
+    </linearGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff4fd8" />
+      <stop offset="100%" stop-color="#8f5bff" />
+    </linearGradient>
+    <linearGradient id="nfill" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#78f5ff" />
+      <stop offset="100%" stop-color="#39d2ff" />
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="232" fill="url(#bg)" />
+
+  <circle cx="512" cy="512" r="346" fill="none" stroke="url(#ring)" stroke-width="52" />
+
+  <g fill="url(#nfill)">
+    <rect x="336" y="296" width="82" height="432" rx="20" />
+    <rect x="606" y="296" width="82" height="432" rx="20" />
+    <polygon points="408,324 512,324 616,700 512,700" />
+  </g>
+
+  <g opacity="0.55" stroke="#2ac7ff" stroke-width="10">
+    <line x1="262" y1="452" x2="762" y2="452" />
+    <line x1="240" y1="512" x2="784" y2="512" />
+    <line x1="262" y1="572" x2="762" y2="572" />
+  </g>
+</svg>
