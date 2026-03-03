@@ -3,6 +3,7 @@ members = [
   "crates/nostr-vpn-core",
   "crates/nostr-vpn-cli",
   "crates/nostr-vpn-gui",
+  "crates/nostr-vpn-relay",
 ]
 resolver = "2"
 

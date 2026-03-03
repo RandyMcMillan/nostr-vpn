@@ -1,0 +1,17 @@
+FROM rust:1.93-bookworm AS builder
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p nostr-vpn-cli -p nostr-vpn-relay
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/nostr-vpn /usr/local/bin/nostr-vpn
+COPY --from=builder /app/target/release/nostr-vpn-relay /usr/local/bin/nostr-vpn-relay
+
+ENV RUST_LOG=info

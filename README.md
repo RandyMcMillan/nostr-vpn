@@ -72,6 +72,21 @@ cargo run -p nostr-vpn-gui
 
 Use the topbar controls (`Menu`, `Connect`, `Announce`, `Settings`).
 
+## Docker e2e
+
+Run a real cross-container signaling check (relay + 2 nodes):
+
+```bash
+./scripts/e2e-docker.sh
+```
+
+What it validates:
+
+- Relay container accepts Nostr websocket connections
+- Bob container listens on a network
+- Alice container announces on the same network
+- Bob receives Alice's announcement (asserted by script)
+
 ## Notes
 
 - This is currently a control-plane MVP with config rendering for WireGuard peers.
