@@ -18,7 +18,7 @@
   <rect x="0" y="0" width="1024" height="1024" rx="226" fill="url(#bg)" />
 
   <g stroke="url(#edge)" stroke-linecap="round" stroke-linejoin="round" fill="none">
-    <polyline points="300,740 300,280 724,740 724,280" stroke-width="74" />
+    <polyline points="300,740 300,280 724,740 724,280" stroke-width="60" />
   </g>
 
   <g fill="url(#node)" stroke="#f26bf0" stroke-width="12">
