@@ -22,11 +22,9 @@
   </g>
 
   <g fill="url(#node)" stroke="#f26bf0" stroke-width="12">
-    <circle cx="300" cy="280" r="38" />
-    <circle cx="300" cy="740" r="38" />
-    <circle cx="724" cy="280" r="38" />
-    <circle cx="724" cy="740" r="38" />
-    <circle cx="440" cy="434" r="24" />
-    <circle cx="582" cy="586" r="24" />
+    <circle cx="300" cy="280" r="48" />
+    <circle cx="300" cy="740" r="48" />
+    <circle cx="724" cy="280" r="48" />
+    <circle cx="724" cy="740" r="48" />
   </g>
 </svg>

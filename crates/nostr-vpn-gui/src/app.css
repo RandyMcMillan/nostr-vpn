@@ -48,7 +48,7 @@ body {
 .app-shell {
   max-width: 980px;
   margin: 0 auto;
-  padding: 70px 18px 18px;
+  padding: 66px 18px 18px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -64,18 +64,18 @@ body {
   top: 0;
   left: 0;
   right: 0;
-  height: 64px;
+  height: 60px;
 }
 
 .drag-padding-left {
-  top: 64px;
+  top: 60px;
   bottom: 0;
   left: 0;
   width: 18px;
 }
 
 .drag-padding-right {
-  top: 64px;
+  top: 60px;
   bottom: 0;
   right: 0;
   width: 18px;
@@ -93,7 +93,7 @@ body {
   top: 0;
   left: 0;
   right: 0;
-  height: 64px;
+  height: 60px;
   display: flex;
   align-items: center;
   justify-content: flex-end;
@@ -136,8 +136,11 @@ body {
 }
 
 .window-title {
+  display: flex;
+  align-items: center;
+  height: 100%;
   font-size: 14px;
-  line-height: 1;
+  line-height: 1.05;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   font-weight: 700;
