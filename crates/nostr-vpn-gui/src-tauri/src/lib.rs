@@ -615,7 +615,7 @@ impl NvpnBackend {
             return Ok(());
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
             return Ok(());
@@ -652,7 +652,7 @@ impl NvpnBackend {
             return Ok(());
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
             return Ok(());
@@ -721,7 +721,7 @@ impl NvpnBackend {
             })
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn run_nvpn_command_with_admin_privileges<const N: usize>(
         &self,
         args: [&str; N],
@@ -736,32 +736,85 @@ impl NvpnBackend {
             .to_str()
             .ok_or_else(|| anyhow!("nvpn binary path is not valid UTF-8"))?;
 
-        let mut shell_parts = Vec::with_capacity(N + 1);
-        shell_parts.push(shell_quote_single(nvpn_bin));
-        shell_parts.extend(args.iter().map(|arg| shell_quote_single(arg)));
-        let shell_command = shell_parts.join(" ");
+        #[cfg(target_os = "macos")]
+        {
+            let mut shell_parts = Vec::with_capacity(N + 1);
+            shell_parts.push(shell_quote_single(nvpn_bin));
+            shell_parts.extend(args.iter().map(|arg| shell_quote_single(arg)));
+            let shell_command = shell_parts.join(" ");
 
-        let script = format!(
-            "do shell script \"{}\" with administrator privileges",
-            applescript_escape(&shell_command)
-        );
+            let script = format!(
+                "do shell script \"{}\" with administrator privileges",
+                applescript_escape(&shell_command)
+            );
 
-        let output = ProcessCommand::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .context("failed to execute elevated command prompt on macOS")?;
+            let output = ProcessCommand::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .output()
+                .context("failed to execute elevated command prompt on macOS")?;
 
-        if output.status.success() {
-            return Ok(());
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(anyhow!(
+                "elevated nvpn command failed\nstdout: {}\nstderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            ));
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        #[cfg(target_os = "linux")]
+        {
+            let output = ProcessCommand::new("pkexec")
+                .arg(nvpn_bin)
+                .args(args)
+                .output();
+
+            let output = match output {
+                Ok(output) => output,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(anyhow!(
+                        "pkexec not found; install policykit (polkit) to allow GUI privilege prompts"
+                    ));
+                }
+                Err(error) => {
+                    return Err(anyhow!(
+                        "failed to execute pkexec for elevated nvpn command: {error}"
+                    ));
+                }
+            };
+
+            if output.status.success() {
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let details = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            if details
+                .to_ascii_lowercase()
+                .contains("no authentication agent found")
+            {
+                return Err(anyhow!(
+                    "pkexec could not find a polkit authentication agent; run a desktop polkit agent or start nvpn with sudo"
+                ));
+            }
+            return Err(anyhow!(
+                "elevated nvpn command failed via pkexec: {details}"
+            ));
+        }
+
+        #[allow(unreachable_code)]
         Err(anyhow!(
-            "elevated nvpn command failed\nstdout: {}\nstderr: {}",
-            stdout.trim(),
-            stderr.trim()
+            "privilege escalation helper is not implemented on this platform"
         ))
     }
 
