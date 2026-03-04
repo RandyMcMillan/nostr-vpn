@@ -1214,8 +1214,12 @@ impl NvpnBackend {
         self.sync_daemon_state();
     }
 
+    fn lan_discovery_should_run(&self) -> bool {
+        self.config.lan_discovery_enabled || self.config.all_participant_pubkeys_hex().is_empty()
+    }
+
     fn maybe_refresh_lan_discovery(&mut self) {
-        let should_run = self.config.lan_discovery_enabled;
+        let should_run = self.lan_discovery_should_run();
 
         if should_run && !self.lan_discovery_running {
             self.start_lan_discovery();
@@ -1413,7 +1417,7 @@ impl NvpnBackend {
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
             autoconnect: self.config.autoconnect,
-            lan_discovery_enabled: self.config.lan_discovery_enabled,
+            lan_discovery_enabled: self.lan_discovery_should_run(),
             launch_on_startup: self.config.launch_on_startup,
             close_to_tray_on_close: self.config.close_to_tray_on_close,
             connected_peer_count,
