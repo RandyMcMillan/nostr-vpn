@@ -14,8 +14,8 @@
 - Deterministic network IDs derived from participant pubkeys
 - Automatic key generation for both WireGuard and Nostr identities
 - Tauri + Svelte desktop GUI (single-pane settings UX)
-- LAN multicast peer discovery helper (active when no participants are configured)
-- GUI-managed boringtun tunnel orchestration on unix targets (applies peers from private Nostr presence signals)
+- LAN multicast peer discovery helper (default-enabled on fresh/no-peer configs, toggleable anytime)
+- GUI controls a background `nvpn` daemon; signaling/tunnel/MagicDNS runtime lives in the daemon process
 - Docker e2e that validates signaling + data-plane ping across 2 containers
 - UDP NAT endpoint discovery + hole-punch helpers (reflector-based)
 
@@ -77,6 +77,18 @@ nvpn connect
 `nvpn connect` keeps running, consumes private peer presence signals from your configured
 participants, and applies boringtun interface/peer config automatically.
 
+To run in background:
+
+```bash
+nvpn start --daemon --connect
+```
+
+Stop daemon:
+
+```bash
+nvpn stop
+```
+
 ### 6. Check status
 
 ```bash
@@ -100,8 +112,11 @@ pnpm --dir crates/nostr-vpn-gui install
 pnpm --dir crates/nostr-vpn-gui tauri:dev
 ```
 
-Note: bringing the tunnel interface up requires OS network privileges.
-On Linux/macOS, run the app with permissions that allow interface/routing updates.
+GUI session control calls the `nvpn` CLI daemon (`start/stop/status`) and does not run
+WireGuard/Nostr runtime in the frontend process.
+
+Note: bringing the tunnel interface up requires OS network privileges in the daemon process.
+On Linux/macOS, run `nvpn`/the app with permissions that allow interface/routing updates.
 
 ### 9. Run Tauri-driver UI smoke test (Docker)
 
@@ -117,6 +132,8 @@ and writes a screenshot to `artifacts/screenshots/tauri-driver-smoke.png`.
 `nvpn` includes these Tailscale-style commands:
 
 - `up`
+- `start`
+- `stop`
 - `connect`
 - `down`
 - `status`

@@ -1,29 +1,21 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr};
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use boringtun::device::{DeviceConfig, DeviceHandle};
 use nostr_sdk::prelude::{PublicKey, ToBech32};
 use nostr_vpn_core::config::{
     AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_nostr_pubkey,
 };
-use nostr_vpn_core::control::PeerAnnouncement;
-use nostr_vpn_core::magic_dns::{
-    MagicDnsResolverConfig, MagicDnsServer, build_magic_dns_records, install_system_resolver,
-    uninstall_system_resolver,
-};
-use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -35,140 +27,12 @@ const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
 const TRAY_QUIT_MENU_ID: &str = "tray_quit";
-const TUNNEL_IFACE: &str = "utun100";
-const MAGIC_DNS_PORT: u16 = 1053;
-
-#[derive(Debug, Clone)]
-struct WireGuardPeer {
-    pubkey_hex: String,
-    endpoint: String,
-    allowed_ip: String,
-}
-
-struct TunnelRuntime {
-    iface: String,
-    handle: Option<DeviceHandle>,
-    uapi_socket_path: Option<String>,
-    last_fingerprint: Option<String>,
-}
-
-impl TunnelRuntime {
-    fn new(iface: impl Into<String>) -> Self {
-        Self {
-            iface: iface.into(),
-            handle: None,
-            uapi_socket_path: None,
-            last_fingerprint: None,
-        }
-    }
-
-    fn ensure_started(&mut self) -> Result<()> {
-        #[cfg(not(unix))]
-        {
-            return Err(anyhow!(
-                "boringtun runtime in GUI is currently supported on unix targets only"
-            ));
-        }
-
-        #[cfg(unix)]
-        {
-            if self.handle.is_some() {
-                return Ok(());
-            }
-
-            let handle = DeviceHandle::new(
-                &self.iface,
-                DeviceConfig {
-                    n_threads: 2,
-                    use_connected_socket: true,
-                    #[cfg(target_os = "linux")]
-                    use_multi_queue: false,
-                    #[cfg(target_os = "linux")]
-                    uapi_fd: -1,
-                },
-            )
-            .with_context(|| format!("failed to create boringtun interface {}", self.iface))?;
-
-            let socket = uapi_socket_path(&self.iface);
-            wait_for_socket(&socket)?;
-
-            self.handle = Some(handle);
-            self.uapi_socket_path = Some(socket);
-            Ok(())
-        }
-    }
-
-    fn apply(
-        &mut self,
-        config: &AppConfig,
-        peer_announcements: &HashMap<String, PeerAnnouncement>,
-    ) -> Result<()> {
-        let own_pubkey = config.own_nostr_pubkey_hex().ok();
-        let mut peers = config
-            .participants
-            .iter()
-            .filter(|participant| Some(participant.as_str()) != own_pubkey.as_deref())
-            .filter_map(|participant| peer_announcements.get(participant))
-            .map(peer_from_announcement)
-            .collect::<Result<Vec<_>>>()?;
-        peers.sort_by(|left, right| left.pubkey_hex.cmp(&right.pubkey_hex));
-
-        let local_address = local_tunnel_address_for_interface(&config.node.tunnel_ip);
-        let fingerprint = tunnel_fingerprint(
-            &self.iface,
-            &config.node.private_key,
-            config.node.listen_port,
-            &local_address,
-            &peers,
-        );
-        if self.last_fingerprint.as_deref() == Some(fingerprint.as_str()) && self.handle.is_some() {
-            return Ok(());
-        }
-
-        self.ensure_started()?;
-        let socket = self
-            .uapi_socket_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing uapi socket path"))?;
-
-        apply_base_tunnel_config(socket, config.node.listen_port, &config.node.private_key)?;
-        apply_local_interface_network(&self.iface, &local_address)?;
-        apply_peer_set(socket, &peers)?;
-
-        self.last_fingerprint = Some(fingerprint);
-        Ok(())
-    }
-
-    fn stop(&mut self) {
-        self.handle = None;
-        self.uapi_socket_path = None;
-        self.last_fingerprint = None;
-    }
-
-    fn peer_status(&self) -> Result<HashMap<String, WireGuardPeerStatus>> {
-        let socket = self
-            .uapi_socket_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing uapi socket path"))?;
-        let response = wg_get(socket)?;
-        Ok(parse_wg_peer_status(&response))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct RelayCheckResult {
-    relay: String,
-    latency_ms: u128,
-    error: Option<String>,
-    checked_at: SystemTime,
-}
+const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
 
 #[derive(Debug, Clone, Default)]
 struct RelayStatus {
-    checking: bool,
-    latency_ms: Option<u128>,
-    error: Option<String>,
-    checked_at: Option<SystemTime>,
+    state: String,
+    status_text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -182,50 +46,17 @@ struct RelaySummary {
 
 #[derive(Debug, Clone, Default)]
 struct PeerLinkStatus {
-    checking: bool,
     reachable: Option<bool>,
     last_handshake_at: Option<SystemTime>,
-    rx_bytes: Option<u64>,
-    tx_bytes: Option<u64>,
     endpoint: Option<String>,
     error: Option<String>,
     checked_at: Option<SystemTime>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WireGuardPeerStatus {
-    endpoint: Option<String>,
-    last_handshake_sec: Option<u64>,
-    last_handshake_nsec: Option<u64>,
-    rx_bytes: Option<u64>,
-    tx_bytes: Option<u64>,
-}
-
-impl WireGuardPeerStatus {
-    fn has_handshake(&self) -> bool {
-        self.last_handshake_sec.unwrap_or(0) > 0 || self.last_handshake_nsec.unwrap_or(0) > 0
-    }
-
-    fn last_handshake(&self) -> Option<SystemTime> {
-        let sec = self.last_handshake_sec?;
-        // Some platforms expose monotonic seconds here instead of unix epoch;
-        // avoid interpreting those as 1970 timestamps.
-        if sec < 946_684_800 {
-            return None;
-        }
-
-        let mut ts = UNIX_EPOCH.checked_add(Duration::from_secs(sec))?;
-        if let Some(nsec) = self.last_handshake_nsec {
-            ts = ts.checked_add(Duration::from_nanos(nsec.min(999_999_999)))?;
-        }
-        Some(ts)
-    }
+    last_signal_seen_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfiguredPeerStatus {
     Local,
-    Checking,
     Online,
     Offline,
     Unknown,
@@ -254,6 +85,45 @@ struct LanAnnouncement {
     node_name: String,
     endpoint: String,
     timestamp: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CliStatusResponse {
+    daemon: CliDaemonStatus,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CliDaemonStatus {
+    running: bool,
+    state: Option<DaemonRuntimeState>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Default)]
+struct DaemonRuntimeState {
+    updated_at: u64,
+    session_active: bool,
+    relay_connected: bool,
+    session_status: String,
+    expected_peer_count: usize,
+    connected_peer_count: usize,
+    mesh_ready: bool,
+    peers: Vec<DaemonPeerState>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize, Default)]
+struct DaemonPeerState {
+    participant_pubkey: String,
+    node_id: String,
+    tunnel_ip: String,
+    endpoint: String,
+    public_key: String,
+    presence_timestamp: u64,
+    last_signal_seen_at: Option<u64>,
+    reachable: bool,
+    last_handshake_at: Option<u64>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,6 +176,7 @@ struct UiState {
     magic_dns_suffix: String,
     magic_dns_status: String,
     auto_disconnect_relays_when_mesh_ready: bool,
+    autoconnect: bool,
     lan_discovery_enabled: bool,
     launch_on_startup: bool,
     close_to_tray_on_close: bool,
@@ -328,6 +199,7 @@ struct SettingsPatch {
     network_id: Option<String>,
     magic_dns_suffix: Option<String>,
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
+    autoconnect: Option<bool>,
     lan_discovery_enabled: Option<bool>,
     launch_on_startup: Option<bool>,
     close_to_tray_on_close: Option<bool>,
@@ -337,34 +209,21 @@ struct NvpnBackend {
     runtime: Runtime,
     config_path: PathBuf,
     config: AppConfig,
+    nvpn_bin: Option<PathBuf>,
 
     session_status: String,
     session_active: bool,
     relay_connected: bool,
-    client: Option<Arc<NostrSignalingClient>>,
-    signal_rx: Option<mpsc::Receiver<nostr_vpn_core::signaling::SignalEnvelope>>,
+    daemon_state: Option<DaemonRuntimeState>,
 
     relay_status: HashMap<String, RelayStatus>,
-    relay_check_rx: Option<mpsc::Receiver<Vec<RelayCheckResult>>>,
-    relay_check_inflight: bool,
-    next_relay_check_at: Option<Instant>,
-    next_relay_retry_at: Option<Instant>,
-
     peer_status: HashMap<String, PeerLinkStatus>,
-    peer_signal_seen_at: HashMap<String, SystemTime>,
-    peer_announcements: HashMap<String, PeerAnnouncement>,
-
-    autosave_pending: bool,
-    autosave_due_at: Option<Instant>,
 
     lan_discovery_running: bool,
     lan_discovery_rx: Option<mpsc::Receiver<LanDiscoverySignal>>,
     lan_discovery_stop: Option<Arc<AtomicBool>>,
     lan_peers: HashMap<String, LanPeerRecord>,
-    tunnel_runtime: TunnelRuntime,
-    tunnel_error: Option<String>,
-    magic_dns_server: Option<MagicDnsServer>,
-    magic_dns_resolver_suffix: Option<String>,
+
     magic_dns_status: String,
 }
 
@@ -377,7 +236,9 @@ impl NvpnBackend {
             AppConfig::load(&config_path).context("failed to load config")?
         } else {
             let generated = AppConfig::generated();
-            let _ = generated.save(&config_path);
+            generated
+                .save(&config_path)
+                .context("failed to persist generated config")?;
             generated
         };
 
@@ -388,7 +249,15 @@ impl NvpnBackend {
             .nostr
             .relays
             .iter()
-            .map(|relay| (relay.clone(), RelayStatus::default()))
+            .map(|relay| {
+                (
+                    relay.clone(),
+                    RelayStatus {
+                        state: "unknown".to_string(),
+                        status_text: "not checked".to_string(),
+                    },
+                )
+            })
             .collect::<HashMap<_, _>>();
 
         let peer_status = config
@@ -397,504 +266,54 @@ impl NvpnBackend {
             .map(|participant| (participant.clone(), PeerLinkStatus::default()))
             .collect::<HashMap<_, _>>();
 
+        let nvpn_bin = resolve_nvpn_cli_path().ok();
+
         let mut backend = Self {
             runtime,
             config_path,
             config,
+            nvpn_bin,
             session_status: "Disconnected".to_string(),
             session_active: false,
             relay_connected: false,
-            client: None,
-            signal_rx: None,
+            daemon_state: None,
             relay_status,
-            relay_check_rx: None,
-            relay_check_inflight: false,
-            next_relay_check_at: None,
-            next_relay_retry_at: None,
             peer_status,
-            peer_signal_seen_at: HashMap::new(),
-            peer_announcements: HashMap::new(),
-            autosave_pending: false,
-            autosave_due_at: None,
             lan_discovery_running: false,
             lan_discovery_rx: None,
             lan_discovery_stop: None,
             lan_peers: HashMap::new(),
-            tunnel_runtime: TunnelRuntime::new(TUNNEL_IFACE),
-            tunnel_error: None,
-            magic_dns_server: None,
-            magic_dns_resolver_suffix: None,
-            magic_dns_status: "DNS disabled (session disconnected)".to_string(),
+            magic_dns_status: "DNS disabled (VPN off)".to_string(),
         };
 
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
         backend.maybe_refresh_lan_discovery();
-        if !backend.config.participants.is_empty() {
-            let _ = backend.connect_session();
+
+        if backend.config.autoconnect && !backend.config.participants.is_empty() {
+            let _ = backend.start_daemon_process();
         }
 
+        backend.sync_daemon_state();
         Ok(backend)
     }
 
     fn connect_session(&mut self) -> Result<()> {
-        if self.session_active {
-            self.reconcile_tunnel_runtime();
-            self.refresh_magic_dns_runtime();
-            return Ok(());
-        }
-
-        self.session_active = true;
-        if let Err(error) = self.connect_relays() {
-            self.session_active = false;
-            self.session_status = format!("Connect failed: {error}");
-            return Err(error);
-        }
-
-        self.reconcile_tunnel_runtime();
-        self.refresh_magic_dns_runtime();
-        if self.tunnel_error.is_none() {
-            self.session_status = "Connected".to_string();
-        }
-        Ok(())
-    }
-
-    fn connect_relays(&mut self) -> Result<()> {
-        if self.relay_connected {
-            return Ok(());
-        }
-
-        if self.config.nostr.relays.is_empty() {
-            return Err(anyhow!("at least one relay is required"));
-        }
-
-        maybe_autoconfigure_node(&mut self.config);
-
-        let relays = self.config.nostr.relays.clone();
-        let network_id = self.config.effective_network_id();
-        let client = Arc::new(NostrSignalingClient::from_secret_key(
-            network_id,
-            &self.config.nostr.secret_key,
-            self.config.participant_pubkeys_hex(),
-        )?);
-
-        self.runtime.block_on(client.connect(&relays))?;
-
-        let (tx, rx) = mpsc::channel();
-        let recv_client = client.clone();
-        self.runtime.spawn(async move {
-            loop {
-                let Some(message) = recv_client.recv().await else {
-                    break;
-                };
-
-                if tx.send(message).is_err() {
-                    break;
-                }
-            }
-        });
-
-        self.client = Some(client);
-        self.signal_rx = Some(rx);
-        self.relay_connected = true;
-        self.next_relay_retry_at = None;
-
-        self.ensure_peer_status_entries();
-        self.start_relay_check(4);
-        self.next_relay_check_at = Some(Instant::now() + Duration::from_secs(45));
-
-        if let Err(error) = self.publish_announcement()
-            && !is_no_participants_error(&error)
-        {
-            self.session_status = format!("Connected, presence publish failed: {error}");
-        }
-
+        self.persist_config()?;
+        self.start_daemon_process()?;
+        self.sync_daemon_state();
         Ok(())
     }
 
     fn disconnect_session(&mut self) {
-        if self.relay_connected {
-            let _ = self.publish_disconnect();
-        }
-        self.session_active = false;
-        self.disconnect_relays();
-        self.peer_announcements.clear();
-        self.tunnel_runtime.stop();
-        self.stop_magic_dns_runtime();
-
-        self.relay_check_inflight = false;
-        self.relay_check_rx = None;
-        self.next_relay_check_at = None;
-        self.next_relay_retry_at = None;
-
-        for status in self.peer_status.values_mut() {
-            status.checking = false;
-            status.reachable = None;
-            status.last_handshake_at = None;
-            status.rx_bytes = None;
-            status.tx_bytes = None;
-            status.endpoint = None;
-            status.checked_at = None;
-            status.error = Some("disconnected".to_string());
-        }
-
-        self.session_status = "Disconnected".to_string();
-        self.magic_dns_status = "DNS disabled (session disconnected)".to_string();
-    }
-
-    fn disconnect_relays(&mut self) {
-        if let Some(client) = self.client.take() {
-            self.runtime.block_on(client.disconnect());
-        }
-
-        self.signal_rx = None;
-        self.relay_connected = false;
-    }
-
-    fn publish_announcement(&self) -> Result<()> {
-        let Some(client) = self.client.clone() else {
-            return Err(anyhow!("connect first"));
-        };
-
-        let announcement = PeerAnnouncement {
-            node_id: self.config.node.id.clone(),
-            public_key: self.config.node.public_key.clone(),
-            endpoint: self.config.node.endpoint.clone(),
-            tunnel_ip: self.config.node.tunnel_ip.clone(),
-            timestamp: unix_timestamp(),
-        };
-
-        self.runtime
-            .block_on(client.publish(SignalPayload::Announce(announcement)))
-    }
-
-    fn publish_disconnect(&self) -> Result<()> {
-        let Some(client) = self.client.clone() else {
-            return Ok(());
-        };
-
-        self.runtime
-            .block_on(client.publish(SignalPayload::Disconnect {
-                node_id: self.config.node.id.clone(),
-            }))
-    }
-
-    fn start_relay_check(&mut self, timeout_secs: u64) {
-        self.ensure_relay_status_entries();
-
-        if self.relay_check_inflight || self.config.nostr.relays.is_empty() || !self.relay_connected
-        {
+        if let Err(error) = self.stop_daemon_process() {
+            self.session_status = format!("Disconnect failed: {error}");
             return;
         }
-
-        for relay in &self.config.nostr.relays {
-            self.relay_status
-                .entry(relay.clone())
-                .and_modify(|status| {
-                    status.checking = true;
-                    status.error = None;
-                })
-                .or_insert_with(|| RelayStatus {
-                    checking: true,
-                    ..RelayStatus::default()
-                });
-        }
-
-        let relays = self.config.nostr.relays.clone();
-        let network_id = self.config.effective_network_id();
-        let secret_key = self.config.nostr.secret_key.clone();
-        let participants = self.config.participant_pubkeys_hex();
-
-        let (tx, rx) = mpsc::channel();
-        self.relay_check_rx = Some(rx);
-        self.relay_check_inflight = true;
-
-        self.runtime.spawn(async move {
-            let mut checks = Vec::with_capacity(relays.len());
-
-            for relay in relays {
-                let started = Instant::now();
-                let probe = tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), async {
-                    let client = NostrSignalingClient::from_secret_key(
-                        network_id.clone(),
-                        &secret_key,
-                        participants.clone(),
-                    )?;
-                    client.connect(std::slice::from_ref(&relay)).await?;
-                    client.disconnect().await;
-                    Result::<(), anyhow::Error>::Ok(())
-                })
-                .await;
-
-                let error = match probe {
-                    Ok(Ok(())) => None,
-                    Ok(Err(err)) => Some(err.to_string()),
-                    Err(_) => Some("timeout".to_string()),
-                };
-
-                checks.push(RelayCheckResult {
-                    relay,
-                    latency_ms: started.elapsed().as_millis(),
-                    error,
-                    checked_at: SystemTime::now(),
-                });
-            }
-
-            let _ = tx.send(checks);
-        });
-    }
-
-    fn handle_relay_checks(&mut self) {
-        let recv_result = self
-            .relay_check_rx
-            .as_ref()
-            .map(|receiver| receiver.try_recv());
-
-        match recv_result {
-            Some(Ok(results)) => {
-                for result in results {
-                    self.relay_status.insert(
-                        result.relay,
-                        RelayStatus {
-                            checking: false,
-                            latency_ms: Some(result.latency_ms),
-                            error: result.error,
-                            checked_at: Some(result.checked_at),
-                        },
-                    );
-                }
-                self.relay_check_inflight = false;
-                self.relay_check_rx = None;
-            }
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.relay_check_inflight = false;
-                self.relay_check_rx = None;
-            }
-            _ => {}
-        }
-    }
-
-    fn maybe_schedule_periodic_relay_check(&mut self) {
-        if !self.session_active || !self.relay_connected || self.relay_check_inflight {
-            return;
-        }
-
-        let now = Instant::now();
-        let due = self
-            .next_relay_check_at
-            .is_none_or(|next_check| now >= next_check);
-
-        if due {
-            self.start_relay_check(4);
-            self.next_relay_check_at = Some(now + Duration::from_secs(45));
-        }
-    }
-
-    fn refresh_peer_link_statuses(&mut self) {
-        self.ensure_peer_status_entries();
-
-        let now = SystemTime::now();
-        let own_pubkey_hex = self.config.own_nostr_pubkey_hex().ok();
-
-        if !self.session_active || self.config.participants.is_empty() {
-            for participant in &self.config.participants {
-                if Some(participant.as_str()) == own_pubkey_hex.as_deref() {
-                    continue;
-                }
-
-                if let Some(status) = self.peer_status.get_mut(participant) {
-                    status.checking = false;
-                    status.reachable = None;
-                    status.last_handshake_at = None;
-                    status.rx_bytes = None;
-                    status.tx_bytes = None;
-                    status.endpoint = None;
-                    status.error = if self.session_active {
-                        Some("waiting for peer signal".to_string())
-                    } else {
-                        Some("disconnected".to_string())
-                    };
-                    status.checked_at = Some(now);
-                }
-            }
-            return;
-        }
-
-        let (runtime_peers, runtime_error) = match self.tunnel_runtime.peer_status() {
-            Ok(peers) => (Some(peers), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-
-        for participant in &self.config.participants {
-            if Some(participant.as_str()) == own_pubkey_hex.as_deref() {
-                continue;
-            }
-
-            let status = self.peer_status.entry(participant.clone()).or_default();
-            status.checking = false;
-            status.reachable = Some(false);
-            status.last_handshake_at = None;
-            status.rx_bytes = None;
-            status.tx_bytes = None;
-            status.endpoint = None;
-            status.error = None;
-            status.checked_at = Some(now);
-
-            let Some(announcement) = self.peer_announcements.get(participant) else {
-                status.error = Some("no signal yet".to_string());
-                continue;
-            };
-
-            let peer_pubkey_hex = match key_b64_to_hex(&announcement.public_key) {
-                Ok(value) => value.to_lowercase(),
-                Err(error) => {
-                    status.error = Some(format!("invalid peer key: {error}"));
-                    continue;
-                }
-            };
-
-            let Some(peers) = runtime_peers.as_ref() else {
-                status.error = runtime_error
-                    .clone()
-                    .map(|message| format!("runtime unavailable: {message}"));
-                continue;
-            };
-
-            let Some(wg_peer) = peers.get(&peer_pubkey_hex) else {
-                status.error = Some("peer not in tunnel runtime".to_string());
-                continue;
-            };
-
-            status.endpoint = wg_peer.endpoint.clone();
-            status.rx_bytes = wg_peer.rx_bytes;
-            status.tx_bytes = wg_peer.tx_bytes;
-            status.last_handshake_at = wg_peer.last_handshake();
-
-            if wg_peer.has_handshake() {
-                status.reachable = Some(true);
-            } else {
-                status.error = Some("awaiting handshake".to_string());
-            }
-        }
-    }
-
-    fn handle_signals(&mut self) {
-        let mut changed = false;
-        if let Some(rx) = &self.signal_rx {
-            while let Ok(message) = rx.try_recv() {
-                self.peer_signal_seen_at
-                    .insert(message.sender_pubkey.clone(), SystemTime::now());
-
-                match message.payload {
-                    SignalPayload::Announce(announcement) => {
-                        self.peer_announcements
-                            .insert(message.sender_pubkey.clone(), announcement);
-                        let state = self.peer_status.entry(message.sender_pubkey).or_default();
-                        state.error = None;
-                        changed = true;
-                    }
-                    SignalPayload::Disconnect { .. } => {
-                        self.peer_announcements.remove(&message.sender_pubkey);
-                        self.peer_status.insert(
-                            message.sender_pubkey,
-                            PeerLinkStatus {
-                                checking: false,
-                                reachable: Some(false),
-                                last_handshake_at: None,
-                                rx_bytes: None,
-                                tx_bytes: None,
-                                endpoint: None,
-                                error: Some("peer disconnected".to_string()),
-                                checked_at: Some(SystemTime::now()),
-                            },
-                        );
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        if changed {
-            self.reconcile_tunnel_runtime();
-        }
-    }
-
-    fn maybe_auto_relay_policy(&mut self) {
-        if !self.session_active {
-            return;
-        }
-
-        let expected = expected_peer_count(&self.config);
-        let connected = connected_configured_peer_count(&self.config, &self.peer_status);
-
-        if self.config.auto_disconnect_relays_when_mesh_ready
-            && is_mesh_complete(connected, expected)
-        {
-            if self.relay_connected {
-                self.disconnect_relays();
-                self.session_status =
-                    format!("Mesh ready ({connected}/{expected}) - relay connections paused");
-            }
-            return;
-        }
-
-        if !self.relay_connected {
-            let now = Instant::now();
-            let due = self
-                .next_relay_retry_at
-                .is_none_or(|retry_at| now >= retry_at);
-            if !due {
-                return;
-            }
-
-            if let Err(error) = self.connect_relays() {
-                self.session_status = format!("Relay reconnect failed: {error}");
-                self.next_relay_retry_at = Some(now + Duration::from_secs(5));
-            }
-        }
-    }
-
-    fn reconcile_tunnel_runtime(&mut self) {
-        if !self.session_active {
-            self.tunnel_runtime.stop();
-            self.tunnel_error = None;
-            return;
-        }
-
-        if self.config.participants.is_empty() {
-            self.tunnel_runtime.stop();
-            self.tunnel_error = None;
-            return;
-        }
-
-        match self
-            .tunnel_runtime
-            .apply(&self.config, &self.peer_announcements)
-        {
-            Ok(()) => {
-                if self.tunnel_error.is_some()
-                    && self.session_status.starts_with("Tunnel setup failed:")
-                {
-                    self.session_status = if self.relay_connected {
-                        "Connected".to_string()
-                    } else {
-                        "Connected (relays paused)".to_string()
-                    };
-                }
-                self.tunnel_error = None;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                if self.tunnel_error.as_deref() != Some(message.as_str()) {
-                    self.session_status = format!("Tunnel setup failed: {message}");
-                }
-                self.tunnel_error = Some(message);
-            }
-        }
+        self.sync_daemon_state();
     }
 
     fn add_participant(&mut self, npub: &str) -> Result<()> {
-        let had_no_participants = self.config.participants.is_empty();
         let input = npub.trim();
         if input.is_empty() {
             return Err(anyhow!("participant npub is empty"));
@@ -917,22 +336,15 @@ impl NvpnBackend {
         self.config.participants.sort();
         self.config.participants.dedup();
         self.peer_status.entry(normalized).or_default();
-        if had_no_participants && self.config.lan_discovery_enabled {
-            self.config.lan_discovery_enabled = false;
-        }
+
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
 
-        self.schedule_autosave();
         self.ensure_peer_status_entries();
-        self.refresh_magic_dns_runtime();
-        if self.session_active {
-            self.restart_relay_if_needed()?;
-        } else if !self.config.participants.is_empty() {
-            self.connect_session()?;
-        }
+        self.restart_daemon_if_running()?;
         self.maybe_refresh_lan_discovery();
-        self.reconcile_tunnel_runtime();
+        self.sync_daemon_state();
 
         Ok(())
     }
@@ -949,17 +361,15 @@ impl NvpnBackend {
         }
 
         self.peer_status.remove(&normalized);
-        self.peer_signal_seen_at.remove(&normalized);
-        self.peer_announcements.remove(&normalized);
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.schedule_autosave();
+        self.persist_config()?;
+
         self.ensure_peer_status_entries();
-        self.refresh_magic_dns_runtime();
-        self.restart_relay_if_needed()?;
+        self.restart_daemon_if_running()?;
         self.maybe_refresh_lan_discovery();
-        self.reconcile_tunnel_runtime();
+        self.sync_daemon_state();
 
         Ok(())
     }
@@ -985,10 +395,13 @@ impl NvpnBackend {
         }
 
         self.config.nostr.relays.push(relay.to_string());
-        self.relay_status.entry(relay.to_string()).or_default();
-        self.schedule_autosave();
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
+
         self.ensure_relay_status_entries();
-        self.restart_relay_if_needed()?;
+        self.restart_daemon_if_running()?;
+        self.sync_daemon_state();
 
         Ok(())
     }
@@ -1005,27 +418,33 @@ impl NvpnBackend {
             return Ok(());
         }
 
-        self.relay_status.remove(relay);
-        self.schedule_autosave();
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
+
         self.ensure_relay_status_entries();
-        self.restart_relay_if_needed()?;
+        self.restart_daemon_if_running()?;
+        self.sync_daemon_state();
 
         Ok(())
     }
 
     fn update_settings(&mut self, patch: SettingsPatch) -> Result<()> {
-        let mut reconnect_required = false;
+        let mut restart_required = false;
 
         if let Some(node_name) = patch.node_name {
             self.config.node_name = node_name;
+            restart_required = true;
         }
 
         if let Some(endpoint) = patch.endpoint {
             self.config.node.endpoint = endpoint;
+            restart_required = true;
         }
 
         if let Some(tunnel_ip) = patch.tunnel_ip {
             self.config.node.tunnel_ip = tunnel_ip;
+            restart_required = true;
         }
 
         if let Some(listen_port) = patch.listen_port {
@@ -1033,14 +452,17 @@ impl NvpnBackend {
                 return Err(anyhow!("listen port must be > 0"));
             }
             self.config.node.listen_port = listen_port;
+            restart_required = true;
         }
 
         if let Some(network_id) = patch.network_id {
             self.config.network_id = network_id;
-            reconnect_required = true;
+            restart_required = true;
         }
+
         if let Some(magic_dns_suffix) = patch.magic_dns_suffix {
             self.config.magic_dns_suffix = magic_dns_suffix;
+            restart_required = true;
         }
 
         if let Some(auto_disconnect_relays_when_mesh_ready) =
@@ -1048,60 +470,44 @@ impl NvpnBackend {
         {
             self.config.auto_disconnect_relays_when_mesh_ready =
                 auto_disconnect_relays_when_mesh_ready;
+            restart_required = true;
+        }
+
+        if let Some(autoconnect) = patch.autoconnect {
+            self.config.autoconnect = autoconnect;
         }
 
         if let Some(lan_discovery_enabled) = patch.lan_discovery_enabled {
             self.config.lan_discovery_enabled = lan_discovery_enabled;
         }
+
         if let Some(launch_on_startup) = patch.launch_on_startup {
             self.config.launch_on_startup = launch_on_startup;
         }
+
         if let Some(close_to_tray_on_close) = patch.close_to_tray_on_close {
             self.config.close_to_tray_on_close = close_to_tray_on_close;
         }
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
+        self.persist_config()?;
 
-        self.schedule_autosave();
+        self.maybe_refresh_lan_discovery();
 
-        if reconnect_required {
-            self.restart_relay_if_needed()?;
-        } else if self.relay_connected {
-            let _ = self.publish_announcement();
+        if restart_required {
+            self.restart_daemon_if_running()?;
         }
 
-        if self.session_active {
-            self.reconcile_tunnel_runtime();
-            self.refresh_magic_dns_runtime();
-        }
-
+        self.sync_daemon_state();
         Ok(())
     }
 
     fn set_participant_alias(&mut self, npub: &str, alias: &str) -> Result<()> {
         self.config.set_peer_alias(npub, alias)?;
-        self.schedule_autosave();
-        self.refresh_magic_dns_runtime();
-        Ok(())
-    }
-
-    fn restart_relay_if_needed(&mut self) -> Result<()> {
-        if !self.session_active {
-            return Ok(());
-        }
-
-        let was_connected = self.relay_connected;
-        if self.relay_connected {
-            self.disconnect_relays();
-        }
-
-        if was_connected {
-            self.connect_relays()?;
-        } else {
-            self.next_relay_retry_at = Some(Instant::now());
-        }
-
+        self.persist_config()?;
+        self.restart_daemon_if_running()?;
+        self.sync_daemon_state();
         Ok(())
     }
 
@@ -1115,37 +521,7 @@ impl NvpnBackend {
         self.config.save(&self.config_path)?;
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
-
         Ok(())
-    }
-
-    fn schedule_autosave(&mut self) {
-        self.autosave_pending = true;
-        self.autosave_due_at = Some(Instant::now() + Duration::from_millis(700));
-    }
-
-    fn maybe_run_autosave(&mut self) {
-        if !self.autosave_pending {
-            return;
-        }
-
-        let due = self
-            .autosave_due_at
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        if !due {
-            return;
-        }
-
-        match self.persist_config() {
-            Ok(()) => {
-                self.autosave_pending = false;
-                self.autosave_due_at = None;
-            }
-            Err(error) => {
-                self.session_status = format!("Autosave failed: {error}");
-                self.autosave_due_at = Some(Instant::now() + Duration::from_secs(2));
-            }
-        }
     }
 
     fn ensure_relay_status_entries(&mut self) {
@@ -1154,7 +530,12 @@ impl NvpnBackend {
             .retain(|relay, _| configured.contains(relay));
 
         for relay in &self.config.nostr.relays {
-            self.relay_status.entry(relay.clone()).or_default();
+            self.relay_status
+                .entry(relay.clone())
+                .or_insert(RelayStatus {
+                    state: "unknown".to_string(),
+                    status_text: "not checked".to_string(),
+                });
         }
     }
 
@@ -1162,13 +543,317 @@ impl NvpnBackend {
         let configured: HashSet<String> = self.config.participants.iter().cloned().collect();
         self.peer_status
             .retain(|participant, _| configured.contains(participant));
-        self.peer_signal_seen_at
-            .retain(|participant, _| configured.contains(participant));
-        self.peer_announcements
-            .retain(|participant, _| configured.contains(participant));
 
         for participant in &self.config.participants {
             self.peer_status.entry(participant.clone()).or_default();
+        }
+    }
+
+    fn start_daemon_process(&self) -> Result<()> {
+        let output = self.run_nvpn_command([
+            "start",
+            "--daemon",
+            "--connect",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ])?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn start failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        if message.contains("already running") {
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn stop_daemon_process(&self) -> Result<()> {
+        let output = self.run_nvpn_command([
+            "stop",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+            "--timeout-secs",
+            "5",
+        ])?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let message = format!(
+            "nvpn stop failed\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        if message.contains("not running") {
+            return Ok(());
+        }
+
+        Err(anyhow!(message))
+    }
+
+    fn restart_daemon_if_running(&mut self) -> Result<()> {
+        let status = self.fetch_cli_status()?;
+        if !status.daemon.running {
+            return Ok(());
+        }
+
+        self.stop_daemon_process()?;
+        self.start_daemon_process()?;
+        Ok(())
+    }
+
+    fn fetch_cli_status(&self) -> Result<CliStatusResponse> {
+        let output = self.run_nvpn_command([
+            "status",
+            "--json",
+            "--discover-secs",
+            "0",
+            "--config",
+            self.config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
+        ])?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(anyhow!(
+                "nvpn status failed\nstdout: {}\nstderr: {}",
+                stdout.trim(),
+                stderr.trim()
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let json_text = extract_json_document(&stdout)?;
+        let parsed = serde_json::from_str::<CliStatusResponse>(json_text)
+            .context("failed to parse `nvpn status --json` output")?;
+        Ok(parsed)
+    }
+
+    fn run_nvpn_command<const N: usize>(&self, args: [&str; N]) -> Result<std::process::Output> {
+        let Some(nvpn_bin) = &self.nvpn_bin else {
+            return Err(anyhow!(
+                "nvpn CLI binary not found; set {} or install nvpn in PATH",
+                NVPN_BIN_ENV
+            ));
+        };
+
+        ProcessCommand::new(nvpn_bin)
+            .args(args)
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to execute {} {}",
+                    nvpn_bin.display(),
+                    args.join(" ")
+                )
+            })
+    }
+
+    fn sync_daemon_state(&mut self) {
+        self.ensure_relay_status_entries();
+        self.ensure_peer_status_entries();
+
+        let status = match self.fetch_cli_status() {
+            Ok(status) => status,
+            Err(error) => {
+                self.daemon_state = None;
+                self.session_active = false;
+                self.relay_connected = false;
+                self.session_status = format!("Daemon status unavailable: {error}");
+                self.magic_dns_status = "DNS status unavailable (daemon not reachable)".to_string();
+
+                for relay in &self.config.nostr.relays {
+                    self.relay_status.insert(
+                        relay.clone(),
+                        RelayStatus {
+                            state: "unknown".to_string(),
+                            status_text: "not checked".to_string(),
+                        },
+                    );
+                }
+
+                for participant in &self.config.participants {
+                    let status = self.peer_status.entry(participant.clone()).or_default();
+                    status.reachable = None;
+                    status.last_handshake_at = None;
+                    status.endpoint = None;
+                    status.error = Some("vpn off".to_string());
+                    status.checked_at = Some(SystemTime::now());
+                    status.last_signal_seen_at = None;
+                }
+                return;
+            }
+        };
+
+        let state = status.daemon.state.clone();
+        self.daemon_state = state.clone();
+
+        if status.daemon.running {
+            self.session_active = state
+                .as_ref()
+                .map(|value| value.session_active)
+                .unwrap_or(true);
+            self.relay_connected = state
+                .as_ref()
+                .map(|value| value.relay_connected)
+                .unwrap_or(false);
+            self.session_status = state
+                .as_ref()
+                .map(|value| value.session_status.clone())
+                .unwrap_or_else(|| "Daemon running".to_string());
+        } else {
+            self.session_active = false;
+            self.relay_connected = false;
+            self.session_status = "Disconnected".to_string();
+        }
+
+        self.refresh_relay_runtime_status();
+        self.refresh_peer_runtime_status();
+
+        self.magic_dns_status = if self.session_active {
+            let suffix = self
+                .config
+                .magic_dns_suffix
+                .trim()
+                .trim_matches('.')
+                .to_ascii_lowercase();
+            if suffix.is_empty() {
+                "MagicDNS active in daemon (suffix disabled)".to_string()
+            } else {
+                format!("MagicDNS active in daemon for .{suffix}")
+            }
+        } else {
+            "DNS disabled (VPN off)".to_string()
+        };
+    }
+
+    fn refresh_relay_runtime_status(&mut self) {
+        let mesh_ready = self
+            .daemon_state
+            .as_ref()
+            .is_some_and(|value| value.mesh_ready);
+
+        for relay in &self.config.nostr.relays {
+            let entry = self.relay_status.entry(relay.clone()).or_default();
+
+            if !self.session_active {
+                entry.state = "unknown".to_string();
+                entry.status_text = "not checked".to_string();
+            } else if self.relay_connected {
+                entry.state = "up".to_string();
+                entry.status_text = "connected".to_string();
+            } else if self.config.auto_disconnect_relays_when_mesh_ready && mesh_ready {
+                entry.state = "down".to_string();
+                entry.status_text = "paused (mesh ready)".to_string();
+            } else {
+                entry.state = "down".to_string();
+                entry.status_text = "disconnected".to_string();
+            }
+        }
+    }
+
+    fn refresh_peer_runtime_status(&mut self) {
+        let own_pubkey = self.config.own_nostr_pubkey_hex().ok();
+        let now = SystemTime::now();
+        let daemon_peer_map = self
+            .daemon_state
+            .as_ref()
+            .map(|value| {
+                value
+                    .peers
+                    .iter()
+                    .map(|peer| (peer.participant_pubkey.as_str(), peer))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
+        for participant in &self.config.participants {
+            let status = self.peer_status.entry(participant.clone()).or_default();
+            status.checked_at = Some(now);
+
+            if Some(participant.as_str()) == own_pubkey.as_deref() {
+                status.reachable = None;
+                status.last_handshake_at = None;
+                status.endpoint = None;
+                status.error = None;
+                status.last_signal_seen_at = None;
+                continue;
+            }
+
+            if !self.session_active {
+                status.reachable = None;
+                status.last_handshake_at = None;
+                status.endpoint = None;
+                status.error = Some("vpn off".to_string());
+                status.last_signal_seen_at = None;
+                continue;
+            }
+
+            let Some(peer) = daemon_peer_map.get(participant.as_str()) else {
+                status.reachable = Some(false);
+                status.last_handshake_at = None;
+                status.endpoint = None;
+                status.error = Some("no signal yet".to_string());
+                status.last_signal_seen_at = None;
+                continue;
+            };
+
+            status.reachable = Some(peer.reachable);
+            status.endpoint = if peer.endpoint.is_empty() {
+                None
+            } else {
+                Some(peer.endpoint.clone())
+            };
+            status.last_handshake_at = peer
+                .last_handshake_at
+                .and_then(epoch_secs_to_system_time)
+                .or_else(|| {
+                    if peer.reachable {
+                        Some(SystemTime::now())
+                    } else {
+                        None
+                    }
+                });
+            status.last_signal_seen_at = peer
+                .last_signal_seen_at
+                .and_then(epoch_secs_to_system_time)
+                .or_else(|| {
+                    if peer.presence_timestamp > 0 {
+                        epoch_secs_to_system_time(peer.presence_timestamp)
+                    } else {
+                        None
+                    }
+                });
+            status.error = if peer.reachable {
+                None
+            } else {
+                Some(
+                    peer.error
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or_else(|| "awaiting handshake".to_string()),
+                )
+            };
         }
     }
 
@@ -1176,12 +861,14 @@ impl NvpnBackend {
         let mut summary = RelaySummary::default();
 
         for relay in &self.config.nostr.relays {
-            match self.relay_status.get(relay) {
-                Some(status) if status.checking => summary.checking += 1,
-                Some(status) if status.error.is_none() && status.latency_ms.is_some() => {
-                    summary.up += 1;
-                }
-                Some(status) if status.error.is_some() => summary.down += 1,
+            match self
+                .relay_status
+                .get(relay)
+                .map(|value| value.state.as_str())
+            {
+                Some("up") => summary.up += 1,
+                Some("down") => summary.down += 1,
+                Some("checking") => summary.checking += 1,
                 _ => summary.unknown += 1,
             }
         }
@@ -1189,40 +876,18 @@ impl NvpnBackend {
         summary
     }
 
-    fn relay_state(&self, relay: &str) -> &'static str {
-        match self.relay_status.get(relay) {
-            Some(status) if status.checking => "checking",
-            Some(status) if status.error.is_none() && status.latency_ms.is_some() => "up",
-            Some(status) if status.error.is_some() => "down",
-            _ => "unknown",
-        }
+    fn relay_state(&self, relay: &str) -> &str {
+        self.relay_status
+            .get(relay)
+            .map(|value| value.state.as_str())
+            .unwrap_or("unknown")
     }
 
     fn relay_status_line(&self, relay: &str) -> String {
-        let Some(status) = self.relay_status.get(relay) else {
-            return "not checked".to_string();
-        };
-
-        if status.checking {
-            return "checking...".to_string();
-        }
-
-        if let Some(error) = &status.error {
-            return format!("down ({error})");
-        }
-
-        if let Some(latency_ms) = status.latency_ms {
-            if let Some(checked_at) = status.checked_at {
-                let age_secs = checked_at
-                    .elapsed()
-                    .map(|elapsed| elapsed.as_secs())
-                    .unwrap_or(0);
-                return format!("up ({latency_ms} ms, {age_secs}s ago)");
-            }
-            return format!("up ({latency_ms} ms)");
-        }
-
-        "not checked".to_string()
+        self.relay_status
+            .get(relay)
+            .map(|value| value.status_text.clone())
+            .unwrap_or_else(|| "not checked".to_string())
     }
 
     fn configured_peer_rows(&self) -> Vec<ParticipantView> {
@@ -1266,7 +931,11 @@ impl NvpnBackend {
             return "self".to_string();
         }
 
-        let Some(seen_at) = self.peer_signal_seen_at.get(participant) else {
+        let Some(seen_at) = self
+            .peer_status
+            .get(participant)
+            .and_then(|status| status.last_signal_seen_at)
+        else {
             return "no presence yet".to_string();
         };
 
@@ -1287,7 +956,6 @@ impl NvpnBackend {
         }
 
         match self.peer_status.get(participant) {
-            Some(status) if status.checking => ConfiguredPeerStatus::Checking,
             Some(status) if status.reachable == Some(true) => ConfiguredPeerStatus::Online,
             Some(status) if status.reachable == Some(false) => ConfiguredPeerStatus::Offline,
             _ => ConfiguredPeerStatus::Unknown,
@@ -1297,33 +965,31 @@ impl NvpnBackend {
     fn peer_status_line(&self, participant: &str, status: ConfiguredPeerStatus) -> String {
         match status {
             ConfiguredPeerStatus::Local => "local".to_string(),
-            ConfiguredPeerStatus::Checking => "checking...".to_string(),
             ConfiguredPeerStatus::Online => {
                 let Some(link) = self.peer_status.get(participant) else {
                     return "online".to_string();
                 };
-                let handshake_age = link.last_handshake_at.and_then(|handshake_at| {
-                    handshake_at.elapsed().ok().map(|elapsed| elapsed.as_secs())
-                });
 
-                let tx = link.tx_bytes.map(format_bytes);
-                let rx = link.rx_bytes.map(format_bytes);
+                let handshake_age = link
+                    .last_handshake_at
+                    .and_then(|handshake_at| handshake_at.elapsed().ok())
+                    .map(|elapsed| elapsed.as_secs());
 
-                match (handshake_age, tx, rx) {
-                    (Some(age_secs), Some(tx), Some(rx)) => {
-                        format!("online (handshake {age_secs}s ago, tx {tx}, rx {rx})")
-                    }
-                    (Some(age_secs), _, _) => format!("online (handshake {age_secs}s ago)"),
-                    _ => "online".to_string(),
+                match handshake_age {
+                    Some(age_secs) => format!("online (handshake {age_secs}s ago)"),
+                    None => "online".to_string(),
                 }
             }
             ConfiguredPeerStatus::Offline => {
                 let Some(link) = self.peer_status.get(participant) else {
                     return "offline".to_string();
                 };
-                let checked_age = link.checked_at.and_then(|checked_at| {
-                    checked_at.elapsed().ok().map(|elapsed| elapsed.as_secs())
-                });
+
+                let checked_age = link
+                    .checked_at
+                    .and_then(|checked_at| checked_at.elapsed().ok())
+                    .map(|elapsed| elapsed.as_secs());
+
                 if let Some(error) = &link.error {
                     match checked_age {
                         Some(age_secs) => {
@@ -1346,131 +1012,10 @@ impl NvpnBackend {
     }
 
     fn tick(&mut self) {
-        self.handle_relay_checks();
-        self.handle_signals();
-        self.reconcile_tunnel_runtime();
-        self.refresh_peer_link_statuses();
-
-        self.maybe_schedule_periodic_relay_check();
-        self.maybe_auto_relay_policy();
-
         self.maybe_refresh_lan_discovery();
         self.handle_lan_discovery_events();
         self.prune_lan_peers();
-
-        self.maybe_run_autosave();
-    }
-
-    fn stop_magic_dns_runtime(&mut self) {
-        if let Some(mut server) = self.magic_dns_server.take() {
-            server.stop();
-        }
-
-        if let Some(suffix) = self.magic_dns_resolver_suffix.take() {
-            let _ = uninstall_system_resolver(&suffix);
-        }
-    }
-
-    fn refresh_magic_dns_runtime(&mut self) {
-        if !self.session_active {
-            self.stop_magic_dns_runtime();
-            self.magic_dns_status = "DNS disabled (session disconnected)".to_string();
-            return;
-        }
-
-        let records = build_magic_dns_records(&self.config);
-        if records.is_empty() {
-            self.stop_magic_dns_runtime();
-            self.magic_dns_status = "DNS disabled (no alias records)".to_string();
-            return;
-        }
-
-        if let Some(server) = self.magic_dns_server.as_ref() {
-            server.update_records(records);
-        } else {
-            match MagicDnsServer::start(
-                SocketAddr::from((Ipv4Addr::LOCALHOST, MAGIC_DNS_PORT)),
-                records.clone(),
-            ) {
-                Ok(server) => {
-                    self.magic_dns_server = Some(server);
-                }
-                Err(error) => {
-                    match MagicDnsServer::start(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), records)
-                    {
-                        Ok(server) => {
-                            self.magic_dns_server = Some(server);
-                            self.magic_dns_status = format!(
-                                "DNS server fallback: preferred port {MAGIC_DNS_PORT} unavailable ({error})"
-                            );
-                        }
-                        Err(fallback_error) => {
-                            self.stop_magic_dns_runtime();
-                            self.magic_dns_status = format!("DNS server failed: {fallback_error}");
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-
-        let Some(server) = self.magic_dns_server.as_ref() else {
-            self.magic_dns_status = "DNS server unavailable".to_string();
-            return;
-        };
-
-        let local_addr = server.local_addr();
-        let suffix = self
-            .config
-            .magic_dns_suffix
-            .trim()
-            .trim_matches('.')
-            .to_ascii_lowercase();
-
-        if suffix.is_empty() {
-            if let Some(existing) = self.magic_dns_resolver_suffix.take() {
-                let _ = uninstall_system_resolver(&existing);
-            }
-            self.magic_dns_status =
-                format!("Local DNS only on {local_addr} (set suffix for system split-dns)");
-            return;
-        }
-
-        let nameserver = match local_addr {
-            SocketAddr::V4(v4) => *v4.ip(),
-            SocketAddr::V6(_) => {
-                self.magic_dns_status =
-                    format!("Local DNS on {local_addr}; split-dns unavailable (IPv6 bind)");
-                return;
-            }
-        };
-
-        if let Some(existing) = self.magic_dns_resolver_suffix.clone()
-            && existing != suffix
-        {
-            let _ = uninstall_system_resolver(&existing);
-            self.magic_dns_resolver_suffix = None;
-        }
-
-        let resolver_config = MagicDnsResolverConfig {
-            suffix: suffix.clone(),
-            nameserver,
-            port: local_addr.port(),
-        };
-        match install_system_resolver(&resolver_config) {
-            Ok(()) => {
-                self.magic_dns_resolver_suffix = Some(suffix.clone());
-                self.magic_dns_status = format!(
-                    "System DNS active for .{suffix} via {}:{}",
-                    resolver_config.nameserver, resolver_config.port
-                );
-            }
-            Err(error) => {
-                self.magic_dns_resolver_suffix = None;
-                self.magic_dns_status =
-                    format!("Local DNS on {local_addr}; resolver install failed: {error}");
-            }
-        }
+        self.sync_daemon_state();
     }
 
     fn maybe_refresh_lan_discovery(&mut self) {
@@ -1633,8 +1178,25 @@ impl NvpnBackend {
             .collect::<Vec<_>>();
 
         let relay_summary = self.relay_summary();
-        let expected_peer_count = expected_peer_count(&self.config);
-        let connected_peer_count = connected_configured_peer_count(&self.config, &self.peer_status);
+        let fallback_expected_peer_count = expected_peer_count(&self.config);
+        let fallback_connected_peer_count =
+            connected_configured_peer_count(&self.config, &self.peer_status);
+
+        let expected_peer_count = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.expected_peer_count)
+            .unwrap_or(fallback_expected_peer_count);
+        let connected_peer_count = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.connected_peer_count)
+            .unwrap_or(fallback_connected_peer_count);
+        let mesh_ready = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.mesh_ready)
+            .unwrap_or_else(|| is_mesh_complete(connected_peer_count, expected_peer_count));
 
         UiState {
             session_active: self.session_active,
@@ -1655,12 +1217,13 @@ impl NvpnBackend {
             auto_disconnect_relays_when_mesh_ready: self
                 .config
                 .auto_disconnect_relays_when_mesh_ready,
+            autoconnect: self.config.autoconnect,
             lan_discovery_enabled: self.config.lan_discovery_enabled,
             launch_on_startup: self.config.launch_on_startup,
             close_to_tray_on_close: self.config.close_to_tray_on_close,
             connected_peer_count,
             expected_peer_count,
-            mesh_ready: is_mesh_complete(connected_peer_count, expected_peer_count),
+            mesh_ready,
             participants,
             relays,
             relay_summary,
@@ -1671,330 +1234,113 @@ impl NvpnBackend {
 
 impl Drop for NvpnBackend {
     fn drop(&mut self) {
-        self.stop_magic_dns_runtime();
         self.stop_lan_discovery();
-        self.disconnect_relays();
-        self.tunnel_runtime.stop();
     }
 }
 
-fn peer_from_announcement(announcement: &PeerAnnouncement) -> Result<WireGuardPeer> {
-    let endpoint: SocketAddr = announcement
-        .endpoint
-        .parse()
-        .with_context(|| format!("invalid peer endpoint {}", announcement.endpoint))?;
-
-    Ok(WireGuardPeer {
-        pubkey_hex: key_b64_to_hex(&announcement.public_key)?,
-        endpoint: endpoint.to_string(),
-        allowed_ip: normalize_cidr32(&announcement.tunnel_ip),
-    })
-}
-
-fn local_tunnel_address_for_interface(tunnel_ip: &str) -> String {
-    format!("{}/24", strip_cidr(tunnel_ip))
-}
-
-fn normalize_cidr32(ip_or_cidr: &str) -> String {
-    format!("{}/32", strip_cidr(ip_or_cidr))
-}
-
-fn strip_cidr(value: &str) -> &str {
-    value.split('/').next().unwrap_or(value)
-}
-
-fn tunnel_fingerprint(
-    iface: &str,
-    private_key: &str,
-    listen_port: u16,
-    local_address: &str,
-    peers: &[WireGuardPeer],
-) -> String {
-    let mut peer_entries = peers
-        .iter()
-        .map(|peer| format!("{}|{}|{}", peer.pubkey_hex, peer.endpoint, peer.allowed_ip))
-        .collect::<Vec<_>>();
-    peer_entries.sort();
-    format!(
-        "{iface}|{private_key}|{listen_port}|{local_address}|{}",
-        peer_entries.join(";")
-    )
-}
-
-fn apply_base_tunnel_config(socket: &str, listen_port: u16, private_key_b64: &str) -> Result<()> {
-    let private_key_hex = key_b64_to_hex(private_key_b64)?;
-    wg_set(
-        socket,
-        &format!("private_key={private_key_hex}\nlisten_port={listen_port}"),
-    )
-}
-
-fn apply_peer_set(socket: &str, peers: &[WireGuardPeer]) -> Result<()> {
-    wg_set(socket, "replace_peers=true")?;
-    for peer in peers {
-        wg_set(
-            socket,
-            &format!(
-                "public_key={}\nendpoint={}\nreplace_allowed_ips=true\nallowed_ip={}\npersistent_keepalive_interval=5",
-                peer.pubkey_hex, peer.endpoint, peer.allowed_ip
-            ),
-        )?;
+fn resolve_nvpn_cli_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os(NVPN_BIN_ENV) {
+        let candidate = PathBuf::from(path);
+        return validate_nvpn_binary(candidate);
     }
-    Ok(())
-}
 
-fn apply_local_interface_network(iface: &str, address: &str) -> Result<()> {
-    #[cfg(target_os = "linux")]
+    if let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
     {
-        run_checked(
-            ProcessCommand::new("ip")
-                .arg("address")
-                .arg("replace")
-                .arg(address)
-                .arg("dev")
-                .arg(iface),
-        )?;
-        run_checked(
-            ProcessCommand::new("ip")
-                .arg("link")
-                .arg("set")
-                .arg("mtu")
-                .arg("1380")
-                .arg("up")
-                .arg("dev")
-                .arg(iface),
-        )?;
-        run_checked(
-            ProcessCommand::new("ip")
-                .arg("route")
-                .arg("replace")
-                .arg("10.44.0.0/24")
-                .arg("dev")
-                .arg(iface),
-        )?;
-        return Ok(());
+        let sibling = dir.join(nvpn_binary_name());
+        if sibling.exists() {
+            return validate_nvpn_binary(sibling);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let resources_sidecar = dir
+                .parent()
+                .and_then(Path::parent)
+                .map(|path| path.join("Resources").join(nvpn_binary_name()));
+            if let Some(candidate) = resources_sidecar
+                && candidate.exists()
+            {
+                return validate_nvpn_binary(candidate);
+            }
+        }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        let ip = strip_cidr(address).to_string();
-        run_checked(
-            ProcessCommand::new("ifconfig")
-                .arg(iface)
-                .arg("inet")
-                .arg(&ip)
-                .arg(&ip)
-                .arg("netmask")
-                .arg("255.255.255.0")
-                .arg("up"),
-        )?;
-        run_checked(
-            ProcessCommand::new("route")
-                .arg("-n")
-                .arg("add")
-                .arg("-net")
-                .arg("10.44.0.0/24")
-                .arg("-interface")
-                .arg(iface),
-        )
-        .or_else(|_| {
-            run_checked(
-                ProcessCommand::new("route")
-                    .arg("-n")
-                    .arg("change")
-                    .arg("-net")
-                    .arg("10.44.0.0/24")
-                    .arg("-interface")
-                    .arg(iface),
-            )
-        })?;
-        return Ok(());
+    if let Some(path_var) = env::var_os("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let candidate = dir.join(nvpn_binary_name());
+            if candidate.exists()
+                && let Ok(validated) = validate_nvpn_binary(candidate)
+            {
+                return Ok(validated);
+            }
+        }
     }
 
-    #[allow(unreachable_code)]
     Err(anyhow!(
-        "local interface configuration not implemented for this platform"
+        "nvpn CLI binary not found; set {} or install nvpn",
+        NVPN_BIN_ENV
     ))
 }
 
-fn key_b64_to_hex(value: &str) -> Result<String> {
-    let bytes = STANDARD
-        .decode(value)
-        .with_context(|| "invalid WireGuard key encoding (base64 expected)")?;
-    if bytes.len() != 32 {
-        return Err(anyhow!("expected 32-byte WireGuard key material"));
-    }
-    Ok(encode_hex_lower(&bytes))
-}
+fn validate_nvpn_binary(path: PathBuf) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(&path)
+        .with_context(|| format!("failed to canonicalize {}", path.display()))?;
 
-fn encode_hex_lower(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut result, "{byte:02x}");
-    }
-    result
-}
-
-fn uapi_socket_path(iface: &str) -> String {
-    format!("/var/run/wireguard/{iface}.sock")
-}
-
-fn wait_for_socket(path: &str) -> Result<()> {
-    for _ in 0..50 {
-        if fs::metadata(path).is_ok() {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(anyhow!("timed out waiting for uapi socket at {path}"))
-}
-
-fn wg_set(socket_path: &str, body: &str) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path;
-        let _ = body;
-        return Err(anyhow!(
-            "wireguard uapi writes are supported on unix targets only"
-        ));
+    let metadata = fs::metadata(&canonical)
+        .with_context(|| format!("failed to inspect {}", canonical.display()))?;
+    if !metadata.is_file() {
+        return Err(anyhow!("{} is not a file", canonical.display()));
     }
 
     #[cfg(unix)]
     {
-        let mut socket =
-            UnixStream::connect(socket_path).with_context(|| format!("connect {socket_path}"))?;
-        write!(socket, "set=1\n{body}\n\n").context("failed to send uapi set")?;
-        socket
-            .shutdown(std::net::Shutdown::Write)
-            .context("failed to close uapi write half")?;
-
-        let mut response = String::new();
-        socket
-            .read_to_string(&mut response)
-            .context("failed to read uapi response")?;
-
-        if !response.contains("errno=0") {
-            return Err(anyhow!("uapi set failed: {}", response.trim()));
+        let mode = metadata.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(anyhow!("{} is not executable", canonical.display()));
         }
-
-        Ok(())
+        if mode & 0o002 != 0 {
+            return Err(anyhow!(
+                "{} is world-writable and rejected for daemon control safety",
+                canonical.display()
+            ));
+        }
     }
+
+    Ok(canonical)
 }
 
-fn wg_get(socket_path: &str) -> Result<String> {
-    #[cfg(not(unix))]
-    {
-        let _ = socket_path;
-        return Err(anyhow!(
-            "wireguard uapi reads are supported on unix targets only"
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        let mut socket =
-            UnixStream::connect(socket_path).with_context(|| format!("connect {socket_path}"))?;
-        write!(socket, "get=1\n\n").context("failed to send uapi get")?;
-        socket
-            .shutdown(std::net::Shutdown::Write)
-            .context("failed to close uapi write half")?;
-
-        let mut response = String::new();
-        socket
-            .read_to_string(&mut response)
-            .context("failed to read uapi get response")?;
-
-        if !response.contains("errno=0") {
-            return Err(anyhow!("uapi get failed: {}", response.trim()));
-        }
-
-        Ok(response)
-    }
+#[cfg(target_os = "windows")]
+fn nvpn_binary_name() -> &'static str {
+    "nvpn.exe"
 }
 
-fn parse_wg_peer_status(response: &str) -> HashMap<String, WireGuardPeerStatus> {
-    let mut peers = HashMap::new();
-    let mut current_pubkey: Option<String> = None;
-    let mut current = WireGuardPeerStatus::default();
-
-    let commit_current = |peers: &mut HashMap<String, WireGuardPeerStatus>,
-                          current_pubkey: &mut Option<String>,
-                          current: &mut WireGuardPeerStatus| {
-        if let Some(pubkey) = current_pubkey.take() {
-            peers.insert(pubkey, std::mem::take(current));
-        }
-    };
-
-    for line in response.lines() {
-        if line.is_empty() || line == "errno=0" {
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("public_key=") {
-            commit_current(&mut peers, &mut current_pubkey, &mut current);
-            current_pubkey = Some(value.trim().to_lowercase());
-            continue;
-        }
-
-        let Some(_pubkey) = current_pubkey.as_ref() else {
-            continue;
-        };
-
-        if let Some(value) = line.strip_prefix("endpoint=") {
-            current.endpoint = Some(value.trim().to_string());
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("last_handshake_time_sec=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.last_handshake_sec = Some(parsed);
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("last_handshake_time_nsec=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.last_handshake_nsec = Some(parsed);
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("rx_bytes=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.rx_bytes = Some(parsed);
-            }
-            continue;
-        }
-
-        if let Some(value) = line.strip_prefix("tx_bytes=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.tx_bytes = Some(parsed);
-            }
-        }
-    }
-
-    commit_current(&mut peers, &mut current_pubkey, &mut current);
-    peers
+#[cfg(not(target_os = "windows"))]
+fn nvpn_binary_name() -> &'static str {
+    "nvpn"
 }
 
-fn run_checked(command: &mut ProcessCommand) -> Result<()> {
-    let display = format!("{command:?}");
-    let output = command
-        .output()
-        .with_context(|| format!("failed to execute {display}"))?;
+fn extract_json_document(raw: &str) -> Result<&str> {
+    let start = raw
+        .find('{')
+        .ok_or_else(|| anyhow!("command output did not contain JSON start"))?;
+    let end = raw
+        .rfind('}')
+        .ok_or_else(|| anyhow!("command output did not contain JSON end"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(anyhow!(
-            "command failed: {display}\nstdout: {}\nstderr: {}",
-            stdout.trim(),
-            stderr.trim()
-        ));
+    if end < start {
+        return Err(anyhow!("invalid JSON range in command output"));
     }
 
-    Ok(())
+    Ok(&raw[start..=end])
+}
+
+fn epoch_secs_to_system_time(value: u64) -> Option<SystemTime> {
+    if value == 0 {
+        return None;
+    }
+
+    UNIX_EPOCH.checked_add(Duration::from_secs(value))
 }
 
 fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
@@ -2014,19 +1360,6 @@ fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
             .rev()
             .collect::<String>()
     )
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-
-    if bytes as f64 >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB)
-    } else if bytes as f64 >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 fn expected_peer_count(config: &AppConfig) -> usize {
@@ -2073,7 +1406,6 @@ fn is_mesh_complete(connected: usize, expected: usize) -> bool {
 fn peer_state_label(state: ConfiguredPeerStatus) -> &'static str {
     match state {
         ConfiguredPeerStatus::Local => "local",
-        ConfiguredPeerStatus::Checking => "checking",
         ConfiguredPeerStatus::Online => "online",
         ConfiguredPeerStatus::Offline => "offline",
         ConfiguredPeerStatus::Unknown => "unknown",
@@ -2104,12 +1436,6 @@ fn to_npub(pubkey_hex: &str) -> String {
         .unwrap_or_else(|| pubkey_hex.to_string())
 }
 
-fn is_no_participants_error(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("no configured participants to send private signaling message to")
-}
-
 async fn run_lan_discovery_loop(
     tx: mpsc::Sender<LanDiscoverySignal>,
     stop_flag: Arc<AtomicBool>,
@@ -2117,21 +1443,22 @@ async fn run_lan_discovery_loop(
     node_name: String,
     endpoint: String,
 ) {
-    let multicast = Ipv4Addr::new(
+    let multicast = std::net::Ipv4Addr::new(
         LAN_DISCOVERY_ADDR[0],
         LAN_DISCOVERY_ADDR[1],
         LAN_DISCOVERY_ADDR[2],
         LAN_DISCOVERY_ADDR[3],
     );
-    let target = SocketAddr::from((LAN_DISCOVERY_ADDR, LAN_DISCOVERY_PORT));
+    let target = std::net::SocketAddr::from((LAN_DISCOVERY_ADDR, LAN_DISCOVERY_PORT));
 
-    let std_socket = match std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT)) {
-        Ok(socket) => socket,
-        Err(_) => return,
-    };
+    let std_socket =
+        match std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, LAN_DISCOVERY_PORT)) {
+            Ok(socket) => socket,
+            Err(_) => return,
+        };
 
     if std_socket
-        .join_multicast_v4(&multicast, &Ipv4Addr::UNSPECIFIED)
+        .join_multicast_v4(&multicast, &std::net::Ipv4Addr::UNSPECIFIED)
         .is_err()
     {
         return;
@@ -2310,7 +1637,11 @@ fn update_settings(state: State<'_, AppState>, patch: SettingsPatch) -> Result<U
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .try_init();
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
     let launch_on_startup_default = backend.config.launch_on_startup;
@@ -2359,53 +1690,19 @@ pub fn run() {
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
+                        button,
+                        button_state,
                         ..
                     } = event
+                        && button == MouseButton::Left
+                        && button_state == MouseButtonState::Up
                     {
                         let _ = show_main_window(tray.app_handle());
                     }
-                })
-                .show_menu_on_left_click(false);
+                });
 
-            #[cfg(target_os = "macos")]
-            let tray_builder = {
-                if let Ok(template_icon) =
-                    tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))
-                {
-                    tray_builder.icon(template_icon).icon_as_template(true)
-                } else if let Some(icon) = app.default_window_icon().cloned() {
-                    tray_builder.icon(icon).icon_as_template(true)
-                } else {
-                    tray_builder.icon_as_template(true)
-                }
-            };
-
-            #[cfg(not(target_os = "macos"))]
-            let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
-                tray_builder.icon(icon)
-            } else {
-                tray_builder
-            };
-
-            let _ = tray_builder.build(app)?;
-
+            tray_builder.build(app)?;
             Ok(())
-        })
-        .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
-            }
-
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                if should_close_to_tray(window.app_handle()) {
-                    api.prevent_close();
-                    let _ = window.hide();
-                } else {
-                    window.app_handle().exit(0);
-                }
-            }
         })
         .manage(AppState {
             backend: Mutex::new(backend),
@@ -2419,66 +1716,42 @@ pub fn run() {
             set_participant_alias,
             add_relay,
             remove_relay,
-            update_settings
+            update_settings,
         ])
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event
+                && should_close_to_tray(window.app_handle())
+            {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .build(tauri::generate_context!())
-        .expect("error while building tauri application");
+        .expect("error while running tauri application");
 
-    #[cfg(target_os = "macos")]
-    app.run(|app, event| {
-        if let tauri::RunEvent::Reopen { .. } = event {
-            let _ = show_main_window(app);
-        }
-    });
-
-    #[cfg(not(target_os = "macos"))]
-    app.run(|_app, _event| {});
+    app.run(|_app_handle, _event| {});
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        connected_configured_peer_count, expected_peer_count, is_mesh_complete,
-        local_tunnel_address_for_interface, normalize_cidr32, parse_wg_peer_status,
-        peer_from_announcement,
+        expected_peer_count, extract_json_document, is_mesh_complete, to_npub, validate_nvpn_binary,
     };
-    use std::collections::HashMap;
-
-    use crate::PeerLinkStatus;
     use nostr_vpn_core::config::AppConfig;
-    use nostr_vpn_core::control::PeerAnnouncement;
-    use nostr_vpn_core::crypto::generate_keypair;
 
     #[test]
     fn expected_peer_count_excludes_own_participant_when_present() {
         let mut config = AppConfig::generated();
-        config.participants = vec!["aa".to_string(), "bb".to_string(), "cc".to_string()];
+        let own_hex =
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_string();
+        config.participants = vec![
+            own_hex.clone(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ];
+        config.nostr.public_key = to_npub(&own_hex);
 
-        assert_eq!(expected_peer_count(&config), 3);
-    }
-
-    #[test]
-    fn connected_peer_count_only_counts_reachable() {
-        let mut config = AppConfig::generated();
-        config.participants = vec!["aa".to_string(), "bb".to_string()];
-
-        let mut map = HashMap::new();
-        map.insert(
-            "aa".to_string(),
-            PeerLinkStatus {
-                reachable: Some(true),
-                ..PeerLinkStatus::default()
-            },
-        );
-        map.insert(
-            "bb".to_string(),
-            PeerLinkStatus {
-                reachable: Some(false),
-                ..PeerLinkStatus::default()
-            },
-        );
-
-        assert_eq!(connected_configured_peer_count(&config, &map), 1);
+        assert_eq!(expected_peer_count(&config), 2);
     }
 
     #[test]
@@ -2489,67 +1762,36 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_ip_helpers_expand_to_expected_ranges() {
-        assert_eq!(normalize_cidr32("10.44.0.12"), "10.44.0.12/32");
-        assert_eq!(normalize_cidr32("10.44.0.12/24"), "10.44.0.12/32");
-        assert_eq!(
-            local_tunnel_address_for_interface("10.44.0.12/32"),
-            "10.44.0.12/24"
-        );
+    fn extract_json_document_ignores_prefix_noise() {
+        let raw = "INFO something\n{\"daemon\":{\"running\":false}}\n";
+        let extracted = extract_json_document(raw).expect("should extract json object");
+        assert_eq!(extracted, "{\"daemon\":{\"running\":false}}")
     }
 
     #[test]
-    fn peer_from_announcement_converts_b64_public_key_for_uapi() {
-        let keypair = generate_keypair();
-        let announcement = PeerAnnouncement {
-            node_id: "node-a".to_string(),
-            public_key: keypair.public_key,
-            endpoint: "203.0.113.7:51820".to_string(),
-            tunnel_ip: "10.44.0.2/32".to_string(),
-            timestamp: 1,
-        };
-
-        let peer = peer_from_announcement(&announcement).expect("peer conversion");
-        assert_eq!(peer.endpoint, "203.0.113.7:51820");
-        assert_eq!(peer.allowed_ip, "10.44.0.2/32");
-        assert_eq!(peer.pubkey_hex.len(), 64);
+    fn validate_nvpn_binary_rejects_missing_path() {
+        let result = validate_nvpn_binary("/path/that/does/not/exist".into());
+        assert!(result.is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn parse_wg_peer_status_reads_runtime_fields() {
-        let status = parse_wg_peer_status(
-            "private_key=<redacted>\n\
-             listen_port=51820\n\
-             public_key=ABCDEF012345\n\
-             endpoint=203.0.113.8:51820\n\
-             last_handshake_time_sec=1700000000\n\
-             last_handshake_time_nsec=222\n\
-             rx_bytes=101\n\
-             tx_bytes=202\n\
-             errno=0\n",
-        );
+    fn validate_nvpn_binary_rejects_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let peer = status
-            .get("abcdef012345")
-            .expect("expected parsed peer status");
-        assert_eq!(peer.endpoint.as_deref(), Some("203.0.113.8:51820"));
-        assert_eq!(peer.rx_bytes, Some(101));
-        assert_eq!(peer.tx_bytes, Some(202));
-        assert!(peer.last_handshake().is_some());
-    }
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "nvpn-test-{}-{}",
+            std::process::id(),
+            super::unix_timestamp()
+        ));
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write test executable");
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&path, perms).expect("set permissions");
 
-    #[test]
-    fn parse_wg_peer_status_zero_handshake_is_none() {
-        let status = parse_wg_peer_status(
-            "public_key=0123ABCD\n\
-             last_handshake_time_sec=0\n\
-             last_handshake_time_nsec=0\n\
-             rx_bytes=0\n\
-             tx_bytes=0\n\
-             errno=0\n",
-        );
-
-        let peer = status.get("0123abcd").expect("expected parsed peer");
-        assert!(peer.last_handshake().is_none());
+        let result = validate_nvpn_binary(path.clone());
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(path);
     }
 }

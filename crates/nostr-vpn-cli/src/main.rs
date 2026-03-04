@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +30,7 @@ use nostr_vpn_core::magic_dns::{
 use nostr_vpn_core::nat::{discover_public_udp_endpoint, hole_punch_udp};
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Debug, Parser)]
@@ -57,6 +60,10 @@ enum Command {
     },
     /// Bring the node up (publish presence and optionally discover peers).
     Up(UpArgs),
+    /// Start a session (foreground by default, or daemonized with --daemon).
+    Start(StartArgs),
+    /// Stop a background daemon started by `nvpn start --daemon`.
+    Stop(StopArgs),
     /// Run a full data-plane session from config (presence + boringtun tunnel).
     Connect(ConnectArgs),
     /// Bring the node down (publish disconnect signal).
@@ -117,6 +124,9 @@ enum Command {
     NatDiscover(NatDiscoverArgs),
     /// Send UDP punch packets to a peer endpoint to open NAT mappings.
     HolePunch(HolePunchArgs),
+    /// Internal daemon entrypoint. Use `nvpn start --daemon`.
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
     /// Internal low-level tunnel helper for e2e scripts.
     #[command(hide = true)]
     TunnelUp(TunnelUpArgs),
@@ -189,6 +199,54 @@ struct ConnectArgs {
 }
 
 #[derive(Debug, Args)]
+struct DaemonArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    network_id: Option<String>,
+    #[arg(long = "participant")]
+    participants: Vec<String>,
+    #[arg(long)]
+    relay: Vec<String>,
+    #[arg(long, default_value = "utun100")]
+    iface: String,
+    #[arg(long, default_value_t = 20)]
+    announce_interval_secs: u64,
+}
+
+#[derive(Debug, Args)]
+struct StartArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    network_id: Option<String>,
+    #[arg(long = "participant")]
+    participants: Vec<String>,
+    #[arg(long)]
+    relay: Vec<String>,
+    #[arg(long, default_value = "utun100")]
+    iface: String,
+    #[arg(long, default_value_t = 20)]
+    announce_interval_secs: u64,
+    #[arg(long)]
+    daemon: bool,
+    #[arg(long, conflicts_with = "no_connect")]
+    connect: bool,
+    #[arg(long, conflicts_with = "connect")]
+    no_connect: bool,
+}
+
+#[derive(Debug, Args)]
+struct StopArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long, default_value_t = 5)]
+    timeout_secs: u64,
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
 struct DownArgs {
     #[arg(long)]
     config: Option<PathBuf>,
@@ -244,6 +302,8 @@ struct SetArgs {
     participants: Vec<String>,
     #[arg(long)]
     auto_disconnect_relays_when_mesh_ready: Option<bool>,
+    #[arg(long)]
+    autoconnect: Option<bool>,
     #[arg(long)]
     json: bool,
 }
@@ -349,7 +409,9 @@ struct HolePunchArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let cli = Cli::parse();
 
@@ -418,6 +480,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Start(args) => {
+            start_session(args).await?;
+        }
+        Command::Stop(args) => {
+            stop_daemon(args)?;
+        }
         Command::Connect(args) => {
             connect_session(args).await?;
         }
@@ -465,23 +533,59 @@ async fn main() -> Result<()> {
             let (app, network_id) =
                 load_config_with_overrides(&config_path, args.network_id, args.participants)?;
             let relays = resolve_relays(&args.relay, &app);
-            let peers = discover_peers(&app, &network_id, &relays, args.discover_secs).await?;
-            let expected_peers = expected_peer_count(&app);
-            let mesh_ready = expected_peers > 0 && peers.len() >= expected_peers;
+            let daemon = daemon_status(&config_path)?;
+
+            let (peers, expected_peers, peer_count, mesh_ready, status_source) = if daemon.running {
+                if let Some(state) = daemon.state.clone() {
+                    let peers = state
+                        .peers
+                        .iter()
+                        .filter(|peer| !peer.node_id.is_empty())
+                        .map(|peer| PeerAnnouncement {
+                            node_id: peer.node_id.clone(),
+                            public_key: peer.public_key.clone(),
+                            endpoint: peer.endpoint.clone(),
+                            tunnel_ip: peer.tunnel_ip.clone(),
+                            timestamp: peer.presence_timestamp,
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        peers,
+                        state.expected_peer_count,
+                        state.connected_peer_count,
+                        state.mesh_ready,
+                        "daemon",
+                    )
+                } else {
+                    let peers =
+                        discover_peers(&app, &network_id, &relays, args.discover_secs).await?;
+                    let expected = expected_peer_count(&app);
+                    let mesh = expected > 0 && peers.len() >= expected;
+                    (peers.clone(), expected, peers.len(), mesh, "probe")
+                }
+            } else {
+                let peers = discover_peers(&app, &network_id, &relays, args.discover_secs).await?;
+                let expected = expected_peer_count(&app);
+                let mesh = expected > 0 && peers.len() >= expected;
+                (peers.clone(), expected, peers.len(), mesh, "probe")
+            };
 
             if args.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
+                        "status_source": status_source,
                         "network_id": network_id,
                         "magic_dns_suffix": app.magic_dns_suffix,
+                        "autoconnect": app.autoconnect,
                         "node_id": app.node.id,
                         "tunnel_ip": app.node.tunnel_ip,
                         "endpoint": app.node.endpoint,
                         "relays": relays,
                         "auto_disconnect_relays_when_mesh_ready": app.auto_disconnect_relays_when_mesh_ready,
+                        "daemon": daemon_status_json(&config_path)?,
                         "expected_peer_count": expected_peers,
-                        "peer_count": peers.len(),
+                        "peer_count": peer_count,
                         "mesh_ready": mesh_ready,
                         "peers": peers,
                     }))?
@@ -489,10 +593,20 @@ async fn main() -> Result<()> {
             } else {
                 println!("network: {network_id}");
                 println!("magic_dns_suffix: {}", app.magic_dns_suffix);
+                println!("autoconnect: {}", app.autoconnect);
                 println!("node: {}", app.node.id);
                 println!("tunnel_ip: {}", app.node.tunnel_ip);
                 println!("endpoint: {}", app.node.endpoint);
                 println!("relays: {}", relays.len());
+                if daemon.running {
+                    println!("daemon: running (pid {})", daemon.pid.unwrap_or_default());
+                    if let Some(state) = daemon.state.as_ref() {
+                        println!("session_status: {}", state.session_status);
+                    }
+                } else {
+                    println!("daemon: stopped");
+                }
+                println!("status_source: {status_source}");
                 println!(
                     "relay_policy: {}",
                     if app.auto_disconnect_relays_when_mesh_ready {
@@ -502,7 +616,7 @@ async fn main() -> Result<()> {
                     }
                 );
                 if expected_peers > 0 {
-                    println!("mesh_progress: {}/{}", peers.len(), expected_peers);
+                    println!("mesh_progress: {}/{}", peer_count, expected_peers);
                     println!("mesh_ready: {mesh_ready}");
                 }
                 println!("peers: {}", peers.len());
@@ -538,6 +652,9 @@ async fn main() -> Result<()> {
             }
             if let Some(value) = args.auto_disconnect_relays_when_mesh_ready {
                 app.auto_disconnect_relays_when_mesh_ready = value;
+            }
+            if let Some(value) = args.autoconnect {
+                app.autoconnect = value;
             }
             if !args.relays.is_empty() {
                 app.nostr.relays = args.relays;
@@ -795,6 +912,7 @@ async fn main() -> Result<()> {
 
             print!("{}", render_wireguard_config(&interface, &parsed_peers));
         }
+        Command::Daemon(args) => daemon_session(args).await?,
         Command::TunnelUp(args) => tunnel_up(&args)?,
     }
 
@@ -845,6 +963,49 @@ struct PublishedAnnouncement {
 struct RelayCheck {
     relay: String,
     latency_ms: u128,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonPidRecord {
+    pid: u32,
+    config_path: String,
+    started_at: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DaemonStatus {
+    running: bool,
+    pid: Option<u32>,
+    pid_file: PathBuf,
+    log_file: PathBuf,
+    state_file: PathBuf,
+    state: Option<DaemonRuntimeState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct DaemonRuntimeState {
+    updated_at: u64,
+    session_active: bool,
+    relay_connected: bool,
+    session_status: String,
+    expected_peer_count: usize,
+    connected_peer_count: usize,
+    mesh_ready: bool,
+    peers: Vec<DaemonPeerState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonPeerState {
+    participant_pubkey: String,
+    node_id: String,
+    tunnel_ip: String,
+    endpoint: String,
+    public_key: String,
+    presence_timestamp: u64,
+    last_signal_seen_at: Option<u64>,
+    reachable: bool,
+    last_handshake_at: Option<u64>,
     error: Option<String>,
 }
 
@@ -973,6 +1134,27 @@ struct TunnelPeer {
     pubkey_hex: String,
     endpoint: String,
     allowed_ip: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WireGuardPeerStatus {
+    endpoint: Option<String>,
+    last_handshake_sec: Option<u64>,
+    last_handshake_nsec: Option<u64>,
+}
+
+impl WireGuardPeerStatus {
+    fn has_handshake(&self) -> bool {
+        self.last_handshake_sec.unwrap_or(0) > 0 || self.last_handshake_nsec.unwrap_or(0) > 0
+    }
+
+    fn last_handshake_epoch(&self) -> Option<u64> {
+        let sec = self.last_handshake_sec?;
+        if sec < 946_684_800 {
+            return None;
+        }
+        Some(sec)
+    }
 }
 
 const MAGIC_DNS_PORT: u16 = 1053;
@@ -1202,6 +1384,15 @@ impl CliTunnelRuntime {
         Ok(())
     }
 
+    fn peer_status(&self) -> Result<HashMap<String, WireGuardPeerStatus>> {
+        let socket = self
+            .uapi_socket_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("missing uapi socket path"))?;
+        let response = wg_get(socket)?;
+        Ok(parse_wg_peer_status(&response))
+    }
+
     fn stop(&mut self) {
         self.handle = None;
         self.uapi_socket_path = None;
@@ -1359,6 +1550,601 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     println!("connect: disconnected");
 
     Ok(())
+}
+
+async fn daemon_session(args: DaemonArgs) -> Result<()> {
+    if args.iface.trim().is_empty() {
+        return Err(anyhow!("--iface must not be empty"));
+    }
+
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    let (app, network_id) =
+        load_config_with_overrides(&config_path, args.network_id, args.participants)?;
+    if app.participants.is_empty() {
+        return Err(anyhow!(
+            "at least one participant must be configured before running daemon"
+        ));
+    }
+
+    let relays = resolve_relays(&args.relay, &app);
+    let own_pubkey = app.own_nostr_pubkey_hex().ok();
+    let expected_peers = expected_peer_count(&app);
+    let state_file = daemon_state_file_path(&config_path);
+    let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
+    let mut peer_signal_seen_at = HashMap::<String, u64>::new();
+    let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
+    let _magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+
+    let client = NostrSignalingClient::from_secret_key(
+        network_id.clone(),
+        &app.nostr.secret_key,
+        app.participant_pubkeys_hex(),
+    )?;
+    client.connect(&relays).await?;
+
+    let local_announcement = PeerAnnouncement {
+        node_id: app.node.id.clone(),
+        public_key: app.node.public_key.clone(),
+        endpoint: app.node.endpoint.clone(),
+        tunnel_ip: app.node.tunnel_ip.clone(),
+        timestamp: unix_timestamp(),
+    };
+    client
+        .publish(SignalPayload::Announce(local_announcement.clone()))
+        .await
+        .context("failed to publish local presence signal")?;
+    tunnel_runtime
+        .apply(&app, own_pubkey.as_deref(), &peer_announcements)
+        .context("failed to initialize tunnel runtime")?;
+
+    let mut announce_interval =
+        tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
+    announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut state_interval = tokio::time::interval(Duration::from_secs(1));
+    state_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    #[cfg(unix)]
+    let mut terminate_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to install SIGTERM handler")?;
+    #[cfg(unix)]
+    let terminate_wait = async move {
+        let _ = terminate_signal.recv().await;
+    };
+    #[cfg(not(unix))]
+    let terminate_wait = std::future::pending::<()>();
+    tokio::pin!(terminate_wait);
+
+    let mut session_status = "Connected".to_string();
+    let mut last_mesh_count = 0_usize;
+    write_daemon_state(
+        &state_file,
+        &build_daemon_runtime_state(
+            &app,
+            expected_peers,
+            &peer_announcements,
+            &peer_signal_seen_at,
+            &tunnel_runtime,
+            &session_status,
+            true,
+        ),
+    )?;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+            _ = &mut terminate_wait => {
+                break;
+            }
+            _ = announce_interval.tick() => {
+                let refreshed = PeerAnnouncement {
+                    timestamp: unix_timestamp(),
+                    ..local_announcement.clone()
+                };
+                if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
+                    session_status = format!("Presence publish failed: {error}");
+                }
+            }
+            _ = state_interval.tick() => {
+                let _ = write_daemon_state(
+                    &state_file,
+                    &build_daemon_runtime_state(
+                        &app,
+                        expected_peers,
+                        &peer_announcements,
+                        &peer_signal_seen_at,
+                        &tunnel_runtime,
+                        &session_status,
+                        true,
+                    ),
+                );
+            }
+            message = client.recv() => {
+                let Some(message) = message else {
+                    break;
+                };
+
+                peer_signal_seen_at.insert(message.sender_pubkey.clone(), unix_timestamp());
+                match message.payload {
+                    SignalPayload::Announce(announcement) => {
+                        if let Some(existing) = peer_announcements.get(&message.sender_pubkey)
+                            && existing.timestamp > announcement.timestamp
+                        {
+                            continue;
+                        }
+                        peer_announcements.insert(message.sender_pubkey, announcement);
+                    }
+                    SignalPayload::Disconnect { .. } => {
+                        peer_announcements.remove(&message.sender_pubkey);
+                    }
+                }
+
+                if let Err(error) = tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements) {
+                    session_status = format!("Tunnel update failed: {error}");
+                } else {
+                    session_status = "Connected".to_string();
+                }
+
+                let connected = app
+                    .participants
+                    .iter()
+                    .filter(|participant| Some(participant.as_str()) != own_pubkey.as_deref())
+                    .filter(|participant| peer_announcements.contains_key(*participant))
+                    .count();
+                if connected != last_mesh_count {
+                    println!("mesh: {connected}/{expected_peers} peers with presence");
+                    last_mesh_count = connected;
+                }
+            }
+        }
+    }
+
+    let _ = client
+        .publish(SignalPayload::Disconnect {
+            node_id: app.node.id.clone(),
+        })
+        .await;
+    client.disconnect().await;
+    tunnel_runtime.stop();
+
+    let final_state = DaemonRuntimeState {
+        updated_at: unix_timestamp(),
+        session_active: false,
+        relay_connected: false,
+        session_status: "Disconnected".to_string(),
+        expected_peer_count: expected_peers,
+        connected_peer_count: 0,
+        mesh_ready: false,
+        peers: Vec::new(),
+    };
+    let _ = write_daemon_state(&state_file, &final_state);
+
+    Ok(())
+}
+
+fn build_daemon_runtime_state(
+    app: &AppConfig,
+    expected_peers: usize,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    peer_signal_seen_at: &HashMap<String, u64>,
+    tunnel_runtime: &CliTunnelRuntime,
+    session_status: &str,
+    relay_connected: bool,
+) -> DaemonRuntimeState {
+    let own_pubkey = app.own_nostr_pubkey_hex().ok();
+    let runtime_peers = tunnel_runtime.peer_status().ok();
+    let mut peers = Vec::new();
+    let mut connected_peer_count = 0usize;
+
+    for participant in &app.participants {
+        if Some(participant.as_str()) == own_pubkey.as_deref() {
+            continue;
+        }
+
+        let Some(announcement) = peer_announcements.get(participant) else {
+            peers.push(DaemonPeerState {
+                participant_pubkey: participant.clone(),
+                node_id: String::new(),
+                tunnel_ip: String::new(),
+                endpoint: String::new(),
+                public_key: String::new(),
+                presence_timestamp: 0,
+                last_signal_seen_at: None,
+                reachable: false,
+                last_handshake_at: None,
+                error: Some("no signal yet".to_string()),
+            });
+            continue;
+        };
+
+        let peer_pubkey_hex = key_b64_to_hex(&announcement.public_key)
+            .map(|value| value.to_lowercase())
+            .ok();
+        let runtime_peer = peer_pubkey_hex
+            .as_ref()
+            .and_then(|pubkey| runtime_peers.as_ref().and_then(|map| map.get(pubkey)));
+
+        let reachable = runtime_peer.is_some_and(WireGuardPeerStatus::has_handshake);
+        if reachable {
+            connected_peer_count += 1;
+        }
+
+        let error = if peer_pubkey_hex.is_none() {
+            Some("invalid peer key".to_string())
+        } else if runtime_peer.is_none() {
+            Some("peer not in tunnel runtime".to_string())
+        } else if !reachable {
+            Some("awaiting handshake".to_string())
+        } else {
+            None
+        };
+
+        peers.push(DaemonPeerState {
+            participant_pubkey: participant.clone(),
+            node_id: announcement.node_id.clone(),
+            tunnel_ip: announcement.tunnel_ip.clone(),
+            endpoint: announcement.endpoint.clone(),
+            public_key: announcement.public_key.clone(),
+            presence_timestamp: announcement.timestamp,
+            last_signal_seen_at: peer_signal_seen_at.get(participant).copied(),
+            reachable,
+            last_handshake_at: runtime_peer.and_then(WireGuardPeerStatus::last_handshake_epoch),
+            error,
+        });
+    }
+
+    let mesh_ready = expected_peers > 0 && connected_peer_count >= expected_peers;
+    DaemonRuntimeState {
+        updated_at: unix_timestamp(),
+        session_active: true,
+        relay_connected,
+        session_status: session_status.to_string(),
+        expected_peer_count: expected_peers,
+        connected_peer_count,
+        mesh_ready,
+        peers,
+    }
+}
+
+async fn start_session(args: StartArgs) -> Result<()> {
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    let (app, _network_id) = load_config_with_overrides(
+        &config_path,
+        args.network_id.clone(),
+        args.participants.clone(),
+    )?;
+
+    let should_connect = if args.connect {
+        true
+    } else if args.no_connect {
+        false
+    } else {
+        app.autoconnect
+    };
+
+    if !should_connect {
+        println!(
+            "start: autoconnect is disabled; not starting a session (pass --connect to override)"
+        );
+        return Ok(());
+    }
+
+    let connect_args = ConnectArgs {
+        config: Some(config_path.clone()),
+        network_id: args.network_id,
+        participants: args.participants,
+        relay: args.relay,
+        iface: args.iface,
+        announce_interval_secs: args.announce_interval_secs,
+    };
+
+    if args.daemon {
+        let status = daemon_status(&config_path)?;
+        if status.running {
+            return Err(anyhow!(
+                "daemon already running with pid {}",
+                status.pid.unwrap_or_default()
+            ));
+        }
+
+        let pid = spawn_daemon_process(&connect_args, &config_path)?;
+        println!("daemon started: pid {pid}");
+        println!("pid_file: {}", status.pid_file.display());
+        println!("log_file: {}", status.log_file.display());
+        return Ok(());
+    }
+
+    connect_session(connect_args).await
+}
+
+fn stop_daemon(args: StopArgs) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let status = daemon_status(&config_path)?;
+    let Some(pid) = status.pid else {
+        println!("daemon: not running");
+        return Ok(());
+    };
+
+    if !status.running {
+        let _ = fs::remove_file(&status.pid_file);
+        println!("daemon: stale pid file removed");
+        return Ok(());
+    }
+
+    send_signal(pid, "-TERM")?;
+
+    let timeout = Duration::from_secs(args.timeout_secs.max(1));
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        if !is_process_running(pid) {
+            let _ = fs::remove_file(&status.pid_file);
+            println!("daemon stopped: pid {pid}");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    if args.force {
+        send_signal(pid, "-KILL")?;
+        thread::sleep(Duration::from_millis(120));
+    }
+
+    if is_process_running(pid) && daemon_process_matches(pid, &config_path) {
+        return Err(anyhow!(
+            "failed to stop daemon pid {pid}; retry with --force"
+        ));
+    }
+
+    let _ = fs::remove_file(&status.pid_file);
+    println!("daemon stopped: pid {pid}");
+    Ok(())
+}
+
+fn daemon_status(config_path: &Path) -> Result<DaemonStatus> {
+    let pid_file = daemon_pid_file_path(config_path);
+    let log_file = daemon_log_file_path(config_path);
+    let state_file = daemon_state_file_path(config_path);
+    let pid_record = read_daemon_pid_record(&pid_file)?;
+    let pid = pid_record.as_ref().map(|record| record.pid);
+    let running = pid.is_some_and(|pid| daemon_process_matches(pid, config_path));
+    let state = read_daemon_state(&state_file)?;
+
+    Ok(DaemonStatus {
+        running,
+        pid,
+        pid_file,
+        log_file,
+        state_file,
+        state,
+    })
+}
+
+fn daemon_status_json(config_path: &Path) -> Result<serde_json::Value> {
+    let status = daemon_status(config_path)?;
+    Ok(json!({
+        "running": status.running,
+        "pid": status.pid,
+        "pid_file": status.pid_file,
+        "log_file": status.log_file,
+        "state_file": status.state_file,
+        "state": status.state,
+    }))
+}
+
+fn daemon_pid_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.pid")
+}
+
+fn daemon_log_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.log")
+}
+
+fn daemon_state_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.state.json")
+}
+
+fn read_daemon_pid_record(path: &Path) -> Result<Option<DaemonPidRecord>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon pid file {}", path.display()))?;
+    let parsed = serde_json::from_str::<DaemonPidRecord>(&raw)
+        .with_context(|| format!("failed to parse daemon pid file {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn write_daemon_pid_record(path: &Path, record: &DaemonPidRecord) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(record)?;
+    fs::write(path, raw)
+        .with_context(|| format!("failed to write daemon pid file {}", path.display()))?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
+fn read_daemon_state(path: &Path) -> Result<Option<DaemonRuntimeState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon state file {}", path.display()))?;
+    let parsed = serde_json::from_str::<DaemonRuntimeState>(&raw)
+        .with_context(|| format!("failed to parse daemon state file {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(state)?;
+    fs::write(path, raw)
+        .with_context(|| format!("failed to write daemon state file {}", path.display()))?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
+fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
+    let pid_file = daemon_pid_file_path(config_path);
+    if let Some(record) = read_daemon_pid_record(&pid_file)?
+        && daemon_process_matches(record.pid, config_path)
+    {
+        return Err(anyhow!("daemon already running with pid {}", record.pid));
+    }
+
+    let log_file_path = daemon_log_file_path(config_path);
+    if let Some(parent) = log_file_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .with_context(|| format!("failed to open {}", log_file_path.display()))?;
+    let _ = set_private_file_permissions(&log_file_path);
+    let stderr_log = log_file
+        .try_clone()
+        .context("failed to clone daemon log file handle")?;
+
+    let mut command = ProcessCommand::new(
+        std::env::current_exe().context("failed to resolve current executable")?,
+    );
+    command
+        .arg("daemon")
+        .arg("--config")
+        .arg(config_path)
+        .arg("--iface")
+        .arg(&args.iface)
+        .arg("--announce-interval-secs")
+        .arg(args.announce_interval_secs.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_log));
+
+    if let Some(network_id) = &args.network_id {
+        command.arg("--network-id").arg(network_id);
+    }
+    for participant in &args.participants {
+        command.arg("--participant").arg(participant);
+    }
+    for relay in &args.relay {
+        command.arg("--relay").arg(relay);
+    }
+
+    let mut child = command
+        .spawn()
+        .context("failed to spawn daemonized connect process")?;
+    let pid = child.id();
+
+    thread::sleep(Duration::from_millis(200));
+    if let Some(status) = child
+        .try_wait()
+        .context("failed to verify daemon process state")?
+    {
+        return Err(anyhow!(
+            "daemon process exited immediately with status {status}"
+        ));
+    }
+
+    let record = DaemonPidRecord {
+        pid,
+        config_path: config_path.display().to_string(),
+        started_at: unix_timestamp(),
+    };
+    write_daemon_pid_record(&pid_file, &record)?;
+    Ok(pid)
+}
+
+fn is_process_running(pid: u32) -> bool {
+    if cfg!(not(unix)) {
+        return false;
+    }
+
+    ProcessCommand::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn daemon_process_matches(pid: u32, config_path: &Path) -> bool {
+    if !is_process_running(pid) {
+        return false;
+    }
+
+    let output = ProcessCommand::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let command = String::from_utf8_lossy(&output.stdout);
+    let config_text = config_path.display().to_string();
+    command.contains(" daemon ")
+        && command.contains("--config")
+        && command.contains(config_text.as_str())
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
+fn send_signal(pid: u32, signal: &str) -> Result<()> {
+    if cfg!(not(unix)) {
+        return Err(anyhow!("daemon signal control is only supported on unix"));
+    }
+
+    let output = ProcessCommand::new("kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .output()
+        .with_context(|| format!("failed to execute kill {signal} {pid}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow!(
+        "kill {signal} {pid} failed\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
 }
 
 fn run_ping(target: &str, count: u32, timeout_secs: u64) -> Result<()> {
@@ -1798,6 +2584,77 @@ fn wg_set(socket_path: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
+fn wg_get(socket_path: &str) -> Result<String> {
+    let mut socket =
+        UnixStream::connect(socket_path).with_context(|| format!("connect {socket_path}"))?;
+    write!(socket, "get=1\n\n").context("failed to send uapi get")?;
+    socket
+        .shutdown(std::net::Shutdown::Write)
+        .context("failed to close uapi write half")?;
+
+    let mut response = String::new();
+    socket
+        .read_to_string(&mut response)
+        .context("failed to read uapi get response")?;
+
+    if !response.contains("errno=0") {
+        return Err(anyhow!("uapi get failed: {}", response.trim()));
+    }
+
+    Ok(response)
+}
+
+fn parse_wg_peer_status(response: &str) -> HashMap<String, WireGuardPeerStatus> {
+    let mut peers = HashMap::new();
+    let mut current_pubkey: Option<String> = None;
+    let mut current = WireGuardPeerStatus::default();
+
+    let commit_current = |peers: &mut HashMap<String, WireGuardPeerStatus>,
+                          current_pubkey: &mut Option<String>,
+                          current: &mut WireGuardPeerStatus| {
+        if let Some(pubkey) = current_pubkey.take() {
+            peers.insert(pubkey, std::mem::take(current));
+        }
+    };
+
+    for line in response.lines() {
+        if line.is_empty() || line == "errno=0" {
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("public_key=") {
+            commit_current(&mut peers, &mut current_pubkey, &mut current);
+            current_pubkey = Some(value.trim().to_lowercase());
+            continue;
+        }
+
+        let Some(_pubkey) = current_pubkey.as_ref() else {
+            continue;
+        };
+
+        if let Some(value) = line.strip_prefix("endpoint=") {
+            current.endpoint = Some(value.trim().to_string());
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("last_handshake_time_sec=") {
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                current.last_handshake_sec = Some(parsed);
+            }
+            continue;
+        }
+
+        if let Some(value) = line.strip_prefix("last_handshake_time_nsec=") {
+            if let Ok(parsed) = value.trim().parse::<u64>() {
+                current.last_handshake_nsec = Some(parsed);
+            }
+        }
+    }
+
+    commit_current(&mut peers, &mut current_pubkey, &mut current);
+    peers
+}
+
 fn run_checked(command: &mut ProcessCommand) -> Result<()> {
     let display = format!("{command:?}");
     let output = command
@@ -1833,6 +2690,8 @@ mod tests {
     fn clap_includes_tailscale_style_commands() {
         let command = Cli::command();
         for name in [
+            "start",
+            "stop",
             "up",
             "connect",
             "down",
@@ -1852,5 +2711,19 @@ mod tests {
                 "missing subcommand {name}"
             );
         }
+    }
+
+    #[test]
+    fn clap_set_supports_autoconnect_flag() {
+        let command = Cli::command();
+        let set = command
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "set")
+            .expect("set subcommand exists");
+        assert!(
+            set.get_arguments()
+                .any(|argument| argument.get_long() == Some("autoconnect")),
+            "missing --autoconnect on set command"
+        );
     }
 }
