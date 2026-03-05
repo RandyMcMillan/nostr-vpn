@@ -21,7 +21,6 @@ fn default_relays_match_hashtree_defaults() {
             "wss://relay.damus.io",
             "wss://nos.lol",
             "wss://relay.primal.net",
-            "wss://offchain.pub",
         ]
     );
 }

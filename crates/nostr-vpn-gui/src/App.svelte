@@ -322,6 +322,9 @@
 
     {#if state}
       <div class="row status-row">
+        <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
+          Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
+        </span>
         <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
           VPN {state.sessionActive ? 'On' : 'Off'}
         </span>
@@ -332,6 +335,7 @@
           Mesh {state.connectedPeerCount}/{state.expectedPeerCount}
         </span>
       </div>
+      <div class="identity-status" data-testid="session-status-text">{state.sessionStatus}</div>
     {/if}
   </section>
 

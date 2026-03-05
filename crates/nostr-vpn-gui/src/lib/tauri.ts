@@ -33,9 +33,10 @@ const countOnline = (network: NetworkView) =>
     : 0
 
 const mockState: UiState = {
+  daemonRunning: false,
   sessionActive: false,
   relayConnected: false,
-  sessionStatus: 'Disconnected',
+  sessionStatus: 'Daemon not running',
   configPath: '~/.config/nvpn/config.toml',
   ownNpub: 'npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u',
   ownPubkeyHex: 'f'.repeat(64),
@@ -139,8 +140,9 @@ export const connectSession = () =>
     ? invoke<UiState>('connect_session')
     : (() => {
         mockState.sessionActive = true
+        mockState.daemonRunning = true
         mockState.relayConnected = true
-        mockState.sessionStatus = 'Connected'
+        mockState.sessionStatus = 'Daemon running'
         mockState.relays = mockState.relays.map((relay) => ({
           ...relay,
           state: 'up',
@@ -168,8 +170,9 @@ export const disconnectSession = () =>
     ? invoke<UiState>('disconnect_session')
     : (() => {
         mockState.sessionActive = false
+        mockState.daemonRunning = false
         mockState.relayConnected = false
-        mockState.sessionStatus = 'Disconnected'
+        mockState.sessionStatus = 'Daemon not running'
         mockState.relays = mockState.relays.map((relay) => ({
           ...relay,
           state: 'unknown',

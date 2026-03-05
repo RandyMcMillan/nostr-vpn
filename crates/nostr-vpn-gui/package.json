@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "prepare:sidecar:debug": "node ./scripts/prepare-sidecar.mjs --debug",
+    "prepare:sidecar:release": "node ./scripts/prepare-sidecar.mjs --release",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "test:tauri-driver": "node e2e-tauri/smoke.mjs"

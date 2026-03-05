@@ -171,6 +171,7 @@ struct LanPeerView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UiState {
+    daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
     session_status: String,
@@ -220,6 +221,7 @@ struct NvpnBackend {
     nvpn_bin: Option<PathBuf>,
 
     session_status: String,
+    daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
     daemon_state: Option<DaemonRuntimeState>,
@@ -282,6 +284,7 @@ impl NvpnBackend {
             config,
             nvpn_bin,
             session_status: "Disconnected".to_string(),
+            daemon_running: false,
             session_active: false,
             relay_connected: false,
             daemon_state: None,
@@ -298,11 +301,16 @@ impl NvpnBackend {
         backend.ensure_peer_status_entries();
         backend.maybe_refresh_lan_discovery();
 
-        if backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty() {
-            let _ = backend.start_daemon_process();
+        let wants_autoconnect =
+            backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
+        if wants_autoconnect {
+            if let Err(error) = backend.start_daemon_process() {
+                backend.session_status = format!("Daemon start failed: {error}");
+            }
         }
 
         backend.sync_daemon_state();
+
         Ok(backend)
     }
 
@@ -587,8 +595,8 @@ impl NvpnBackend {
         }
     }
 
-    fn start_daemon_process(&self) -> Result<()> {
-        let args = [
+    fn daemon_start_args<'a>(&'a self) -> Result<[&'a str; 5]> {
+        Ok([
             "start",
             "--daemon",
             "--connect",
@@ -596,7 +604,29 @@ impl NvpnBackend {
             self.config_path
                 .to_str()
                 .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
-        ];
+        ])
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_daemon_process(&self) -> Result<()> {
+        let args = self.daemon_start_args()?;
+
+        if let Ok(status) = self.fetch_cli_status()
+            && status.daemon.running
+        {
+            return Ok(());
+        }
+
+        match self.run_nvpn_command_with_admin_privileges(args) {
+            Ok(()) => Ok(()),
+            Err(error) if is_already_running_message(&error.to_string()) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn start_daemon_process(&self) -> Result<()> {
+        let args = self.daemon_start_args()?;
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
@@ -611,13 +641,17 @@ impl NvpnBackend {
             stderr.trim()
         );
 
-        if message.contains("already running") {
+        if is_already_running_message(&message) {
             return Ok(());
         }
 
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(target_os = "linux")]
         if requires_admin_privileges(&message) {
-            self.run_nvpn_command_with_admin_privileges(args)?;
+            match self.run_nvpn_command_with_admin_privileges(args) {
+                Ok(()) => {}
+                Err(error) if is_already_running_message(&error.to_string()) => {}
+                Err(error) => return Err(error),
+            }
             return Ok(());
         }
 
@@ -648,13 +682,17 @@ impl NvpnBackend {
             stderr.trim()
         );
 
-        if message.contains("not running") {
+        if is_not_running_message(&message) {
             return Ok(());
         }
 
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if requires_admin_privileges(&message) {
-            self.run_nvpn_command_with_admin_privileges(args)?;
+            match self.run_nvpn_command_with_admin_privileges(args) {
+                Ok(()) => {}
+                Err(error) if is_not_running_message(&error.to_string()) => {}
+                Err(error) => return Err(error),
+            }
             return Ok(());
         }
 
@@ -826,6 +864,7 @@ impl NvpnBackend {
             Ok(status) => status,
             Err(error) => {
                 self.daemon_state = None;
+                self.daemon_running = false;
                 self.session_active = false;
                 self.relay_connected = false;
                 self.session_status = format!("Daemon status unavailable: {error}");
@@ -856,6 +895,7 @@ impl NvpnBackend {
 
         let state = status.daemon.state.clone();
         self.daemon_state = state.clone();
+        self.daemon_running = status.daemon.running;
 
         if status.daemon.running {
             self.session_active = state
@@ -873,7 +913,9 @@ impl NvpnBackend {
         } else {
             self.session_active = false;
             self.relay_connected = false;
-            self.session_status = "Disconnected".to_string();
+            if !self.session_status.starts_with("Daemon start failed:") {
+                self.session_status = "Daemon not running".to_string();
+            }
         }
 
         self.refresh_relay_runtime_status();
@@ -1400,6 +1442,7 @@ impl NvpnBackend {
             .unwrap_or_else(|| is_mesh_complete(connected_peer_count, expected_peer_count));
 
         UiState {
+            daemon_running: self.daemon_running,
             session_active: self.session_active,
             relay_connected: self.relay_connected,
             session_status: self.session_status.clone(),
@@ -1443,24 +1486,34 @@ fn resolve_nvpn_cli_path() -> Result<PathBuf> {
         return validate_nvpn_binary(candidate);
     }
 
+    let bundled_candidates = nvpn_bundled_binary_candidates();
     if let Ok(exe) = env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let sibling = dir.join(nvpn_binary_name());
-        if sibling.exists() {
-            return validate_nvpn_binary(sibling);
+        for candidate_name in &bundled_candidates {
+            let sibling = dir.join(candidate_name);
+            if sibling.exists()
+                && let Ok(validated) = validate_nvpn_binary(sibling)
+            {
+                return Ok(validated);
+            }
         }
 
         #[cfg(target_os = "macos")]
         {
-            let resources_sidecar = dir
+            if let Some(resources_dir) = dir
                 .parent()
                 .and_then(Path::parent)
-                .map(|path| path.join("Resources").join(nvpn_binary_name()));
-            if let Some(candidate) = resources_sidecar
-                && candidate.exists()
+                .map(|path| path.join("Resources"))
             {
-                return validate_nvpn_binary(candidate);
+                for candidate_name in &bundled_candidates {
+                    let candidate = resources_dir.join(candidate_name);
+                    if candidate.exists()
+                        && let Ok(validated) = validate_nvpn_binary(candidate)
+                    {
+                        return Ok(validated);
+                    }
+                }
             }
         }
     }
@@ -1509,6 +1562,44 @@ fn validate_nvpn_binary(path: PathBuf) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+fn nvpn_bundled_binary_candidates() -> Vec<String> {
+    vec![nvpn_binary_name().to_string(), nvpn_sidecar_binary_name()]
+}
+
+fn nvpn_sidecar_binary_name() -> String {
+    let target = current_target_triple();
+
+    #[cfg(target_os = "windows")]
+    {
+        format!("{}-{target}.exe", nvpn_binary_stem())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("{}-{target}", nvpn_binary_stem())
+    }
+}
+
+fn nvpn_binary_stem() -> &'static str {
+    "nvpn"
+}
+
+fn current_target_triple() -> String {
+    if let Some(target) = option_env!("NVPN_GUI_TARGET")
+        && !target.trim().is_empty()
+    {
+        return target.to_string();
+    }
+
+    let arch = env::consts::ARCH;
+    match env::consts::OS {
+        "macos" => format!("{arch}-apple-darwin"),
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "windows" => format!("{arch}-pc-windows-msvc"),
+        os => format!("{arch}-unknown-{os}"),
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn nvpn_binary_name() -> &'static str {
     "nvpn.exe"
@@ -1516,7 +1607,7 @@ fn nvpn_binary_name() -> &'static str {
 
 #[cfg(not(target_os = "windows"))]
 fn nvpn_binary_name() -> &'static str {
-    "nvpn"
+    nvpn_binary_stem()
 }
 
 fn extract_json_document(raw: &str) -> Result<&str> {
@@ -1540,6 +1631,14 @@ fn requires_admin_privileges(message: &str) -> bool {
         || lower.contains("permission denied")
         || lower.contains("did you run with sudo")
         || lower.contains("admin privileges")
+}
+
+fn is_already_running_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("already running")
+}
+
+fn is_not_running_message(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("not running")
 }
 
 #[cfg(target_os = "macos")]
@@ -2009,7 +2108,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        expected_peer_count, extract_json_document, is_mesh_complete, to_npub, validate_nvpn_binary,
+        expected_peer_count, extract_json_document, is_already_running_message, is_mesh_complete,
+        is_not_running_message, to_npub, validate_nvpn_binary,
     };
     use nostr_vpn_core::config::AppConfig;
 
@@ -2040,6 +2140,18 @@ mod tests {
         let raw = "INFO something\n{\"daemon\":{\"running\":false}}\n";
         let extracted = extract_json_document(raw).expect("should extract json object");
         assert_eq!(extracted, "{\"daemon\":{\"running\":false}}")
+    }
+
+    #[test]
+    fn idempotent_daemon_error_matchers_work_for_elevated_messages() {
+        assert!(is_already_running_message(
+            "elevated nvpn command failed ... Error: daemon already running with pid 42"
+        ));
+        assert!(is_not_running_message(
+            "elevated nvpn command failed ... daemon: not running"
+        ));
+        assert!(!is_already_running_message("permission denied"));
+        assert!(!is_not_running_message("permission denied"));
     }
 
     #[test]

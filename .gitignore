@@ -10,3 +10,5 @@ crates/nostr-vpn-gui/src-tauri/target
 artifacts/
 crates/nostr-vpn-gui/src-tauri/icons/android/
 crates/nostr-vpn-gui/src-tauri/icons/ios/
+
+crates/nostr-vpn-gui/src-tauri/binaries/

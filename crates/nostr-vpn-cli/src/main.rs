@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -28,7 +28,7 @@ use nostr_vpn_core::magic_dns::{
     uninstall_system_resolver,
 };
 use nostr_vpn_core::nat::{discover_public_udp_endpoint, hole_punch_udp};
-use nostr_vpn_core::signaling::{NostrSignalingClient, SignalPayload};
+use nostr_vpn_core::signaling::{NostrSignalingClient, SignalEnvelope, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1277,6 +1277,7 @@ struct CliTunnelRuntime {
     handle: Option<DeviceHandle>,
     uapi_socket_path: Option<String>,
     last_fingerprint: Option<String>,
+    active_listen_port: Option<u16>,
 }
 
 impl CliTunnelRuntime {
@@ -1286,6 +1287,7 @@ impl CliTunnelRuntime {
             handle: None,
             uapi_socket_path: None,
             last_fingerprint: None,
+            active_listen_port: None,
         }
     }
 
@@ -1300,25 +1302,60 @@ impl CliTunnelRuntime {
             return Ok(());
         }
 
-        let handle = DeviceHandle::new(
-            &self.iface,
-            DeviceConfig {
-                n_threads: 2,
-                use_connected_socket: true,
-                #[cfg(target_os = "linux")]
-                use_multi_queue: false,
-                #[cfg(target_os = "linux")]
-                uapi_fd: -1,
-            },
-        )
-        .with_context(|| format!("failed to create boringtun interface {}", self.iface))?;
+        let preferred_iface = self.iface.clone();
+        let candidates = utun_interface_candidates(&preferred_iface);
+        let mut busy = Vec::new();
 
-        let socket = format!("/var/run/wireguard/{}.sock", self.iface);
-        wait_for_socket(&socket)?;
+        for candidate in candidates {
+            let handle = DeviceHandle::new(
+                &candidate,
+                DeviceConfig {
+                    n_threads: 2,
+                    use_connected_socket: true,
+                    #[cfg(target_os = "linux")]
+                    use_multi_queue: false,
+                    #[cfg(target_os = "linux")]
+                    uapi_fd: -1,
+                },
+            );
 
-        self.handle = Some(handle);
-        self.uapi_socket_path = Some(socket);
-        Ok(())
+            let handle = match handle {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let error_text = error.to_string();
+                    if is_resource_busy_message(&error_text) {
+                        busy.push(candidate);
+                        continue;
+                    }
+                    return Err(anyhow!(
+                        "failed to create boringtun interface {}: {}",
+                        candidate,
+                        error_text
+                    ));
+                }
+            };
+
+            let socket = format!("/var/run/wireguard/{}.sock", candidate);
+            wait_for_socket(&socket)?;
+
+            self.iface = candidate;
+            self.handle = Some(handle);
+            self.uapi_socket_path = Some(socket);
+            return Ok(());
+        }
+
+        if !busy.is_empty() {
+            return Err(anyhow!(
+                "failed to create boringtun interface {}; busy interfaces: {}",
+                preferred_iface,
+                busy.join(", ")
+            ));
+        }
+
+        Err(anyhow!(
+            "failed to create boringtun interface {}",
+            preferred_iface
+        ))
     }
 
     fn apply(
@@ -1328,6 +1365,8 @@ impl CliTunnelRuntime {
         peer_announcements: &HashMap<String, PeerAnnouncement>,
     ) -> Result<()> {
         let configured_participants = app.participant_pubkeys_hex();
+        let configured_listen_port = app.node.listen_port;
+        let listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
         let mut peers = configured_participants
             .iter()
             .filter(|participant| Some(participant.as_str()) != own_pubkey)
@@ -1340,7 +1379,7 @@ impl CliTunnelRuntime {
         let fingerprint = tunnel_fingerprint(
             &self.iface,
             &app.node.private_key,
-            app.node.listen_port,
+            listen_port,
             &local_address,
             &peers,
         );
@@ -1355,16 +1394,57 @@ impl CliTunnelRuntime {
             .ok_or_else(|| anyhow!("missing uapi socket path"))?;
 
         let private_key_hex = key_b64_to_hex(&app.node.private_key)?;
-        wg_set(
-            socket,
-            &format!(
-                "private_key={private_key_hex}\nlisten_port={}",
-                app.node.listen_port
-            ),
-        )?;
+        let primary_listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
+        let mut attempted_ports = HashSet::new();
+        let mut candidate_ports = Vec::with_capacity(17);
+        candidate_ports.push(primary_listen_port);
+        for _ in 0..16 {
+            if let Ok(fallback_port) = pick_available_udp_port() {
+                candidate_ports.push(fallback_port);
+            }
+        }
+
+        let mut selected_listen_port = None;
+        let mut last_bind_conflict = None;
+        for listen_port in candidate_ports {
+            if !attempted_ports.insert(listen_port) {
+                continue;
+            }
+
+            match wg_set(
+                socket,
+                &format!("private_key={private_key_hex}\nlisten_port={listen_port}"),
+            ) {
+                Ok(()) => {
+                    if listen_port != primary_listen_port {
+                        eprintln!(
+                            "tunnel: listen_port {} busy, using fallback {}",
+                            primary_listen_port, listen_port
+                        );
+                    }
+                    selected_listen_port = Some(listen_port);
+                    break;
+                }
+                Err(error) => {
+                    let error_text = error.to_string();
+                    if !is_uapi_addr_in_use_error(&error_text) {
+                        return Err(error);
+                    }
+                    last_bind_conflict = Some(error);
+                }
+            }
+        }
+
+        self.active_listen_port = Some(selected_listen_port.ok_or_else(|| {
+            if let Some(error) = last_bind_conflict {
+                error.context("failed to allocate available wireguard listen port")
+            } else {
+                anyhow!("failed to configure wireguard listen port")
+            }
+        })?);
         wg_set(socket, "replace_peers=true")?;
 
-        for peer in peers {
+        for peer in &peers {
             wg_set(
                 socket,
                 &format!(
@@ -1380,7 +1460,14 @@ impl CliTunnelRuntime {
             &[String::from("10.44.0.0/24")],
         )?;
 
-        self.last_fingerprint = Some(fingerprint);
+        let applied_fingerprint = tunnel_fingerprint(
+            &self.iface,
+            &app.node.private_key,
+            self.listen_port(configured_listen_port),
+            &local_address,
+            &peers,
+        );
+        self.last_fingerprint = Some(applied_fingerprint);
         Ok(())
     }
 
@@ -1397,7 +1484,57 @@ impl CliTunnelRuntime {
         self.handle = None;
         self.uapi_socket_path = None;
         self.last_fingerprint = None;
+        self.active_listen_port = None;
     }
+
+    fn listen_port(&self, configured: u16) -> u16 {
+        self.active_listen_port.unwrap_or(configured)
+    }
+}
+
+fn utun_interface_candidates(preferred: &str) -> Vec<String> {
+    let Some(suffix) = preferred.strip_prefix("utun") else {
+        return vec![preferred.to_string()];
+    };
+    if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
+        return vec![preferred.to_string()];
+    }
+    let Ok(base) = suffix.parse::<u16>() else {
+        return vec![preferred.to_string()];
+    };
+
+    (0u16..16u16)
+        .map(|offset| format!("utun{}", base.saturating_add(offset)))
+        .collect()
+}
+
+fn is_resource_busy_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("resource busy") || lower.contains("address already in use")
+}
+
+fn is_uapi_addr_in_use_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("errno=48") || lower.contains("errno=98") || lower.contains("address in use")
+}
+
+fn pick_available_udp_port() -> Result<u16> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("failed to bind local udp socket for free port discovery")?;
+    let addr = socket
+        .local_addr()
+        .context("failed to read local socket addr for free port discovery")?;
+    Ok(addr.port())
+}
+
+fn endpoint_with_listen_port(endpoint: &str, listen_port: u16) -> String {
+    endpoint
+        .parse::<SocketAddr>()
+        .map(|mut parsed| {
+            parsed.set_port(listen_port);
+            parsed.to_string()
+        })
+        .unwrap_or_else(|_| endpoint.to_string())
 }
 
 fn tunnel_peer_from_announcement(announcement: &PeerAnnouncement) -> Result<TunnelPeer> {
@@ -1466,20 +1603,21 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     )?;
     client.connect(&relays).await?;
 
-    let local_announcement = PeerAnnouncement {
-        node_id: app.node.id.clone(),
-        public_key: app.node.public_key.clone(),
-        endpoint: app.node.endpoint.clone(),
-        tunnel_ip: app.node.tunnel_ip.clone(),
-        timestamp: unix_timestamp(),
-    };
-    client
-        .publish(SignalPayload::Announce(local_announcement.clone()))
-        .await
-        .context("failed to publish local presence signal")?;
     tunnel_runtime
         .apply(&app, own_pubkey.as_deref(), &peer_announcements)
         .context("failed to initialize tunnel runtime")?;
+    let _ = client
+        .publish(SignalPayload::Announce(PeerAnnouncement {
+            node_id: app.node.id.clone(),
+            public_key: app.node.public_key.clone(),
+            endpoint: endpoint_with_listen_port(
+                &app.node.endpoint,
+                tunnel_runtime.listen_port(app.node.listen_port),
+            ),
+            tunnel_ip: app.node.tunnel_ip.clone(),
+            timestamp: unix_timestamp(),
+        }))
+        .await;
 
     println!(
         "connect: network {} on {} relays; waiting for {expected_peers} configured peer(s)",
@@ -1499,8 +1637,14 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             }
             _ = announce_interval.tick() => {
                 let refreshed = PeerAnnouncement {
+                    node_id: app.node.id.clone(),
+                    public_key: app.node.public_key.clone(),
+                    endpoint: endpoint_with_listen_port(
+                        &app.node.endpoint,
+                        tunnel_runtime.listen_port(app.node.listen_port),
+                    ),
+                    tunnel_ip: app.node.tunnel_ip.clone(),
                     timestamp: unix_timestamp(),
-                    ..local_announcement.clone()
                 };
                 let _ = client.publish(SignalPayload::Announce(refreshed)).await;
             }
@@ -1577,33 +1721,22 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let _magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
 
-    let client = NostrSignalingClient::from_secret_key(
+    let mut client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
         &app.nostr.secret_key,
         configured_participants.clone(),
     )?;
-    client.connect(&relays).await?;
 
-    let local_announcement = PeerAnnouncement {
-        node_id: app.node.id.clone(),
-        public_key: app.node.public_key.clone(),
-        endpoint: app.node.endpoint.clone(),
-        tunnel_ip: app.node.tunnel_ip.clone(),
-        timestamp: unix_timestamp(),
-    };
-    client
-        .publish(SignalPayload::Announce(local_announcement.clone()))
-        .await
-        .context("failed to publish local presence signal")?;
     tunnel_runtime
         .apply(&app, own_pubkey.as_deref(), &peer_announcements)
         .context("failed to initialize tunnel runtime")?;
-
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut state_interval = tokio::time::interval(Duration::from_secs(1));
     state_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reconnect_interval = tokio::time::interval(Duration::from_secs(1));
+    reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     #[cfg(unix)]
     let mut terminate_signal =
@@ -1617,7 +1750,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let terminate_wait = std::future::pending::<()>();
     tokio::pin!(terminate_wait);
 
-    let mut session_status = "Connected".to_string();
+    let mut session_status = "Connecting to relays".to_string();
+    let mut relay_connected = false;
+    let mut reconnect_attempt = 0u32;
+    let mut reconnect_due = Instant::now();
     let mut last_mesh_count = 0_usize;
     write_daemon_state(
         &state_file,
@@ -1628,7 +1764,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             &peer_signal_seen_at,
             &tunnel_runtime,
             &session_status,
-            true,
+            relay_connected,
         ),
     )?;
 
@@ -1640,13 +1776,84 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             _ = &mut terminate_wait => {
                 break;
             }
+            _ = reconnect_interval.tick() => {
+                if relay_connected || Instant::now() < reconnect_due {
+                    continue;
+                }
+
+                client.disconnect().await;
+                client = NostrSignalingClient::from_secret_key(
+                    network_id.clone(),
+                    &app.nostr.secret_key,
+                    configured_participants.clone(),
+                )?;
+
+                match client.connect(&relays).await {
+                    Ok(()) => {
+                        relay_connected = true;
+                        reconnect_attempt = 0;
+                        session_status = "Connected".to_string();
+
+                        let refreshed = PeerAnnouncement {
+                            node_id: app.node.id.clone(),
+                            public_key: app.node.public_key.clone(),
+                            endpoint: endpoint_with_listen_port(
+                                &app.node.endpoint,
+                                tunnel_runtime.listen_port(app.node.listen_port),
+                            ),
+                            tunnel_ip: app.node.tunnel_ip.clone(),
+                            timestamp: unix_timestamp(),
+                        };
+                        if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
+                            let error_text = error.to_string();
+                            session_status =
+                                format!("Connected; presence publish failed ({error_text})");
+                            eprintln!("daemon: initial presence publish failed after reconnect: {error_text}");
+                        }
+                    }
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                        reconnect_due = Instant::now() + delay;
+                        session_status = format!(
+                            "Relay connect failed; retry in {}s ({error_text})",
+                            delay.as_secs(),
+                        );
+                        eprintln!("daemon: relay connect failed (retry in {}s): {error_text}", delay.as_secs());
+                    }
+                }
+            }
             _ = announce_interval.tick() => {
+                if !relay_connected {
+                    continue;
+                }
+
                 let refreshed = PeerAnnouncement {
+                    node_id: app.node.id.clone(),
+                    public_key: app.node.public_key.clone(),
+                    endpoint: endpoint_with_listen_port(
+                        &app.node.endpoint,
+                        tunnel_runtime.listen_port(app.node.listen_port),
+                    ),
+                    tunnel_ip: app.node.tunnel_ip.clone(),
                     timestamp: unix_timestamp(),
-                    ..local_announcement.clone()
                 };
                 if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
-                    session_status = format!("Presence publish failed: {error}");
+                    let error_text = error.to_string();
+                    if publish_error_requires_reconnect(&error_text) {
+                        relay_connected = false;
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                        reconnect_due = Instant::now() + delay;
+                        session_status = format!(
+                            "Relay disconnected; retry in {}s ({error_text})",
+                            delay.as_secs(),
+                        );
+                        eprintln!("daemon: publish indicates disconnected relays (retry in {}s): {error_text}", delay.as_secs());
+                    } else {
+                        session_status = format!("Presence publish failed ({error_text})");
+                    }
                 }
             }
             _ = state_interval.tick() => {
@@ -1659,13 +1866,25 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         &peer_signal_seen_at,
                         &tunnel_runtime,
                         &session_status,
-                        true,
+                        relay_connected,
                     ),
                 );
             }
-            message = client.recv() => {
+            message = async {
+                if relay_connected {
+                    client.recv().await
+                } else {
+                    std::future::pending::<Option<SignalEnvelope>>().await
+                }
+            } => {
                 let Some(message) = message else {
-                    break;
+                    relay_connected = false;
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                    reconnect_due = Instant::now() + delay;
+                    session_status = format!("Signal stream closed; retry in {}s", delay.as_secs());
+                    eprintln!("daemon: signal stream closed (retry in {}s)", delay.as_secs());
+                    continue;
                 };
 
                 peer_signal_seen_at.insert(message.sender_pubkey.clone(), unix_timestamp());
@@ -1684,7 +1903,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
 
                 if let Err(error) = tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements) {
-                    session_status = format!("Tunnel update failed: {error}");
+                    let error_text = error.to_string();
+                    session_status = format!("Tunnel update failed ({error_text})");
                 } else {
                     session_status = "Connected".to_string();
                 }
@@ -1703,11 +1923,13 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         }
     }
 
-    let _ = client
-        .publish(SignalPayload::Disconnect {
-            node_id: app.node.id.clone(),
-        })
-        .await;
+    if relay_connected {
+        let _ = client
+            .publish(SignalPayload::Disconnect {
+                node_id: app.node.id.clone(),
+            })
+            .await;
+    }
     client.disconnect().await;
     tunnel_runtime.stop();
 
@@ -1724,6 +1946,28 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let _ = write_daemon_state(&state_file, &final_state);
 
     Ok(())
+}
+
+fn daemon_reconnect_backoff_delay(attempt: u32) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(4),
+        4 => Duration::from_secs(8),
+        5 => Duration::from_secs(16),
+        _ => Duration::from_secs(30),
+    }
+}
+
+fn publish_error_requires_reconnect(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("client not connected")
+        || lower.contains("relay pool shutdown")
+        || lower.contains("relay not connected")
+        || lower.contains("status changed")
+        || lower.contains("recv message response timeout")
+        || lower.contains("connection closed")
+        || lower.contains("broken pipe")
 }
 
 fn build_daemon_runtime_state(
@@ -2019,7 +2263,8 @@ fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
     }
     let log_file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&log_file_path)
         .with_context(|| format!("failed to open {}", log_file_path.display()))?;
     let _ = set_daemon_runtime_file_permissions(&log_file_path);
@@ -2108,11 +2353,15 @@ fn is_process_running(pid: u32) -> bool {
         return false;
     }
 
-    ProcessCommand::new("kill")
-        .arg("-0")
+    ProcessCommand::new("ps")
+        .arg("-p")
         .arg(pid.to_string())
-        .status()
-        .map(|status| status.success())
+        .arg("-o")
+        .arg("pid=")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -2717,7 +2966,10 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 mod tests {
     use clap::CommandFactory;
 
-    use super::Cli;
+    use super::{
+        Cli, daemon_reconnect_backoff_delay, endpoint_with_listen_port, is_uapi_addr_in_use_error,
+        publish_error_requires_reconnect, utun_interface_candidates,
+    };
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -2763,6 +3015,79 @@ mod tests {
             set.get_arguments()
                 .any(|argument| argument.get_long() == Some("autoconnect")),
             "missing --autoconnect on set command"
+        );
+    }
+
+    #[test]
+    fn daemon_reconnect_backoff_is_bounded_exponential() {
+        assert_eq!(daemon_reconnect_backoff_delay(1).as_secs(), 1);
+        assert_eq!(daemon_reconnect_backoff_delay(2).as_secs(), 2);
+        assert_eq!(daemon_reconnect_backoff_delay(3).as_secs(), 4);
+        assert_eq!(daemon_reconnect_backoff_delay(4).as_secs(), 8);
+        assert_eq!(daemon_reconnect_backoff_delay(5).as_secs(), 16);
+        assert_eq!(daemon_reconnect_backoff_delay(6).as_secs(), 30);
+        assert_eq!(daemon_reconnect_backoff_delay(99).as_secs(), 30);
+    }
+
+    #[test]
+    fn reconnect_only_for_connection_class_errors() {
+        assert!(publish_error_requires_reconnect(
+            "client not connected to relays"
+        ));
+        assert!(publish_error_requires_reconnect("relay pool shutdown"));
+        assert!(publish_error_requires_reconnect(
+            "event not published: relay not connected (status changed)"
+        ));
+        assert!(publish_error_requires_reconnect(
+            "event not published: recv message response timeout"
+        ));
+        assert!(publish_error_requires_reconnect(
+            "connection closed by peer"
+        ));
+
+        assert!(!publish_error_requires_reconnect(
+            "private signaling event rejected by all relays"
+        ));
+        assert!(!publish_error_requires_reconnect(
+            "event not published: Policy violated and pubkey is not in our web of trust."
+        ));
+    }
+
+    #[test]
+    fn utun_candidates_expand_for_default_style_names() {
+        let candidates = utun_interface_candidates("utun100");
+        assert_eq!(candidates.len(), 16);
+        assert_eq!(candidates[0], "utun100");
+        assert_eq!(candidates[1], "utun101");
+        assert_eq!(candidates[15], "utun115");
+    }
+
+    #[test]
+    fn utun_candidates_keep_custom_iface_as_is() {
+        let candidates = utun_interface_candidates("wg0");
+        assert_eq!(candidates, vec!["wg0".to_string()]);
+    }
+
+    #[test]
+    fn uapi_addr_in_use_matcher_detects_common_errnos() {
+        assert!(is_uapi_addr_in_use_error("uapi set failed: errno=48"));
+        assert!(is_uapi_addr_in_use_error("uapi set failed: errno=98"));
+        assert!(!is_uapi_addr_in_use_error("uapi set failed: errno=1"));
+    }
+
+    #[test]
+    fn endpoint_listen_port_rewrite_updates_socket_port() {
+        assert_eq!(
+            endpoint_with_listen_port("192.168.1.10:51820", 52000),
+            "192.168.1.10:52000"
+        );
+        assert_eq!(
+            endpoint_with_listen_port("[2001:db8::1]:51820", 52000),
+            "[2001:db8::1]:52000"
+        );
+        assert_eq!(
+            endpoint_with_listen_port("not-a-socket", 52000),
+            "not-a-socket"
         );
     }
 }

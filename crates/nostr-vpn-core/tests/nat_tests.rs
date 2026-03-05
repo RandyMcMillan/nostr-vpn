@@ -1,4 +1,4 @@
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
@@ -24,12 +24,16 @@ fn discovers_public_endpoint_from_reflector() {
             .expect("send response");
     });
 
-    let discovered = discover_public_udp_endpoint(reflector_addr, 51820, Duration::from_secs(2))
+    let discovered = discover_public_udp_endpoint(reflector_addr, 0, Duration::from_secs(2))
         .expect("discover endpoint");
+    let parsed = discovered
+        .parse::<SocketAddr>()
+        .expect("parsed discovered endpoint");
     assert!(
-        discovered.ends_with(":51820"),
-        "discovered endpoint was {discovered}"
+        parsed.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST),
+        "discovered endpoint ip was {parsed}"
     );
+    assert!(parsed.port() > 0, "discovered endpoint port was {parsed}");
 
     server.join().expect("reflector thread");
 }

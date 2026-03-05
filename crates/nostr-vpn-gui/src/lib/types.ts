@@ -43,6 +43,7 @@ export interface LanPeerView {
 }
 
 export interface UiState {
+  daemonRunning: boolean
   sessionActive: boolean
   relayConnected: boolean
   sessionStatus: string

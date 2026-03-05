@@ -25,7 +25,6 @@
 - `wss://relay.damus.io`
 - `wss://nos.lol`
 - `wss://relay.primal.net`
-- `wss://offchain.pub`
 
 ## Quickstart
 
@@ -111,6 +110,15 @@ nvpn render-wg \
 pnpm --dir crates/nostr-vpn-gui install
 pnpm --dir crates/nostr-vpn-gui tauri:dev
 ```
+
+For packaged installers:
+
+```bash
+pnpm --dir crates/nostr-vpn-gui tauri:build
+```
+
+`tauri:build` prepares and bundles the `nvpn` CLI as an app sidecar, so GUI daemon
+control works without requiring `nvpn` in `PATH`.
 
 GUI session control calls the `nvpn` CLI daemon (`start/stop/status`) and does not run
 WireGuard/Nostr runtime in the frontend process.

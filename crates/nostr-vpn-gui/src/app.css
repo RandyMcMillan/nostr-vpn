@@ -177,6 +177,13 @@ body {
   flex-wrap: wrap;
 }
 
+.identity-status {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
 .identity-row {
   width: 100%;
 }
