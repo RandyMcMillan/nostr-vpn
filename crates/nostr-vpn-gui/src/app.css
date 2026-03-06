@@ -161,35 +161,51 @@ body {
   background: linear-gradient(170deg, rgba(17, 14, 46, 0.95), rgba(9, 8, 30, 0.9));
 }
 
-.service-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 16px 18px;
+.service-panel {
+  background:
+    linear-gradient(135deg, rgba(18, 13, 48, 0.96), rgba(9, 10, 34, 0.92)),
+    radial-gradient(circle at 86% 18%, rgba(117, 236, 255, 0.12), transparent 34%);
+}
+
+.service-panel-required {
   border-color: rgba(255, 92, 226, 0.4);
   background:
     linear-gradient(135deg, rgba(32, 14, 57, 0.94), rgba(12, 11, 37, 0.92)),
     radial-gradient(circle at 88% 20%, rgba(255, 92, 226, 0.18), transparent 34%);
 }
 
-.service-banner-copy {
+.service-panel-copy {
   min-width: 0;
+  margin-top: 8px;
 }
 
-.service-banner-title {
-  font-size: 16px;
-  line-height: 1.1;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--pink);
-  font-weight: 700;
-}
-
-.service-banner-text {
-  margin-top: 6px;
+.service-panel-title {
+  font-size: 15px;
+  line-height: 1.2;
   color: var(--text);
+  font-weight: 650;
+}
+
+.service-panel-text {
+  margin-top: 6px;
+  color: var(--muted);
   font-size: 14px;
+}
+
+.service-panel-detail {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.service-panel-detail-ok {
+  color: var(--green);
+}
+
+.service-actions-row {
+  margin-top: 12px;
+  flex-wrap: wrap;
 }
 
 .row {
@@ -312,7 +328,7 @@ body {
   padding: 11px 14px;
 }
 
-.service-banner-btn {
+.service-primary-btn {
   min-width: 170px;
   padding: 11px 16px;
   border-color: rgba(255, 92, 226, 0.54);
@@ -320,7 +336,7 @@ body {
   box-shadow: 0 0 0 1px rgba(255, 92, 226, 0.15) inset;
 }
 
-.service-banner-btn:hover:not(:disabled) {
+.service-primary-btn:hover:not(:disabled) {
   background: linear-gradient(180deg, rgba(124, 49, 145, 0.94), rgba(85, 35, 111, 0.94));
 }
 
@@ -663,17 +679,6 @@ body {
   flex-wrap: wrap;
 }
 
-@media (max-width: 760px) {
-  .service-banner {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .service-banner-btn {
-    width: 100%;
-  }
-}
-
 .cli-actions-row {
   gap: 8px;
   flex-wrap: wrap;
@@ -700,6 +705,15 @@ body {
 }
 
 @media (max-width: 760px) {
+  .service-actions-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .service-actions-row .btn {
+    width: 100%;
+  }
+
   .app-shell {
     padding-top: 60px;
   }

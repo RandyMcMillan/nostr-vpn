@@ -426,11 +426,6 @@
 
     {#if state}
       <div class="row status-row">
-        {#if state.serviceSupported}
-          <span class={`badge ${state.serviceInstalled ? 'ok' : 'muted'}`}>
-            Service {state.serviceInstalled ? 'Installed' : 'Not installed'}
-          </span>
-        {/if}
         <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
           Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
         </span>
@@ -454,20 +449,115 @@
 
   {#if state}
     {#if serviceInstallRecommended}
-      <section class="panel service-banner" data-testid="service-setup-banner">
-        <div class="service-banner-copy">
-          <div class="service-banner-title">Install background service</div>
-          <div class="service-banner-text">
-            Required for reliable background VPN, startup, and no repeated password prompts.
+      <section
+        class={`panel service-panel ${serviceSetupRequired ? 'service-panel-required' : ''}`}
+        data-testid="service-panel"
+      >
+        <div class="section-title-row">
+          <h2>Background Service</h2>
+          <div class="section-meta">
+            {state.serviceInstalled
+              ? state.serviceRunning
+                ? 'Installed and running'
+                : 'Installed'
+              : 'Not installed'}
           </div>
         </div>
-        <button
-          class="btn service-banner-btn"
-          data-testid="install-service-banner-btn"
-          on:click={() => onInstallSystemService(serviceSetupRequired)}
-        >
-          Install service
-        </button>
+
+        <div class="row status-row">
+          <span class={`badge ${state.serviceInstalled ? 'ok' : 'warn'}`}>
+            {state.serviceInstalled ? 'Installed' : 'Setup required'}
+          </span>
+          <span class={`badge ${state.serviceRunning ? 'ok' : 'muted'}`}>
+            {state.serviceRunning ? 'Running' : 'Not running'}
+          </span>
+          <span class="badge muted">Daemon {state.daemonRunning ? 'reachable' : 'idle'}</span>
+        </div>
+
+        <div class="service-panel-copy">
+          <div class="service-panel-title">
+            {serviceSetupRequired
+              ? 'Install once for reliable background VPN'
+              : 'Background service keeps VPN control out of the GUI process'}
+          </div>
+          <div class="service-panel-text">
+            Required for background startup, resilient reconnects, and avoiding repeated admin prompts.
+          </div>
+          {#if state.serviceStatusDetail}
+            <div class="service-panel-detail" data-testid="service-status-detail">
+              {state.serviceStatusDetail}
+            </div>
+          {/if}
+          {#if serviceActionStatus}
+            <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
+          {/if}
+        </div>
+
+        <div class="row service-actions-row">
+          <button
+            class={`btn ${serviceSetupRequired ? 'service-primary-btn' : ''}`}
+            data-testid="install-service-btn"
+            on:click={() => onInstallSystemService(serviceSetupRequired)}
+          >
+            {state.serviceInstalled ? 'Reinstall service' : 'Install service'}
+          </button>
+          <button
+            class="btn ghost"
+            data-testid="uninstall-service-btn"
+            on:click={onUninstallSystemService}
+            disabled={!state.serviceInstalled}
+          >
+            Uninstall
+          </button>
+        </div>
+      </section>
+    {/if}
+
+    {#if state.serviceSupported && !serviceInstallRecommended}
+      <section class="panel service-panel" data-testid="service-panel">
+        <div class="section-title-row">
+          <h2>Background Service</h2>
+          <div class="section-meta">
+            {state.serviceRunning ? 'Installed and running' : 'Installed'}
+          </div>
+        </div>
+
+        <div class="row status-row">
+          <span class="badge ok">Installed</span>
+          <span class={`badge ${state.serviceRunning ? 'ok' : 'muted'}`}>
+            {state.serviceRunning ? 'Running' : 'Not running'}
+          </span>
+          <span class={`badge ${state.daemonRunning ? 'ok' : 'muted'}`}>
+            Daemon {state.daemonRunning ? 'reachable' : 'idle'}
+          </span>
+        </div>
+
+        <div class="service-panel-copy">
+          <div class="service-panel-title">
+            Background service manages privileged VPN runtime operations.
+          </div>
+          {#if state.serviceStatusDetail}
+            <div class="service-panel-detail" data-testid="service-status-detail">
+              {state.serviceStatusDetail}
+            </div>
+          {/if}
+          {#if serviceActionStatus}
+            <div class="service-panel-detail service-panel-detail-ok">{serviceActionStatus}</div>
+          {/if}
+        </div>
+
+        <div class="row service-actions-row">
+          <button class="btn" data-testid="install-service-btn" on:click={onInstallSystemService}>
+            Reinstall service
+          </button>
+          <button
+            class="btn ghost"
+            data-testid="uninstall-service-btn"
+            on:click={onUninstallSystemService}
+          >
+            Uninstall
+          </button>
+        </div>
       </section>
     {/if}
 
@@ -688,43 +778,12 @@
 
     <section class="panel">
       <div class="section-title-row">
-        <h2>Node & Runtime</h2>
+        <h2>App & Node</h2>
       </div>
 
       <div class="row settings-action-row">
         <div class="config-path">Config: {state.configPath}</div>
       </div>
-      {#if state.serviceSupported}
-        <div class="row spread settings-action-row">
-          <div class="config-path">
-            Background Service:
-            {state.serviceInstalled
-              ? state.serviceRunning
-                ? 'Installed (running)'
-                : 'Installed'
-              : 'Not installed'}
-          </div>
-          <div class="row cli-actions-row">
-            <button class="btn" data-testid="install-service-btn" on:click={onInstallSystemService}>
-              {state.serviceInstalled ? 'Reinstall service' : 'Install service'}
-            </button>
-            <button
-              class="btn ghost"
-              data-testid="uninstall-service-btn"
-              on:click={onUninstallSystemService}
-              disabled={!state.serviceInstalled}
-            >
-              Uninstall
-            </button>
-          </div>
-        </div>
-        {#if state.serviceStatusDetail}
-          <div class="config-path">{state.serviceStatusDetail}</div>
-        {/if}
-        {#if serviceActionStatus}
-          <div class="config-path">{serviceActionStatus}</div>
-        {/if}
-      {/if}
       <div class="row spread settings-action-row">
         <div class="config-path">Terminal CLI</div>
         <div class="row cli-actions-row">
