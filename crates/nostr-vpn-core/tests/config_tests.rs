@@ -49,6 +49,8 @@ fn generated_config_auto_populates_keys() {
     assert!(config.lan_discovery_enabled);
     assert!(config.launch_on_startup);
     assert!(config.close_to_tray_on_close);
+    assert!(config.nat.enabled);
+    assert!(!config.nat.stun_servers.is_empty());
 }
 
 #[test]

@@ -276,7 +276,7 @@ Run NAT-focused docker e2e:
 ```
 
 This e2e uses two NAT router containers with deterministic UDP/51820 mapping to verify:
-private Nostr signaling, endpoint discovery, pre-punch, and boringtun tunnel ping.
+private Nostr signaling, public endpoint discovery, daemon-managed boringtun handshake, and tunnel ping across separate NATed networks.
 
 ## GitHub release signing/notarization (optional)
 

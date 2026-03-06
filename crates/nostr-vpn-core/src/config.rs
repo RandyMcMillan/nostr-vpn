@@ -49,6 +49,22 @@ fn default_relays() -> Vec<String> {
         .collect()
 }
 
+fn default_nat_enabled() -> bool {
+    true
+}
+
+fn default_nat_stun_servers() -> Vec<String> {
+    vec![
+        "stun:stun.iris.to:3478".to_string(),
+        "stun:stun.l.google.com:19302".to_string(),
+        "stun:stun.cloudflare.com:3478".to_string(),
+    ]
+}
+
+const fn default_nat_discovery_timeout_secs() -> u64 {
+    2
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -72,9 +88,23 @@ pub struct AppConfig {
     #[serde(default = "default_peer_aliases")]
     pub peer_aliases: HashMap<String, String>,
     #[serde(default)]
+    pub nat: NatConfig,
+    #[serde(default)]
     pub nostr: NostrConfig,
     #[serde(default)]
     pub node: NodeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NatConfig {
+    #[serde(default = "default_nat_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_nat_stun_servers")]
+    pub stun_servers: Vec<String>,
+    #[serde(default)]
+    pub reflectors: Vec<String>,
+    #[serde(default = "default_nat_discovery_timeout_secs")]
+    pub discovery_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,11 +138,23 @@ impl Default for AppConfig {
             close_to_tray_on_close: default_close_to_tray_on_close(),
             magic_dns_suffix: default_magic_dns_suffix(),
             peer_aliases: default_peer_aliases(),
+            nat: NatConfig::default(),
             nostr: NostrConfig::default(),
             node: NodeConfig::default(),
         };
         config.ensure_defaults();
         config
+    }
+}
+
+impl Default for NatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_nat_enabled(),
+            stun_servers: default_nat_stun_servers(),
+            reflectors: Vec::new(),
+            discovery_timeout_secs: default_nat_discovery_timeout_secs(),
+        }
     }
 }
 

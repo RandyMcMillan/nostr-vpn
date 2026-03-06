@@ -50,6 +50,8 @@ async fn announces_over_local_nostr_relay() {
         node_id: "sender-node".to_string(),
         public_key: "sender-public".to_string(),
         endpoint: "127.0.0.1:51820".to_string(),
+        local_endpoint: None,
+        public_endpoint: None,
         tunnel_ip: "10.44.0.5/32".to_string(),
         timestamp: 42,
     };
@@ -86,6 +88,8 @@ async fn publish_requires_configured_participants_for_private_signaling() {
         node_id: "node".to_string(),
         public_key: "pub".to_string(),
         endpoint: "127.0.0.1:51820".to_string(),
+        local_endpoint: None,
+        public_endpoint: None,
         tunnel_ip: "10.44.0.9/32".to_string(),
         timestamp: 1,
     };
@@ -144,6 +148,8 @@ async fn relay_event_does_not_leak_plaintext_sensitive_fields() {
         node_id: "node-sensitive".to_string(),
         public_key: "wg-sensitive-public".to_string(),
         endpoint: "203.0.113.77:51820".to_string(),
+        local_endpoint: None,
+        public_endpoint: None,
         tunnel_ip: "10.44.66.7/32".to_string(),
         timestamp: 123456,
     };

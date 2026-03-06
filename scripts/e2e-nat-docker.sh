@@ -4,14 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 COMPOSE=(docker compose -f "$ROOT_DIR/docker-compose.nat-e2e.yml")
 
-NETWORK_ID="docker-vpn-nat"
 RELAY_URL="ws://10.254.241.2:8080"
 REFLECTOR_ADDR="10.254.241.3:3478"
-
-ALICE_WG_PRIVATE="9eUzwIuYiF1Au6fBSwSnMHuWp90mqFQZrsC3YH7qzb8="
-ALICE_WG_PUBLIC="8VBKKEKhzF7lPlukFYvpMsZX42RcgClBcwI1FpFTIRE="
-BOB_WG_PRIVATE="3DnM5OoFTb2DgGQ/BPAM0W8+xKUExtxA1l5jXloihO0="
-BOB_WG_PUBLIC="czraiWsRqvnjWLMoww0riN8uZa6By7EJl6swa5mY5To="
+CONFIG_PATH="/root/.config/nvpn/config.toml"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -19,18 +14,25 @@ cleanup() {
 
 dump_debug() {
   set +e
-  echo "nat e2e failed, collecting debug logs..."
+  echo "nat docker e2e failed, collecting debug output..."
   "${COMPOSE[@]}" ps || true
   for service in relay reflector nat-a nat-b node-a node-b; do
     echo "--- logs: $service ---"
     "${COMPOSE[@]}" logs --no-color --tail 120 "$service" || true
   done
   for node in node-a node-b; do
-    echo "--- $node /tmp/tunnel.log ---"
-    "${COMPOSE[@]}" exec -T "$node" sh -lc "cat /tmp/tunnel.log 2>/dev/null || true" || true
+    echo "--- $node status ---"
+    "${COMPOSE[@]}" exec -T "$node" nvpn status --json --discover-secs 0 || true
+    echo "--- $node daemon.state.json ---"
+    "${COMPOSE[@]}" exec -T "$node" sh -lc "cat /root/.config/nvpn/daemon.state.json 2>/dev/null || true" || true
+    echo "--- $node daemon.log ---"
+    "${COMPOSE[@]}" exec -T "$node" sh -lc "tail -n 200 /root/.config/nvpn/daemon.log 2>/dev/null || true" || true
     echo "--- $node routes ---"
     "${COMPOSE[@]}" exec -T "$node" sh -lc "ip route || true" || true
+    echo "--- $node utun100 ---"
     "${COMPOSE[@]}" exec -T "$node" sh -lc "ip addr show utun100 || true" || true
+    echo "--- $node processes ---"
+    "${COMPOSE[@]}" exec -T "$node" sh -lc "ps ax || true" || true
   done
 }
 
@@ -44,6 +46,18 @@ on_exit() {
 }
 trap on_exit EXIT
 
+compact_json() {
+  tr -d '\n\r\t '
+}
+
+peer_tunnel_ip_from_status() {
+  grep -o '"tunnel_ip":"10\.44\.0\.[0-9]\+/32"' | tail -n1 | cut -d '"' -f4 | cut -d/ -f1
+}
+
+peer_endpoint_from_status() {
+  grep -o '"endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4
+}
+
 cleanup
 
 "${COMPOSE[@]}" build >/dev/null
@@ -55,120 +69,91 @@ sleep 3
 "${COMPOSE[@]}" exec -T node-b sh -lc \
   "ip route del default >/dev/null 2>&1 || true; ip route add default via 198.19.242.2 dev eth0"
 
+for node in node-a node-b; do
+  "${COMPOSE[@]}" exec -T "$node" nvpn init --force >/dev/null
+done
+
 ALICE_NPUB="$("${COMPOSE[@]}" exec -T node-a sh -lc \
-  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
+  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
 BOB_NPUB="$("${COMPOSE[@]}" exec -T node-b sh -lc \
-  "nvpn init --force >/dev/null && grep -m1 '^public_key' /root/.config/nvpn/config.toml | cut -d '\"' -f 2")"
+  "grep -m1 '^public_key' '$CONFIG_PATH' | cut -d '\"' -f 2" | tr -d '\r')"
 
 if [[ -z "$ALICE_NPUB" || -z "$BOB_NPUB" ]]; then
-  echo "nat e2e failed: unable to resolve node npubs from config" >&2
+  echo "nat docker e2e failed: unable to resolve node npubs" >&2
   exit 1
 fi
 
-ALICE_ENDPOINT="$("${COMPOSE[@]}" exec -T node-a nvpn nat-discover --reflector "$REFLECTOR_ADDR" --listen-port 51820 | tr -d '\r' | tail -n1)"
-BOB_ENDPOINT="$("${COMPOSE[@]}" exec -T node-b nvpn nat-discover --reflector "$REFLECTOR_ADDR" --listen-port 51820 | tr -d '\r' | tail -n1)"
+"${COMPOSE[@]}" exec -T node-a nvpn set --participant "$BOB_NPUB" --relay "$RELAY_URL" >/dev/null
+"${COMPOSE[@]}" exec -T node-b nvpn set --participant "$ALICE_NPUB" --relay "$RELAY_URL" >/dev/null
 
-if [[ -z "$ALICE_ENDPOINT" || -z "$BOB_ENDPOINT" ]]; then
-  echo "nat e2e failed: endpoint discovery returned empty result" >&2
-  exit 1
-fi
+for node in node-a node-b; do
+  "${COMPOSE[@]}" exec -T "$node" sh -lc \
+    "sed -i 's|^reflectors = .*|reflectors = [\"$REFLECTOR_ADDR\"]|' '$CONFIG_PATH'"
+  "${COMPOSE[@]}" exec -T "$node" sh -lc \
+    "sed -i 's|^discovery_timeout_secs = .*|discovery_timeout_secs = 2|' '$CONFIG_PATH'"
+done
 
-echo "alice endpoint: $ALICE_ENDPOINT"
-echo "bob endpoint:   $BOB_ENDPOINT"
+"${COMPOSE[@]}" exec -T node-a nvpn start --daemon --connect >/dev/null
+"${COMPOSE[@]}" exec -T node-b nvpn start --daemon --connect >/dev/null
 
-"${COMPOSE[@]}" exec -T node-a sh -lc \
-  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --participant '$ALICE_NPUB' --participant '$BOB_NPUB' --limit 1 > /tmp/listen.log 2>&1 &"
-"${COMPOSE[@]}" exec -T node-b sh -lc \
-  "nvpn listen --network-id '$NETWORK_ID' --relay '$RELAY_URL' --participant '$ALICE_NPUB' --participant '$BOB_NPUB' --limit 1 > /tmp/listen.log 2>&1 &"
+ALICE_STATUS=""
+BOB_STATUS=""
+for _ in $(seq 1 60); do
+  ALICE_STATUS="$("${COMPOSE[@]}" exec -T node-a nvpn status --json --discover-secs 0 | tr -d '\r')"
+  BOB_STATUS="$("${COMPOSE[@]}" exec -T node-b nvpn status --json --discover-secs 0 | tr -d '\r')"
+  ALICE_COMPACT="$(printf '%s' "$ALICE_STATUS" | compact_json)"
+  BOB_COMPACT="$(printf '%s' "$BOB_STATUS" | compact_json)"
 
-sleep 2
-
-"${COMPOSE[@]}" exec -T node-a nvpn announce \
-  --network-id "$NETWORK_ID" \
-  --relay "$RELAY_URL" \
-  --participant "$ALICE_NPUB" \
-  --participant "$BOB_NPUB" \
-  --node-id alice-node \
-  --endpoint "$ALICE_ENDPOINT" \
-  --tunnel-ip 10.44.0.1/32 \
-  --public-key "$ALICE_WG_PUBLIC" >/dev/null
-
-"${COMPOSE[@]}" exec -T node-b nvpn announce \
-  --network-id "$NETWORK_ID" \
-  --relay "$RELAY_URL" \
-  --participant "$BOB_NPUB" \
-  --participant "$ALICE_NPUB" \
-  --node-id bob-node \
-  --endpoint "$BOB_ENDPOINT" \
-  --tunnel-ip 10.44.0.2/32 \
-  --public-key "$BOB_WG_PUBLIC" >/dev/null
-
-for _ in $(seq 1 25); do
-  ALICE_LISTEN_LOGS="$("${COMPOSE[@]}" exec -T node-a sh -lc 'cat /tmp/listen.log 2>/dev/null || true')"
-  BOB_LISTEN_LOGS="$("${COMPOSE[@]}" exec -T node-b sh -lc 'cat /tmp/listen.log 2>/dev/null || true')"
-
-  if grep -Eq '"node_id"\s*:\s*"bob-node"' <<<"$ALICE_LISTEN_LOGS" \
-    && grep -Eq '"node_id"\s*:\s*"alice-node"' <<<"$BOB_LISTEN_LOGS"; then
+  if grep -q '"status_source":"daemon"' <<<"$ALICE_COMPACT" \
+    && grep -q '"status_source":"daemon"' <<<"$BOB_COMPACT" \
+    && grep -q '"running":true' <<<"$ALICE_COMPACT" \
+    && grep -q '"running":true' <<<"$BOB_COMPACT" \
+    && grep -q '"reachable":true' <<<"$ALICE_COMPACT" \
+    && grep -q '"reachable":true' <<<"$BOB_COMPACT"; then
     break
   fi
   sleep 1
 done
 
-ALICE_LISTEN_LOGS="$("${COMPOSE[@]}" exec -T node-a sh -lc 'cat /tmp/listen.log 2>/dev/null || true')"
-BOB_LISTEN_LOGS="$("${COMPOSE[@]}" exec -T node-b sh -lc 'cat /tmp/listen.log 2>/dev/null || true')"
+printf 'ALICE STATUS\n%s\n' "$ALICE_STATUS"
+printf 'BOB STATUS\n%s\n' "$BOB_STATUS"
 
-if ! grep -Eq '"node_id"\s*:\s*"bob-node"' <<<"$ALICE_LISTEN_LOGS"; then
-  echo "nat e2e failed: alice did not receive bob announcement" >&2
-  echo "$ALICE_LISTEN_LOGS"
+ALICE_COMPACT="$(printf '%s' "$ALICE_STATUS" | compact_json)"
+BOB_COMPACT="$(printf '%s' "$BOB_STATUS" | compact_json)"
+
+grep -q '"status_source":"daemon"' <<<"$ALICE_COMPACT"
+grep -q '"status_source":"daemon"' <<<"$BOB_COMPACT"
+grep -q '"running":true' <<<"$ALICE_COMPACT"
+grep -q '"running":true' <<<"$BOB_COMPACT"
+grep -q '"reachable":true' <<<"$ALICE_COMPACT"
+grep -q '"reachable":true' <<<"$BOB_COMPACT"
+
+ALICE_SELECTED_ENDPOINT="$(printf '%s' "$ALICE_COMPACT" | peer_endpoint_from_status)"
+BOB_SELECTED_ENDPOINT="$(printf '%s' "$BOB_COMPACT" | peer_endpoint_from_status)"
+
+if [[ "$ALICE_SELECTED_ENDPOINT" != "10.254.241.11:51820" ]]; then
+  echo "nat docker e2e failed: alice selected unexpected peer endpoint '$ALICE_SELECTED_ENDPOINT'" >&2
+  exit 1
+fi
+if [[ "$BOB_SELECTED_ENDPOINT" != "10.254.241.10:51820" ]]; then
+  echo "nat docker e2e failed: bob selected unexpected peer endpoint '$BOB_SELECTED_ENDPOINT'" >&2
   exit 1
 fi
 
-if ! grep -Eq '"node_id"\s*:\s*"alice-node"' <<<"$BOB_LISTEN_LOGS"; then
-  echo "nat e2e failed: bob did not receive alice announcement" >&2
-  echo "$BOB_LISTEN_LOGS"
+BOB_TUNNEL_IP="$(printf '%s' "$ALICE_COMPACT" | peer_tunnel_ip_from_status)"
+ALICE_TUNNEL_IP="$(printf '%s' "$BOB_COMPACT" | peer_tunnel_ip_from_status)"
+
+if [[ -z "$ALICE_TUNNEL_IP" || -z "$BOB_TUNNEL_IP" ]]; then
+  echo "nat docker e2e failed: unable to resolve peer tunnel IPs from status output" >&2
   exit 1
 fi
 
-"${COMPOSE[@]}" exec -d node-a sh -lc \
-  "nvpn tunnel-up \
-     --iface utun100 \
-     --private-key '$ALICE_WG_PRIVATE' \
-     --listen-port 51820 \
-     --address 10.44.0.1/32 \
-     --peer-public-key '$BOB_WG_PUBLIC' \
-     --peer-endpoint '$BOB_ENDPOINT' \
-     --peer-allowed-ip 10.44.0.2/32 \
-     --keepalive-secs 1 \
-     --hole-punch-attempts 80 \
-     --hole-punch-interval-ms 120 \
-     --hole-punch-recv-timeout-ms 120 > /tmp/tunnel.log 2>&1"
+"${COMPOSE[@]}" exec -T node-a ping -c 3 -W 2 "$BOB_TUNNEL_IP" >/tmp/nvpn-nat-ping-a.log
+"${COMPOSE[@]}" exec -T node-b ping -c 3 -W 2 "$ALICE_TUNNEL_IP" >/tmp/nvpn-nat-ping-b.log
 
-"${COMPOSE[@]}" exec -d node-b sh -lc \
-  "nvpn tunnel-up \
-     --iface utun100 \
-     --private-key '$BOB_WG_PRIVATE' \
-     --listen-port 51820 \
-     --address 10.44.0.2/32 \
-     --peer-public-key '$ALICE_WG_PUBLIC' \
-     --peer-endpoint '$ALICE_ENDPOINT' \
-     --peer-allowed-ip 10.44.0.1/32 \
-     --keepalive-secs 1 \
-     --hole-punch-attempts 80 \
-     --hole-punch-interval-ms 120 \
-     --hole-punch-recv-timeout-ms 120 > /tmp/tunnel.log 2>&1"
-
-sleep 14
-
-"${COMPOSE[@]}" exec -T node-a ping -c 3 -W 2 10.44.0.2 >/tmp/ping-a.log
-"${COMPOSE[@]}" exec -T node-b ping -c 3 -W 2 10.44.0.1 >/tmp/ping-b.log
-
-echo "--- Alice listen log ---"
-echo "$ALICE_LISTEN_LOGS"
-echo "--- Bob listen log ---"
-echo "$BOB_LISTEN_LOGS"
 echo "--- Ping A -> B ---"
-cat /tmp/ping-a.log
+cat /tmp/nvpn-nat-ping-a.log
 echo "--- Ping B -> A ---"
-cat /tmp/ping-b.log
+cat /tmp/nvpn-nat-ping-b.log
 
-echo "nat docker e2e passed: Nostr signaling + UDP punch + boringtun tunnel ping succeeded"
+echo "nat docker e2e passed: daemon-mode Nostr signaling, public endpoint discovery, boringtun tunnel handshake, and ping succeeded across separate Docker NATs"

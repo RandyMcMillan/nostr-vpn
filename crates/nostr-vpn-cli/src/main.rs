@@ -21,13 +21,15 @@ use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, derive_network_id_from_participants, maybe_autoconfigure_node,
     normalize_nostr_pubkey,
 };
-use nostr_vpn_core::control::PeerAnnouncement;
+use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::crypto::generate_keypair;
 use nostr_vpn_core::magic_dns::{
     MagicDnsResolverConfig, MagicDnsServer, build_magic_dns_records, install_system_resolver,
     uninstall_system_resolver,
 };
-use nostr_vpn_core::nat::{discover_public_udp_endpoint, hole_punch_udp};
+use nostr_vpn_core::nat::{
+    discover_public_udp_endpoint, discover_public_udp_endpoint_via_stun, hole_punch_udp,
+};
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalEnvelope, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,7 @@ const DAEMON_CONTROL_STOP_REQUEST: &str = "stop";
 const DAEMON_CONTROL_RELOAD_REQUEST: &str = "reload";
 const DAEMON_CONTROL_PAUSE_REQUEST: &str = "pause";
 const DAEMON_CONTROL_RESUME_REQUEST: &str = "resume";
+const TUNNEL_HEARTBEAT_PORT: u16 = 9;
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -689,6 +692,8 @@ async fn main() -> Result<()> {
                             node_id: peer.node_id.clone(),
                             public_key: peer.public_key.clone(),
                             endpoint: peer.endpoint.clone(),
+                            local_endpoint: None,
+                            public_endpoint: None,
                             tunnel_ip: peer.tunnel_ip.clone(),
                             timestamp: peer.presence_timestamp,
                         })
@@ -1207,6 +1212,8 @@ async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnou
         node_id,
         public_key,
         endpoint,
+        local_endpoint: None,
+        public_endpoint: None,
         tunnel_ip,
         timestamp: unix_timestamp(),
     };
@@ -1531,11 +1538,14 @@ impl CliTunnelRuntime {
         let configured_participants = app.participant_pubkeys_hex();
         let configured_listen_port = app.node.listen_port;
         let listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
+        let own_local_endpoint = local_signal_endpoint(app, listen_port);
         let mut peers = configured_participants
             .iter()
             .filter(|participant| Some(participant.as_str()) != own_pubkey)
             .filter_map(|participant| peer_announcements.get(participant))
-            .map(tunnel_peer_from_announcement)
+            .map(|announcement| {
+                tunnel_peer_from_announcement(announcement, Some(&own_local_endpoint))
+            })
             .collect::<Result<Vec<_>>>()?;
         peers.sort_by(|left, right| left.pubkey_hex.cmp(&right.pubkey_hex));
 
@@ -1701,11 +1711,93 @@ fn endpoint_with_listen_port(endpoint: &str, listen_port: u16) -> String {
         .unwrap_or_else(|_| endpoint.to_string())
 }
 
-fn tunnel_peer_from_announcement(announcement: &PeerAnnouncement) -> Result<TunnelPeer> {
-    let endpoint: SocketAddr = announcement
-        .endpoint
+fn local_signal_endpoint(app: &AppConfig, listen_port: u16) -> String {
+    endpoint_with_listen_port(&app.node.endpoint, listen_port)
+}
+
+fn discover_public_signal_endpoint(app: &AppConfig, listen_port: u16) -> Option<String> {
+    if !app.nat.enabled {
+        return None;
+    }
+
+    let timeout = Duration::from_secs(app.nat.discovery_timeout_secs.max(1));
+
+    for reflector in &app.nat.reflectors {
+        let Ok(reflector_addr) = reflector.parse::<SocketAddr>() else {
+            eprintln!("nat: ignoring invalid reflector address '{reflector}'");
+            continue;
+        };
+
+        match discover_public_udp_endpoint(reflector_addr, listen_port, timeout) {
+            Ok(endpoint) => {
+                eprintln!("nat: discovered public endpoint via reflector {reflector}: {endpoint}");
+                return Some(endpoint);
+            }
+            Err(error) => {
+                eprintln!("nat: reflector discovery failed via {reflector}: {error}");
+            }
+        }
+    }
+
+    for server in &app.nat.stun_servers {
+        match discover_public_udp_endpoint_via_stun(server, listen_port, timeout) {
+            Ok(endpoint) => {
+                eprintln!("nat: discovered public endpoint via STUN {server}: {endpoint}");
+                return Some(endpoint);
+            }
+            Err(error) => {
+                eprintln!("nat: stun discovery failed via {server}: {error}");
+            }
+        }
+    }
+
+    None
+}
+
+fn build_peer_announcement(
+    app: &AppConfig,
+    listen_port: u16,
+    public_endpoint: Option<&str>,
+) -> PeerAnnouncement {
+    let local_endpoint = local_signal_endpoint(app, listen_port);
+    let public_endpoint = public_endpoint
+        .map(str::to_string)
+        .filter(|value| value != &local_endpoint);
+    let endpoint = public_endpoint
+        .clone()
+        .unwrap_or_else(|| local_endpoint.clone());
+
+    PeerAnnouncement {
+        node_id: app.node.id.clone(),
+        public_key: app.node.public_key.clone(),
+        endpoint,
+        local_endpoint: Some(local_endpoint),
+        public_endpoint,
+        tunnel_ip: app.node.tunnel_ip.clone(),
+        timestamp: unix_timestamp(),
+    }
+}
+
+fn compatible_public_endpoint<'a>(
+    public_endpoint: Option<&'a str>,
+    configured_listen_port: u16,
+    actual_listen_port: u16,
+) -> Option<&'a str> {
+    if configured_listen_port == actual_listen_port {
+        public_endpoint
+    } else {
+        None
+    }
+}
+
+fn tunnel_peer_from_announcement(
+    announcement: &PeerAnnouncement,
+    own_local_endpoint: Option<&str>,
+) -> Result<TunnelPeer> {
+    let selected_endpoint = select_peer_endpoint(announcement, own_local_endpoint);
+    let endpoint: SocketAddr = selected_endpoint
         .parse()
-        .with_context(|| format!("invalid peer endpoint {}", announcement.endpoint))?;
+        .with_context(|| format!("invalid peer endpoint {}", selected_endpoint))?;
     let pubkey_hex = key_b64_to_hex(&announcement.public_key)?;
     let allowed_ip = format!("{}/32", strip_cidr(&announcement.tunnel_ip));
 
@@ -1714,6 +1806,195 @@ fn tunnel_peer_from_announcement(announcement: &PeerAnnouncement) -> Result<Tunn
         endpoint: endpoint.to_string(),
         allowed_ip,
     })
+}
+
+fn runtime_has_handshake(tunnel_runtime: &CliTunnelRuntime) -> bool {
+    tunnel_runtime
+        .peer_status()
+        .ok()
+        .is_some_and(|peers| peers.values().any(WireGuardPeerStatus::has_handshake))
+}
+
+fn nat_punch_targets(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    listen_port: u16,
+) -> Vec<SocketAddr> {
+    let own_local_endpoint = local_signal_endpoint(app, listen_port);
+    let mut targets = app
+        .participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .filter_map(|participant| peer_announcements.get(participant))
+        .filter_map(|announcement| {
+            select_peer_endpoint(announcement, Some(&own_local_endpoint))
+                .parse::<SocketAddr>()
+                .ok()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn nat_punch_fingerprint(targets: &[SocketAddr], listen_port: u16) -> Option<String> {
+    if targets.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "{listen_port}|{}",
+        targets
+            .iter()
+            .map(SocketAddr::to_string)
+            .collect::<Vec<_>>()
+            .join(";")
+    ))
+}
+
+fn hole_punch_with_retry(listen_port: u16, target: SocketAddr) -> Result<()> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match hole_punch_udp(
+            listen_port,
+            target,
+            20,
+            Duration::from_millis(120),
+            Duration::from_millis(120),
+        ) {
+            Ok(report) => {
+                eprintln!(
+                    "nat: punched {} from {} to {}, ack={}",
+                    report.packets_sent, report.local_addr, target, report.packet_received
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                if is_resource_busy_message(&error_text) {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to bind hole-punch socket")))
+}
+
+fn maybe_run_nat_punch(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    tunnel_runtime: &mut CliTunnelRuntime,
+    last_attempt: &mut Option<(String, Instant)>,
+) -> Result<()> {
+    if !app.nat.enabled {
+        return Ok(());
+    }
+
+    let listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+    let targets = nat_punch_targets(app, own_pubkey, peer_announcements, listen_port);
+    let Some(fingerprint) = nat_punch_fingerprint(&targets, listen_port) else {
+        *last_attempt = None;
+        return Ok(());
+    };
+
+    if runtime_has_handshake(tunnel_runtime) {
+        *last_attempt = None;
+        return Ok(());
+    }
+
+    let should_retry = match last_attempt {
+        Some((last_fingerprint, last_at)) => {
+            last_fingerprint != &fingerprint || last_at.elapsed() >= Duration::from_secs(10)
+        }
+        None => true,
+    };
+    if !should_retry {
+        return Ok(());
+    }
+
+    tunnel_runtime.stop();
+    thread::sleep(Duration::from_millis(150));
+
+    let mut punch_error = None;
+    for target in &targets {
+        if let Err(error) = hole_punch_with_retry(listen_port, *target) {
+            punch_error = Some(error);
+            break;
+        }
+    }
+
+    tunnel_runtime.active_listen_port = Some(listen_port);
+    tunnel_runtime
+        .apply(app, own_pubkey, peer_announcements)
+        .context("failed to re-apply tunnel runtime after nat punch")?;
+
+    if let Some(error) = punch_error {
+        return Err(error);
+    }
+
+    *last_attempt = Some((fingerprint, Instant::now()));
+    Ok(())
+}
+
+fn pending_tunnel_heartbeat_ips(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+) -> Vec<Ipv4Addr> {
+    let mut targets = app
+        .participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .filter_map(|participant| {
+            let announcement = peer_announcements.get(participant)?;
+            let peer_pubkey_hex = key_b64_to_hex(&announcement.public_key).ok()?;
+            let has_handshake = runtime_peers
+                .and_then(|peers| peers.get(&peer_pubkey_hex))
+                .is_some_and(WireGuardPeerStatus::has_handshake);
+            if has_handshake {
+                return None;
+            }
+
+            strip_cidr(&announcement.tunnel_ip).parse::<Ipv4Addr>().ok()
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn send_tunnel_heartbeat(peer_ip: Ipv4Addr) -> Result<()> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .context("failed to bind local udp socket for tunnel heartbeat")?;
+    socket
+        .send_to(
+            b"nvpn-heartbeat",
+            SocketAddr::V4(SocketAddrV4::new(peer_ip, TUNNEL_HEARTBEAT_PORT)),
+        )
+        .with_context(|| format!("failed to send tunnel heartbeat to {peer_ip}"))?;
+    Ok(())
+}
+
+fn heartbeat_pending_tunnel_peers(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    tunnel_runtime: &CliTunnelRuntime,
+) -> Result<usize> {
+    let runtime_peers = tunnel_runtime.peer_status().ok();
+    let targets =
+        pending_tunnel_heartbeat_ips(app, own_pubkey, peer_announcements, runtime_peers.as_ref());
+    for target in &targets {
+        send_tunnel_heartbeat(*target)?;
+    }
+    Ok(targets.len())
 }
 
 fn build_runtime_magic_dns_records(
@@ -1791,6 +2072,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let public_signal_endpoint = discover_public_signal_endpoint(&app, app.node.listen_port);
 
     let client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -1805,17 +2087,17 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     if let Some(runtime) = magic_dns_runtime.as_ref() {
         runtime.refresh_records(&app, &peer_announcements);
     }
+    let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
     let _ = client
-        .publish(SignalPayload::Announce(PeerAnnouncement {
-            node_id: app.node.id.clone(),
-            public_key: app.node.public_key.clone(),
-            endpoint: endpoint_with_listen_port(
-                &app.node.endpoint,
-                tunnel_runtime.listen_port(app.node.listen_port),
+        .publish(SignalPayload::Announce(build_peer_announcement(
+            &app,
+            actual_listen_port,
+            compatible_public_endpoint(
+                public_signal_endpoint.as_deref(),
+                app.node.listen_port,
+                actual_listen_port,
             ),
-            tunnel_ip: app.node.tunnel_ip.clone(),
-            timestamp: unix_timestamp(),
-        }))
+        )))
         .await;
 
     println!(
@@ -1827,24 +2109,46 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut tunnel_heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
+    tunnel_heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut last_mesh_count = 0_usize;
+    let mut last_nat_punch_attempt: Option<(String, Instant)> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 break;
             }
+            _ = tunnel_heartbeat_interval.tick() => {
+                if let Err(error) = heartbeat_pending_tunnel_peers(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &tunnel_runtime,
+                ) {
+                    eprintln!("tunnel: peer heartbeat failed: {error}");
+                }
+            }
             _ = announce_interval.tick() => {
-                let refreshed = PeerAnnouncement {
-                    node_id: app.node.id.clone(),
-                    public_key: app.node.public_key.clone(),
-                    endpoint: endpoint_with_listen_port(
-                        &app.node.endpoint,
-                        tunnel_runtime.listen_port(app.node.listen_port),
+                if let Err(error) = maybe_run_nat_punch(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &mut tunnel_runtime,
+                    &mut last_nat_punch_attempt,
+                ) {
+                    eprintln!("nat: periodic hole-punch failed: {error}");
+                }
+                let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                let refreshed = build_peer_announcement(
+                    &app,
+                    actual_listen_port,
+                    compatible_public_endpoint(
+                        public_signal_endpoint.as_deref(),
+                        app.node.listen_port,
+                        actual_listen_port,
                     ),
-                    tunnel_ip: app.node.tunnel_ip.clone(),
-                    timestamp: unix_timestamp(),
-                };
+                );
                 let _ = client.publish(SignalPayload::Announce(refreshed)).await;
             }
             message = client.recv() => {
@@ -1871,6 +2175,23 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     .context("failed to apply tunnel update")?;
                 if let Some(runtime) = magic_dns_runtime.as_ref() {
                     runtime.refresh_records(&app, &peer_announcements);
+                }
+                if let Err(error) = maybe_run_nat_punch(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &mut tunnel_runtime,
+                    &mut last_nat_punch_attempt,
+                ) {
+                    eprintln!("nat: hole-punch after peer signal failed: {error}");
+                }
+                if let Err(error) = heartbeat_pending_tunnel_peers(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &tunnel_runtime,
+                ) {
+                    eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
                 }
 
                 let connected = app
@@ -1929,6 +2250,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut peer_signal_seen_at = HashMap::<String, u64>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let public_signal_endpoint = discover_public_signal_endpoint(&app, app.node.listen_port);
 
     let mut client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -1949,6 +2271,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     state_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut reconnect_interval = tokio::time::interval(Duration::from_secs(1));
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tunnel_heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
+    tunnel_heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     #[cfg(unix)]
     let mut terminate_signal =
@@ -1968,6 +2292,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut reconnect_attempt = 0u32;
     let mut reconnect_due = Instant::now();
     let mut last_mesh_count = 0_usize;
+    let mut last_nat_punch_attempt: Option<(String, Instant)> = None;
     write_daemon_state(
         &state_file,
         &build_daemon_runtime_state(
@@ -2007,17 +2332,16 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         relay_connected = true;
                         reconnect_attempt = 0;
                         session_status = "Connected".to_string();
-
-                        let refreshed = PeerAnnouncement {
-                            node_id: app.node.id.clone(),
-                            public_key: app.node.public_key.clone(),
-                            endpoint: endpoint_with_listen_port(
-                                &app.node.endpoint,
-                                tunnel_runtime.listen_port(app.node.listen_port),
+                        let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                        let refreshed = build_peer_announcement(
+                            &app,
+                            actual_listen_port,
+                            compatible_public_endpoint(
+                                public_signal_endpoint.as_deref(),
+                                app.node.listen_port,
+                                actual_listen_port,
                             ),
-                            tunnel_ip: app.node.tunnel_ip.clone(),
-                            timestamp: unix_timestamp(),
-                        };
+                        );
                         if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                             let error_text = error.to_string();
                             session_status =
@@ -2043,16 +2367,25 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     continue;
                 }
 
-                let refreshed = PeerAnnouncement {
-                    node_id: app.node.id.clone(),
-                    public_key: app.node.public_key.clone(),
-                    endpoint: endpoint_with_listen_port(
-                        &app.node.endpoint,
-                        tunnel_runtime.listen_port(app.node.listen_port),
+                if let Err(error) = maybe_run_nat_punch(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &mut tunnel_runtime,
+                    &mut last_nat_punch_attempt,
+                ) {
+                    eprintln!("nat: periodic hole-punch failed: {error}");
+                }
+                let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                let refreshed = build_peer_announcement(
+                    &app,
+                    actual_listen_port,
+                    compatible_public_endpoint(
+                        public_signal_endpoint.as_deref(),
+                        app.node.listen_port,
+                        actual_listen_port,
                     ),
-                    tunnel_ip: app.node.tunnel_ip.clone(),
-                    timestamp: unix_timestamp(),
-                };
+                );
                 if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                     let error_text = error.to_string();
                     if publish_error_requires_reconnect(&error_text) {
@@ -2068,6 +2401,20 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     } else {
                         session_status = format!("Presence publish failed ({error_text})");
                     }
+                }
+            }
+            _ = tunnel_heartbeat_interval.tick() => {
+                if !session_enabled {
+                    continue;
+                }
+
+                if let Err(error) = heartbeat_pending_tunnel_peers(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &peer_announcements,
+                    &tunnel_runtime,
+                ) {
+                    eprintln!("tunnel: peer heartbeat failed: {error}");
                 }
             }
             _ = state_interval.tick() => {
@@ -2089,6 +2436,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             reconnect_due = Instant::now();
                             peer_announcements.clear();
                             peer_signal_seen_at.clear();
+                            last_nat_punch_attempt = None;
                             if let Err(error) =
                                 tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements)
                             {
@@ -2134,7 +2482,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                             .retain(|participant, _| configured_set.contains(participant));
                                         peer_signal_seen_at
                                             .retain(|participant, _| configured_set.contains(participant));
-
+                                        last_nat_punch_attempt = None;
                                         client.disconnect().await;
                                         match NostrSignalingClient::from_secret_key(
                                             network_id.clone(),
@@ -2150,17 +2498,16 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                             reconnect_attempt = 0;
                                                             reconnect_due = Instant::now();
                                                             session_status = "Config reloaded".to_string();
-
-                                                            let refreshed = PeerAnnouncement {
-                                                                node_id: app.node.id.clone(),
-                                                                public_key: app.node.public_key.clone(),
-                                                                endpoint: endpoint_with_listen_port(
-                                                                    &app.node.endpoint,
-                                                                    tunnel_runtime.listen_port(app.node.listen_port),
+                                                            let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                                                            let refreshed = build_peer_announcement(
+                                                                &app,
+                                                                actual_listen_port,
+                                                                compatible_public_endpoint(
+                                                                    public_signal_endpoint.as_deref(),
+                                                                    app.node.listen_port,
+                                                                    actual_listen_port,
                                                                 ),
-                                                                tunnel_ip: app.node.tunnel_ip.clone(),
-                                                                timestamp: unix_timestamp(),
-                                                            };
+                                                            );
                                                             if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                                                                 session_status = format!(
                                                                     "Config reloaded; presence publish failed ({})",
@@ -2266,6 +2613,23 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 } else {
                     if let Some(runtime) = magic_dns_runtime.as_ref() {
                         runtime.refresh_records(&app, &peer_announcements);
+                    }
+                    if let Err(error) = maybe_run_nat_punch(
+                        &app,
+                        own_pubkey.as_deref(),
+                        &peer_announcements,
+                        &mut tunnel_runtime,
+                        &mut last_nat_punch_attempt,
+                    ) {
+                        eprintln!("nat: hole-punch after peer signal failed: {error}");
+                    }
+                    if let Err(error) = heartbeat_pending_tunnel_peers(
+                        &app,
+                        own_pubkey.as_deref(),
+                        &peer_announcements,
+                        &tunnel_runtime,
+                    ) {
+                        eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
                     }
                     session_status = if session_enabled {
                         "Connected".to_string()
@@ -2811,7 +3175,7 @@ fn write_daemon_pid_record(path: &Path, record: &DaemonPidRecord) -> Result<()> 
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(record)?;
-    fs::write(path, raw)
+    write_runtime_file_atomically(path, raw.as_bytes())
         .with_context(|| format!("failed to write daemon pid file {}", path.display()))?;
     set_daemon_runtime_file_permissions(path)?;
     Ok(())
@@ -2835,9 +3199,33 @@ fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(state)?;
-    fs::write(path, raw)
+    write_runtime_file_atomically(path, raw.as_bytes())
         .with_context(|| format!("failed to write daemon state file {}", path.display()))?;
     set_daemon_runtime_file_permissions(path)?;
+    Ok(())
+}
+
+fn write_runtime_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("runtime file has no parent: {}", path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("runtime"),
+        std::process::id(),
+        unix_timestamp()
+    ));
+    fs::write(&temp_path, contents)
+        .with_context(|| format!("failed to write temp runtime file {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            temp_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -4692,18 +5080,22 @@ mod tests {
     use clap::CommandFactory;
 
     use super::{
-        AppConfig, Cli, InstallCliArgs, PeerAnnouncement, UninstallCliArgs,
+        AppConfig, Cli, InstallCliArgs, PeerAnnouncement, UninstallCliArgs, WireGuardPeerStatus,
         build_runtime_magic_dns_records, daemon_control_file_path, daemon_pids_from_ps_output,
         daemon_reconnect_backoff_delay, default_cli_install_path, endpoint_with_listen_port,
-        install_cli, is_uapi_addr_in_use_error, kill_error_requires_control_fallback,
-        linux_service_status_from_show_output, parse_nonzero_pid, publish_error_requires_reconnect,
+        install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        kill_error_requires_control_fallback, linux_service_status_from_show_output,
+        parse_nonzero_pid, pending_tunnel_heartbeat_ips, publish_error_requires_reconnect,
         request_daemon_reload, request_daemon_stop, take_daemon_control_request, uninstall_cli,
         utun_interface_candidates, windows_service_status_from_query_output,
     };
     use std::collections::HashMap;
     use std::fs;
+    use std::net::Ipv4Addr;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    use nostr_vpn_core::crypto::generate_keypair;
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -4873,6 +5265,40 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_heartbeat_targets_only_include_peers_without_handshake() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: None,
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            timestamp: 1,
+        };
+        let announcements = HashMap::from([(participant.clone(), announcement)]);
+
+        let pending = pending_tunnel_heartbeat_ips(&config, None, &announcements, None);
+        assert_eq!(pending, vec![Ipv4Addr::new(10, 44, 0, 2)]);
+
+        let runtime_peers = HashMap::from([(
+            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
+            WireGuardPeerStatus {
+                endpoint: Some("203.0.113.20:51820".to_string()),
+                last_handshake_sec: Some(1),
+                last_handshake_nsec: Some(0),
+            },
+        )]);
+        let pending =
+            pending_tunnel_heartbeat_ips(&config, None, &announcements, Some(&runtime_peers));
+        assert!(pending.is_empty(), "handshaken peer should not be probed");
+    }
+
+    #[test]
     fn runtime_magic_dns_records_prefer_live_announcement_tunnel_ip() {
         let mut config = AppConfig::generated();
         config.magic_dns_suffix = "nvpn".to_string();
@@ -4893,6 +5319,8 @@ mod tests {
                 node_id: "peer-node".to_string(),
                 public_key: "pubkey".to_string(),
                 endpoint: "192.168.1.55:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: None,
                 tunnel_ip: "10.44.0.113/32".to_string(),
                 timestamp: 1,
             },
@@ -4930,6 +5358,8 @@ mod tests {
                 node_id: "peer-node".to_string(),
                 public_key: "pubkey".to_string(),
                 endpoint: "192.168.1.55:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: None,
                 tunnel_ip: "10.44.0.113/32".to_string(),
                 timestamp: 1,
             },
@@ -4946,6 +5376,8 @@ mod tests {
                 node_id: "peer-node".to_string(),
                 public_key: "pubkey".to_string(),
                 endpoint: "192.168.1.55:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: None,
                 tunnel_ip: "10.44.0.114/32".to_string(),
                 timestamp: 2,
             },

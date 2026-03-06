@@ -2,7 +2,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
-use nostr_vpn_core::nat::{discover_public_udp_endpoint, hole_punch_udp};
+use nostr_vpn_core::nat::{
+    discover_public_udp_endpoint, discover_public_udp_endpoint_via_stun, hole_punch_udp,
+};
+use webrtc_stun::message::{
+    BINDING_REQUEST, CLASS_SUCCESS_RESPONSE, METHOD_BINDING, Message, MessageType,
+};
+use webrtc_stun::xoraddr::XORMappedAddress;
 
 #[test]
 fn discovers_public_endpoint_from_reflector() {
@@ -75,4 +81,57 @@ fn hole_punch_sends_and_receives_packets() {
     );
 
     server.join().expect("receiver thread");
+}
+
+#[test]
+fn discovers_public_endpoint_from_stun_server() {
+    let stun = UdpSocket::bind("127.0.0.1:0").expect("bind stun server");
+    stun.set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set timeout");
+    let stun_addr = stun.local_addr().expect("stun addr");
+
+    let server = thread::spawn(move || {
+        let mut buf = [0u8; 1500];
+        let (read, src) = stun.recv_from(&mut buf).expect("receive stun request");
+
+        let mut request = Message::new();
+        request.raw = buf[..read].to_vec();
+        request.decode().expect("decode stun request");
+        assert_eq!(request.typ, BINDING_REQUEST);
+
+        let mut response = Message::new();
+        response.typ = MessageType {
+            method: METHOD_BINDING,
+            class: CLASS_SUCCESS_RESPONSE,
+        };
+        response.transaction_id = request.transaction_id;
+        let xor_addr = XORMappedAddress {
+            ip: src.ip(),
+            port: src.port(),
+        };
+        response
+            .build(&[Box::new(xor_addr)])
+            .expect("build stun response");
+        stun.send_to(&response.raw, src)
+            .expect("send stun response");
+    });
+
+    let discovered = discover_public_udp_endpoint_via_stun(
+        "127.0.0.1:3478"
+            .replace("3478", &stun_addr.port().to_string())
+            .as_str(),
+        0,
+        Duration::from_secs(2),
+    )
+    .expect("discover endpoint via stun");
+    let parsed = discovered
+        .parse::<SocketAddr>()
+        .expect("parsed discovered endpoint");
+    assert!(
+        parsed.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST),
+        "discovered endpoint ip was {parsed}"
+    );
+    assert!(parsed.port() > 0, "discovered endpoint port was {parsed}");
+
+    server.join().expect("stun server thread");
 }
