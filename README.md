@@ -162,8 +162,12 @@ control works without requiring `nvpn` in `PATH`.
 GUI session control calls the `nvpn` CLI daemon (`start/pause/resume/status`) and does not run
 WireGuard/Nostr runtime in the frontend process.
 
-GUI now exposes one-time service install/uninstall controls. With service installed, normal
-VPN On/Off toggles use daemon pause/resume and do not require repeated elevation prompts.
+GUI now exposes one-time service install/uninstall controls. On macOS/Linux/Windows, the GUI is
+service-first: if the background service is missing, the app shows a prominent install action
+instead of silently direct-starting a privileged daemon. With service installed, normal VPN
+On/Off toggles use daemon pause/resume and do not require repeated elevation prompts.
+
+CLI fallback remains available for manual workflows (`nvpn start --daemon`, `nvpn connect`, etc.).
 
 Note: bringing the tunnel interface up requires OS network privileges in the daemon process.
 On Linux/macOS, run `nvpn`/the app with permissions that allow interface/routing updates.

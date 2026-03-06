@@ -34,6 +34,10 @@ const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
 const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
+const GUI_SERVICE_SETUP_REQUIRED_STATUS: &str =
+    "Install background service to turn VPN on from the app";
+const GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS: &str =
+    "Install background service to enable app auto-connect";
 
 #[derive(Debug, Clone, Default)]
 struct RelayStatus {
@@ -100,7 +104,6 @@ struct CliStatusResponse {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 struct CliServiceStatusResponse {
     supported: bool,
     installed: bool,
@@ -196,6 +199,7 @@ struct UiState {
     service_supported: bool,
     service_installed: bool,
     service_running: bool,
+    service_status_detail: String,
     session_status: String,
     config_path: String,
     own_npub: String,
@@ -249,6 +253,7 @@ struct NvpnBackend {
     service_supported: bool,
     service_installed: bool,
     service_running: bool,
+    service_status_detail: String,
     daemon_state: Option<DaemonRuntimeState>,
 
     relay_status: HashMap<String, RelayStatus>,
@@ -319,6 +324,7 @@ impl NvpnBackend {
             )),
             service_installed: false,
             service_running: false,
+            service_status_detail: String::new(),
             daemon_state: None,
             relay_status,
             peer_status,
@@ -332,22 +338,35 @@ impl NvpnBackend {
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
         backend.maybe_refresh_lan_discovery();
+        backend.sync_daemon_state();
 
         let wants_autoconnect =
             backend.config.autoconnect && !backend.config.participant_pubkeys_hex().is_empty();
-        if wants_autoconnect && let Err(error) = backend.start_daemon_process() {
-            backend.session_status = format!("Daemon start failed: {error}");
+        if should_start_gui_daemon_on_launch(
+            backend.config.autoconnect,
+            !backend.config.participant_pubkeys_hex().is_empty(),
+            backend.gui_requires_service_install(),
+        ) && !backend.daemon_running
+        {
+            if let Err(error) = backend.start_daemon_process() {
+                backend.session_status = format!("Daemon start failed: {error}");
+            }
+            backend.sync_daemon_state();
+        } else if wants_autoconnect && backend.gui_requires_service_install() {
+            backend.session_status = gui_service_setup_status_text(true).to_string();
         }
-
-        backend.sync_daemon_state();
 
         Ok(backend)
     }
 
     fn connect_session(&mut self) -> Result<()> {
         self.persist_config()?;
+        self.sync_daemon_state();
         if self.daemon_running {
             self.resume_daemon_process()?;
+        } else if self.gui_requires_service_install() {
+            self.session_status = gui_service_setup_status_text(false).to_string();
+            return Err(anyhow!(self.session_status.clone()));
         } else {
             self.start_daemon_process()?;
         }
@@ -1140,7 +1159,10 @@ impl NvpnBackend {
         } else {
             self.session_active = false;
             self.relay_connected = false;
-            if !self.session_status.starts_with("Daemon start failed:") {
+            if self.gui_requires_service_install() {
+                self.session_status =
+                    gui_service_setup_status_text(self.config.autoconnect).to_string();
+            } else if !self.session_status.starts_with("Daemon start failed:") {
                 self.session_status = "Daemon not running".to_string();
             }
         }
@@ -1171,8 +1193,32 @@ impl NvpnBackend {
                 self.service_supported = status.supported;
                 self.service_installed = status.installed;
                 self.service_running = status.running;
+                self.service_status_detail = if !status.supported {
+                    "Background service unsupported on this platform".to_string()
+                } else if !status.installed {
+                    "Background service is not installed".to_string()
+                } else if status.running {
+                    match status.pid {
+                        Some(pid) => format!("Background service running (pid {pid})"),
+                        None => "Background service running".to_string(),
+                    }
+                } else if status.loaded {
+                    "Background service installed but not running".to_string()
+                } else {
+                    "Background service installed but launch status is unavailable".to_string()
+                };
+                eprintln!(
+                    "gui: service status synced supported={} installed={} loaded={} running={} pid={:?} label={} path={}",
+                    status.supported,
+                    status.installed,
+                    status.loaded,
+                    status.running,
+                    status.pid,
+                    status.label,
+                    status.plist_path
+                );
             }
-            Err(_) => {
+            Err(error) => {
                 self.service_supported = cfg!(any(
                     target_os = "macos",
                     target_os = "linux",
@@ -1180,6 +1226,8 @@ impl NvpnBackend {
                 ));
                 self.service_installed = false;
                 self.service_running = false;
+                self.service_status_detail = format!("Service status unavailable: {error}");
+                eprintln!("gui: failed to sync service status: {error}");
             }
         }
     }
@@ -1701,6 +1749,7 @@ impl NvpnBackend {
             service_supported: self.service_supported,
             service_installed: self.service_installed,
             service_running: self.service_running,
+            service_status_detail: self.service_status_detail.clone(),
             session_status: self.session_status.clone(),
             config_path: self.config_path.display().to_string(),
             own_npub,
@@ -1728,6 +1777,14 @@ impl NvpnBackend {
             lan_peers: self.lan_peer_rows(),
         }
     }
+
+    fn gui_requires_service_install(&self) -> bool {
+        gui_requires_service_install(
+            self.service_supported,
+            self.service_installed,
+            self.daemon_running,
+        )
+    }
 }
 
 fn within_peer_online_grace(last_handshake_at: Option<SystemTime>, now: SystemTime) -> bool {
@@ -1737,6 +1794,30 @@ fn within_peer_online_grace(last_handshake_at: Option<SystemTime>, now: SystemTi
     now.duration_since(last_handshake_at)
         .map(|elapsed| elapsed.as_secs() <= PEER_ONLINE_GRACE_SECS)
         .unwrap_or(false)
+}
+
+fn gui_requires_service_install(
+    service_supported: bool,
+    service_installed: bool,
+    daemon_running: bool,
+) -> bool {
+    service_supported && !service_installed && !daemon_running
+}
+
+fn should_start_gui_daemon_on_launch(
+    autoconnect: bool,
+    has_participants: bool,
+    service_setup_required: bool,
+) -> bool {
+    autoconnect && has_participants && !service_setup_required
+}
+
+fn gui_service_setup_status_text(autoconnect: bool) -> &'static str {
+    if autoconnect {
+        GUI_SERVICE_SETUP_REQUIRED_AUTOCONNECT_STATUS
+    } else {
+        GUI_SERVICE_SETUP_REQUIRED_STATUS
+    }
 }
 
 impl Drop for NvpnBackend {
@@ -2144,32 +2225,52 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resu
     Ok(())
 }
 
-fn tray_vpn_toggle_label(session_active: bool) -> &'static str {
-    if session_active {
+fn tray_vpn_toggle_label(session_active: bool, service_setup_required: bool) -> &'static str {
+    if service_setup_required && !session_active {
+        "Install Service"
+    } else if session_active {
         "Turn VPN Off"
     } else {
         "Turn VPN On"
     }
 }
 
-fn current_session_active<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+#[derive(Clone, Copy)]
+struct TrayRuntimeState {
+    session_active: bool,
+    service_setup_required: bool,
+}
+
+fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> TrayRuntimeState {
     let Some(state) = app.try_state::<AppState>() else {
-        return false;
+        return TrayRuntimeState {
+            session_active: false,
+            service_setup_required: false,
+        };
     };
     let Ok(backend) = state.backend.lock() else {
-        return false;
+        return TrayRuntimeState {
+            session_active: false,
+            service_setup_required: false,
+        };
     };
-    backend.session_active
+    TrayRuntimeState {
+        session_active: backend.session_active,
+        service_setup_required: backend.gui_requires_service_install(),
+    }
 }
 
 fn build_tray_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    session_active: bool,
+    runtime_state: TrayRuntimeState,
 ) -> tauri::Result<tauri::menu::Menu<R>> {
     let open_item = MenuItemBuilder::with_id(TRAY_OPEN_MENU_ID, "Open Nostr VPN").build(app)?;
     let vpn_toggle_item = MenuItemBuilder::with_id(
         TRAY_VPN_TOGGLE_MENU_ID,
-        tray_vpn_toggle_label(session_active),
+        tray_vpn_toggle_label(
+            runtime_state.session_active,
+            runtime_state.service_setup_required,
+        ),
     )
     .build(app)?;
     let quit_ui_item =
@@ -2189,8 +2290,8 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         return;
     };
 
-    let session_active = current_session_active(app);
-    if let Ok(menu) = build_tray_menu(app, session_active) {
+    let runtime_state = current_tray_runtime_state(app);
+    if let Ok(menu) = build_tray_menu(app, runtime_state) {
         let _ = tray.set_menu(Some(menu));
     }
 }
@@ -2402,7 +2503,10 @@ pub fn run() {
 
     let backend = NvpnBackend::new().expect("failed to initialize GUI backend state");
     let launch_on_startup_default = backend.config.launch_on_startup;
-    let initial_session_active = backend.session_active;
+    let initial_tray_state = TrayRuntimeState {
+        session_active: backend.session_active,
+        service_setup_required: backend.gui_requires_service_install(),
+    };
     let launched_from_autostart = started_from_autostart();
     let app = tauri::Builder::default()
         .setup(move |app| {
@@ -2428,7 +2532,7 @@ pub fn run() {
                 }
             }
 
-            let tray_menu = build_tray_menu(app.handle(), initial_session_active)?;
+            let tray_menu = build_tray_menu(app.handle(), initial_tray_state)?;
 
             let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
                 .tooltip("Nostr VPN")
@@ -2438,12 +2542,22 @@ pub fn run() {
                         let _ = show_main_window(app);
                     }
                     TRAY_VPN_TOGGLE_MENU_ID => {
-                        let session_active = current_session_active(app);
+                        let runtime_state = current_tray_runtime_state(app);
                         run_tray_backend_action(app, |backend| {
-                            if session_active {
+                            if runtime_state.session_active {
                                 backend
                                     .disconnect_session()
                                     .context("failed to pause VPN session")?;
+                            } else if runtime_state.service_setup_required {
+                                backend
+                                    .install_system_service()
+                                    .context("failed to install background service")?;
+                                backend.tick();
+                                if !backend.session_active {
+                                    backend
+                                        .connect_session()
+                                        .context("failed to resume VPN session")?;
+                                }
                             } else {
                                 backend
                                     .connect_session()
@@ -2527,9 +2641,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        expected_peer_count, extract_json_document, is_already_running_message, is_mesh_complete,
-        is_not_running_message, started_from_autostart_args, to_npub, validate_nvpn_binary,
-        within_peer_online_grace,
+        expected_peer_count, extract_json_document, gui_requires_service_install,
+        is_already_running_message, is_mesh_complete, is_not_running_message,
+        should_start_gui_daemon_on_launch, started_from_autostart_args, to_npub,
+        validate_nvpn_binary, within_peer_online_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -2561,6 +2676,31 @@ mod tests {
         let raw = "INFO something\n{\"daemon\":{\"running\":false}}\n";
         let extracted = extract_json_document(raw).expect("should extract json object");
         assert_eq!(extracted, "{\"daemon\":{\"running\":false}}")
+    }
+
+    #[test]
+    fn service_status_response_parses_snake_case_cli_json() {
+        let raw = r#"{
+          "supported": true,
+          "installed": true,
+          "loaded": true,
+          "running": true,
+          "pid": 123,
+          "label": "to.nostrvpn.nvpn",
+          "plist_path": "/Library/LaunchDaemons/to.nostrvpn.nvpn.plist"
+        }"#;
+        let parsed: super::CliServiceStatusResponse =
+            serde_json::from_str(raw).expect("service status JSON should parse");
+        assert!(parsed.supported);
+        assert!(parsed.installed);
+        assert!(parsed.loaded);
+        assert!(parsed.running);
+        assert_eq!(parsed.pid, Some(123));
+        assert_eq!(parsed.label, "to.nostrvpn.nvpn");
+        assert_eq!(
+            parsed.plist_path,
+            "/Library/LaunchDaemons/to.nostrvpn.nvpn.plist"
+        );
     }
 
     #[test]
@@ -2605,6 +2745,22 @@ mod tests {
             "/Applications/Nostr VPN.app/Contents/MacOS/nostr-vpn",
             "--autostarted",
         ]));
+    }
+
+    #[test]
+    fn gui_requires_service_install_only_when_no_service_and_no_daemon() {
+        assert!(gui_requires_service_install(true, false, false));
+        assert!(!gui_requires_service_install(true, false, true));
+        assert!(!gui_requires_service_install(true, true, false));
+        assert!(!gui_requires_service_install(false, false, false));
+    }
+
+    #[test]
+    fn gui_launch_autoconnect_skips_direct_start_until_service_exists() {
+        assert!(!should_start_gui_daemon_on_launch(true, true, true));
+        assert!(should_start_gui_daemon_on_launch(true, true, false));
+        assert!(!should_start_gui_daemon_on_launch(true, false, false));
+        assert!(!should_start_gui_daemon_on_launch(false, true, false));
     }
 
     #[cfg(unix)]

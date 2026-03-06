@@ -53,6 +53,11 @@
   let copiedHandle: number | null = null
   let refreshInFlight = false
   let actionInFlight = false
+  let serviceInstallRecommended = false
+  let serviceSetupRequired = false
+
+  $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
+  $: serviceSetupRequired = serviceInstallRecommended && !state?.daemonRunning
 
   const short = (value: string, head = 12, tail = 10) => {
     if (value.length <= head + tail + 3) {
@@ -162,6 +167,13 @@
       error = String(err)
       cliActionStatus = ''
       serviceActionStatus = ''
+      try {
+        state = await tick()
+        initializeDraftsOnce()
+        syncDraftsFromState()
+      } catch {
+        // Keep the original action error if state refresh also fails.
+      }
     } finally {
       actionInFlight = false
     }
@@ -169,6 +181,11 @@
 
   async function onToggleSession() {
     if (!state) {
+      return
+    }
+
+    if (serviceSetupRequired && !state.sessionActive) {
+      await onInstallSystemService(true)
       return
     }
 
@@ -189,16 +206,29 @@
     }
   }
 
-  async function onInstallSystemService() {
+  async function onInstallSystemService(connectAfter = false) {
+    const wasInstalled = !!state?.serviceInstalled
     await runAction(installSystemService)
     if (!error) {
       serviceActionStatus = 'System service installed and started'
+    } else if (!wasInstalled && state?.serviceInstalled) {
+      error = ''
+      serviceActionStatus = state.serviceRunning
+        ? 'System service installed and started'
+        : 'System service installed'
+    }
+    if (connectAfter && !error && state && !state.sessionActive) {
+      await runAction(connectSession)
     }
   }
 
   async function onUninstallSystemService() {
+    const wasInstalled = !!state?.serviceInstalled
     await runAction(uninstallSystemService)
     if (!error) {
+      serviceActionStatus = 'System service removed'
+    } else if (wasInstalled && state && !state.serviceInstalled) {
+      error = ''
       serviceActionStatus = 'System service removed'
     }
   }
@@ -376,19 +406,21 @@
         </span>
       </button>
       {#if state}
-        <button
-          class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
-          role="switch"
-          aria-checked={state.sessionActive}
-          aria-label="Toggle VPN session"
-          data-testid="session-toggle"
-          on:click={onToggleSession}
-        >
-          <span class="session-switch-track" aria-hidden="true">
-            <span class="session-switch-thumb"></span>
-          </span>
-          <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
-        </button>
+        {#if !serviceSetupRequired}
+          <button
+            class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
+            role="switch"
+            aria-checked={state.sessionActive}
+            aria-label="Toggle VPN session"
+            data-testid="session-toggle"
+            on:click={onToggleSession}
+          >
+            <span class="session-switch-track" aria-hidden="true">
+              <span class="session-switch-thumb"></span>
+            </span>
+            <span class="session-switch-label">VPN {state.sessionActive ? 'On' : 'Off'}</span>
+          </button>
+        {/if}
       {/if}
     </div>
 
@@ -421,6 +453,24 @@
   {/if}
 
   {#if state}
+    {#if serviceInstallRecommended}
+      <section class="panel service-banner" data-testid="service-setup-banner">
+        <div class="service-banner-copy">
+          <div class="service-banner-title">Install background service</div>
+          <div class="service-banner-text">
+            Required for reliable background VPN, startup, and no repeated password prompts.
+          </div>
+        </div>
+        <button
+          class="btn service-banner-btn"
+          data-testid="install-service-banner-btn"
+          on:click={() => onInstallSystemService(serviceSetupRequired)}
+        >
+          Install service
+        </button>
+      </section>
+    {/if}
+
     <section class="panel network-controls-panel">
       <div class="section-title-row">
         <h2>Networks</h2>
@@ -656,7 +706,7 @@
           </div>
           <div class="row cli-actions-row">
             <button class="btn" data-testid="install-service-btn" on:click={onInstallSystemService}>
-              Install service
+              {state.serviceInstalled ? 'Reinstall service' : 'Install service'}
             </button>
             <button
               class="btn ghost"
@@ -668,6 +718,9 @@
             </button>
           </div>
         </div>
+        {#if state.serviceStatusDetail}
+          <div class="config-path">{state.serviceStatusDetail}</div>
+        {/if}
         {#if serviceActionStatus}
           <div class="config-path">{serviceActionStatus}</div>
         {/if}

@@ -161,6 +161,37 @@ body {
   background: linear-gradient(170deg, rgba(17, 14, 46, 0.95), rgba(9, 8, 30, 0.9));
 }
 
+.service-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 18px;
+  border-color: rgba(255, 92, 226, 0.4);
+  background:
+    linear-gradient(135deg, rgba(32, 14, 57, 0.94), rgba(12, 11, 37, 0.92)),
+    radial-gradient(circle at 88% 20%, rgba(255, 92, 226, 0.18), transparent 34%);
+}
+
+.service-banner-copy {
+  min-width: 0;
+}
+
+.service-banner-title {
+  font-size: 16px;
+  line-height: 1.1;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--pink);
+  font-weight: 700;
+}
+
+.service-banner-text {
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 14px;
+}
+
 .row {
   display: flex;
   gap: 10px;
@@ -186,6 +217,7 @@ body {
 
 .identity-row {
   width: 100%;
+  align-items: center;
 }
 
 .section-title-row {
@@ -273,9 +305,84 @@ body {
 }
 
 .copy-npub-btn {
-  width: 100%;
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
   justify-content: flex-start;
   padding: 11px 14px;
+}
+
+.service-banner-btn {
+  min-width: 170px;
+  padding: 11px 16px;
+  border-color: rgba(255, 92, 226, 0.54);
+  background: linear-gradient(180deg, rgba(102, 41, 121, 0.92), rgba(69, 28, 92, 0.92));
+  box-shadow: 0 0 0 1px rgba(255, 92, 226, 0.15) inset;
+}
+
+.service-banner-btn:hover:not(:disabled) {
+  background: linear-gradient(180deg, rgba(124, 49, 145, 0.94), rgba(85, 35, 111, 0.94));
+}
+
+.session-switch {
+  min-width: 158px;
+  border: 1px solid rgba(124, 128, 200, 0.55);
+  background: rgba(31, 35, 63, 0.85);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 7px 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.session-switch:hover {
+  background: rgba(49, 55, 90, 0.9);
+}
+
+.session-switch:focus-visible {
+  outline: 1px solid rgba(255, 92, 226, 0.65);
+  outline-offset: 2px;
+}
+
+.session-switch-track {
+  position: relative;
+  width: 42px;
+  height: 23px;
+  border-radius: 999px;
+  border: 1px solid rgba(149, 157, 202, 0.62);
+  background: rgba(99, 109, 149, 0.3);
+  transition: all 140ms ease;
+}
+
+.session-switch-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #d9e1f7;
+  transition: transform 140ms ease, background 140ms ease;
+}
+
+.session-switch-label {
+  font-size: 12px;
+  line-height: 1;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #d7def4;
+}
+
+.session-switch.on .session-switch-track {
+  background: rgba(62, 225, 143, 0.4);
+  border-color: rgba(62, 225, 143, 0.72);
+}
+
+.session-switch.on .session-switch-thumb {
+  transform: translateX(19px);
+  background: #bfffdc;
 }
 
 .copy-icon {
@@ -556,6 +663,22 @@ body {
   flex-wrap: wrap;
 }
 
+@media (max-width: 760px) {
+  .service-banner {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .service-banner-btn {
+    width: 100%;
+  }
+}
+
+.cli-actions-row {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .config-path {
   font-size: 12px;
   color: var(--muted);
@@ -604,6 +727,15 @@ body {
 
   .copy-value {
     font-size: 19px;
+  }
+
+  .identity-row {
+    flex-wrap: wrap;
+  }
+
+  .session-switch {
+    width: 100%;
+    justify-content: space-between;
   }
 
   .field-grid {

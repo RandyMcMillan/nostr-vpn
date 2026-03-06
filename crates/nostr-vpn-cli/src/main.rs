@@ -1905,6 +1905,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     }
 
     let config_path = args.config.clone().unwrap_or_else(default_config_path);
+    ensure_no_other_daemon_processes_for_config(&config_path, std::process::id())?;
     let network_override = args.network_id.clone();
     let participants_override = args.participants.clone();
     let (mut app, network_id) = load_config_with_overrides(
@@ -2683,6 +2684,29 @@ fn daemon_control_file_path(config_path: &Path) -> PathBuf {
     parent.join("daemon.control")
 }
 
+fn ensure_no_other_daemon_processes_for_config(config_path: &Path, current_pid: u32) -> Result<()> {
+    let mut daemon_pids = find_daemon_pids_by_config(config_path);
+    daemon_pids.retain(|pid| *pid != current_pid);
+
+    let pid_file = daemon_pid_file_path(config_path);
+    if let Some(record) = read_daemon_pid_record(&pid_file)?
+        && record.pid != current_pid
+        && daemon_process_matches(record.pid, config_path)
+        && !daemon_pids.contains(&record.pid)
+    {
+        daemon_pids.push(record.pid);
+    }
+
+    daemon_pids.sort_unstable();
+    daemon_pids.dedup();
+
+    if let Some(existing_pid) = daemon_pids.first().copied() {
+        return Err(anyhow!("daemon already running with pid {}", existing_pid));
+    }
+
+    Ok(())
+}
+
 fn write_daemon_control_request(config_path: &Path, request: DaemonControlRequest) -> Result<()> {
     let control_file = daemon_control_file_path(config_path);
     if let Some(parent) = control_file.parent() {
@@ -2903,6 +2927,14 @@ fn spawn_daemon_process(args: &ConnectArgs, config_path: &Path) -> Result<u32> {
     };
     write_daemon_pid_record(&pid_file, &record)?;
     Ok(pid)
+}
+
+fn stop_existing_daemons_before_service_install(config_path: &Path) -> Result<()> {
+    stop_daemon(StopArgs {
+        config: Some(config_path.to_path_buf()),
+        timeout_secs: 5,
+        force: true,
+    })
 }
 
 fn read_daemon_log_tail(path: &Path, max_lines: usize) -> String {
@@ -3408,6 +3440,7 @@ fn macos_install_service(
     }
 
     macos_service_bootout(true)?;
+    stop_existing_daemons_before_service_install(config_path)?;
     let plist = macos_service_plist_content(
         executable,
         config_path,
@@ -3655,6 +3688,12 @@ fn linux_install_service(
         return Ok(());
     }
 
+    let _ = run_systemctl_allow_missing(
+        &["disable", "--now", LINUX_SERVICE_UNIT_NAME],
+        "disable/stop existing service",
+        true,
+    );
+    stop_existing_daemons_before_service_install(config_path)?;
     let unit = linux_service_unit_content(
         executable,
         config_path,
@@ -3889,6 +3928,7 @@ fn windows_install_service(
         let _ = windows_stop_service(true);
         let _ = windows_delete_service(true);
     }
+    stop_existing_daemons_before_service_install(config_path)?;
 
     let exec = executable.display().to_string();
     let config = config_path.display().to_string();
@@ -4925,6 +4965,16 @@ mod tests {
                   55555 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /tmp/other.toml --iface utun100\n";
         let pids = daemon_pids_from_ps_output(ps, config_path);
         assert_eq!(pids, vec![42063, 97597]);
+    }
+
+    #[test]
+    fn daemon_pid_scan_excludes_current_pid_when_filtering_duplicates() {
+        let config_path = Path::new("/Users/sirius/Library/Application Support/nvpn/config.toml");
+        let ps = "  42063 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n\
+                  97597 /Applications/Nostr VPN.app/Contents/MacOS/nvpn daemon --config /Users/sirius/Library/Application Support/nvpn/config.toml --iface utun100\n";
+        let mut pids = daemon_pids_from_ps_output(ps, config_path);
+        pids.retain(|pid| *pid != 97597);
+        assert_eq!(pids, vec![42063]);
     }
 
     #[test]

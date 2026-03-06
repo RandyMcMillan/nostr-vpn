@@ -39,7 +39,8 @@ const mockState: UiState = {
   serviceSupported: true,
   serviceInstalled: false,
   serviceRunning: false,
-  sessionStatus: 'Daemon not running',
+  serviceStatusDetail: 'Background service is not installed',
+  sessionStatus: 'Install background service to turn VPN on from the app',
   configPath: '~/.config/nvpn/config.toml',
   ownNpub: 'npub1akgu9lxldpt32lnjf97k005a4kgasewmvsrmkpzqeff39ssev0ssd6t3u',
   ownPubkeyHex: 'f'.repeat(64),
@@ -86,6 +87,9 @@ const mockState: UiState = {
 }
 
 const cloneMockState = () => structuredClone(mockState)
+
+const mockRequiresServiceSetup = () =>
+  mockState.serviceSupported && !mockState.serviceInstalled && !mockState.daemonRunning
 
 const updateMockRelaySummary = () => {
   mockState.relaySummary = {
@@ -142,6 +146,9 @@ export const connectSession = () =>
   isTauriRuntime()
     ? invoke<UiState>('connect_session')
     : (() => {
+        if (mockRequiresServiceSetup()) {
+          throw new Error('Install background service to turn VPN on from the app')
+        }
         mockState.sessionActive = true
         mockState.daemonRunning = true
         mockState.serviceRunning = mockState.serviceInstalled
@@ -214,6 +221,8 @@ export const installSystemService = () =>
         mockState.serviceInstalled = true
         mockState.serviceRunning = true
         mockState.daemonRunning = true
+        mockState.serviceStatusDetail = 'Background service running (mock)'
+        mockState.sessionStatus = 'Daemon running'
         return asResult()
       })()
 
@@ -223,6 +232,11 @@ export const uninstallSystemService = () =>
     : (() => {
         mockState.serviceInstalled = false
         mockState.serviceRunning = false
+        mockState.sessionActive = false
+        mockState.daemonRunning = false
+        mockState.relayConnected = false
+        mockState.serviceStatusDetail = 'Background service is not installed'
+        mockState.sessionStatus = 'Install background service to turn VPN on from the app'
         return asResult()
       })()
 

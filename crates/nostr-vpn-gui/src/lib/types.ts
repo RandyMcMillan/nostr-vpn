@@ -49,6 +49,7 @@ export interface UiState {
   serviceSupported: boolean
   serviceInstalled: boolean
   serviceRunning: boolean
+  serviceStatusDetail: string
   sessionStatus: string
   configPath: string
   ownNpub: string
