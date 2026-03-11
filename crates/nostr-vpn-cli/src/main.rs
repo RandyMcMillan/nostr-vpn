@@ -30,6 +30,7 @@ use nostr_vpn_core::magic_dns::{
 use nostr_vpn_core::nat::{
     discover_public_udp_endpoint, discover_public_udp_endpoint_via_stun, hole_punch_udp,
 };
+use nostr_vpn_core::paths::PeerPathBook;
 use nostr_vpn_core::presence::PeerPresenceBook;
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalEnvelope, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
@@ -46,6 +47,9 @@ const PRIMARY_LISTEN_PORT_RETRY_DELAY_MS: u64 = 100;
 const POST_PUNCH_REAPPLY_DELAY_MS: u64 = 1_000;
 const MIN_PEER_SIGNAL_TIMEOUT_SECS: u64 = 20;
 const PEER_SIGNAL_TIMEOUT_MULTIPLIER: u64 = 3;
+const MIN_PEER_PATH_CACHE_TIMEOUT_SECS: u64 = 60;
+const PEER_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 3;
+const PEER_PATH_RETRY_AFTER_SECS: u64 = 5;
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -1315,6 +1319,13 @@ struct TunnelPeer {
     allowed_ip: String,
 }
 
+#[derive(Debug, Clone)]
+struct PlannedTunnelPeer {
+    participant: String,
+    endpoint: String,
+    peer: TunnelPeer,
+}
+
 #[derive(Debug, Clone, Default)]
 struct WireGuardPeerStatus {
     endpoint: Option<String>,
@@ -1551,20 +1562,30 @@ impl CliTunnelRuntime {
         app: &AppConfig,
         own_pubkey: Option<&str>,
         peer_announcements: &HashMap<String, PeerAnnouncement>,
+        path_book: &mut PeerPathBook,
+        now: u64,
     ) -> Result<()> {
-        let configured_participants = app.participant_pubkeys_hex();
         let configured_listen_port = app.node.listen_port;
         let listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
         let own_local_endpoint = local_signal_endpoint(app, listen_port);
-        let mut peers = configured_participants
+        record_successful_runtime_paths(
+            peer_announcements,
+            self.peer_status().ok().as_ref(),
+            path_book,
+            now,
+        );
+        let planned_peers = planned_tunnel_peers(
+            app,
+            own_pubkey,
+            peer_announcements,
+            path_book,
+            Some(&own_local_endpoint),
+            now,
+        )?;
+        let peers = planned_peers
             .iter()
-            .filter(|participant| Some(participant.as_str()) != own_pubkey)
-            .filter_map(|participant| peer_announcements.get(participant))
-            .map(|announcement| {
-                tunnel_peer_from_announcement(announcement, Some(&own_local_endpoint))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        peers.sort_by(|left, right| left.pubkey_hex.cmp(&right.pubkey_hex));
+            .map(|planned| planned.peer.clone())
+            .collect::<Vec<_>>();
 
         let local_address = local_interface_address_for_tunnel(&app.node.tunnel_ip);
         let fingerprint = tunnel_fingerprint(
@@ -1684,6 +1705,9 @@ impl CliTunnelRuntime {
             &local_address,
             &peers,
         );
+        for planned in &planned_peers {
+            path_book.note_selected(&planned.participant, &planned.endpoint, now);
+        }
         self.last_fingerprint = Some(applied_fingerprint);
         Ok(())
     }
@@ -1909,14 +1933,13 @@ fn public_endpoint_for_listen_port(
         .map(|endpoint| endpoint.endpoint.clone())
 }
 
-fn tunnel_peer_from_announcement(
+fn tunnel_peer_from_endpoint(
     announcement: &PeerAnnouncement,
-    own_local_endpoint: Option<&str>,
+    endpoint: &str,
 ) -> Result<TunnelPeer> {
-    let selected_endpoint = select_peer_endpoint(announcement, own_local_endpoint);
-    let endpoint: SocketAddr = selected_endpoint
+    let endpoint: SocketAddr = endpoint
         .parse()
-        .with_context(|| format!("invalid peer endpoint {}", selected_endpoint))?;
+        .with_context(|| format!("invalid peer endpoint {}", endpoint))?;
     let pubkey_hex = key_b64_to_hex(&announcement.public_key)?;
     let allowed_ip = format!("{}/32", strip_cidr(&announcement.tunnel_ip));
 
@@ -1925,6 +1948,84 @@ fn tunnel_peer_from_announcement(
         endpoint: endpoint.to_string(),
         allowed_ip,
     })
+}
+
+fn record_successful_runtime_paths(
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    runtime_peers: Option<&HashMap<String, WireGuardPeerStatus>>,
+    path_book: &mut PeerPathBook,
+    now: u64,
+) -> bool {
+    let Some(runtime_peers) = runtime_peers else {
+        return false;
+    };
+
+    let mut changed = false;
+    for (participant, announcement) in peer_announcements {
+        let Ok(peer_pubkey_hex) = key_b64_to_hex(&announcement.public_key) else {
+            continue;
+        };
+        let Some(runtime_peer) = runtime_peers.get(&peer_pubkey_hex) else {
+            continue;
+        };
+        if !runtime_peer.has_handshake() {
+            continue;
+        }
+        let Some(endpoint) = runtime_peer.endpoint.as_deref() else {
+            continue;
+        };
+
+        let success_at = runtime_peer.last_handshake_epoch().unwrap_or(now);
+        changed |= path_book.note_success(participant.clone(), endpoint, success_at);
+    }
+
+    changed
+}
+
+fn planned_tunnel_peers(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    path_book: &mut PeerPathBook,
+    own_local_endpoint: Option<&str>,
+    now: u64,
+) -> Result<Vec<PlannedTunnelPeer>> {
+    let configured_participants = app.participant_pubkeys_hex();
+    let configured_set = configured_participants
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .cloned()
+        .collect::<HashSet<_>>();
+    path_book.retain_participants(&configured_set);
+
+    let mut peers = Vec::new();
+    for participant in configured_participants
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+    {
+        let Some(announcement) = peer_announcements.get(participant) else {
+            continue;
+        };
+        path_book.refresh_from_announcement(participant.clone(), announcement, now);
+        let selected_endpoint = path_book
+            .select_endpoint(
+                participant,
+                announcement,
+                own_local_endpoint,
+                now,
+                PEER_PATH_RETRY_AFTER_SECS,
+            )
+            .unwrap_or_else(|| select_peer_endpoint(announcement, own_local_endpoint));
+
+        peers.push(PlannedTunnelPeer {
+            participant: participant.clone(),
+            endpoint: selected_endpoint.clone(),
+            peer: tunnel_peer_from_endpoint(announcement, &selected_endpoint)?,
+        });
+    }
+
+    peers.sort_by(|left, right| left.peer.pubkey_hex.cmp(&right.peer.pubkey_hex));
+    Ok(peers)
 }
 
 fn runtime_has_handshake(tunnel_runtime: &CliTunnelRuntime) -> bool {
@@ -2024,6 +2125,7 @@ fn maybe_run_nat_punch(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
+    path_book: &mut PeerPathBook,
     tunnel_runtime: &mut CliTunnelRuntime,
     public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
     last_attempt: &mut Option<(String, Instant)>,
@@ -2081,7 +2183,13 @@ fn maybe_run_nat_punch(
 
     tunnel_runtime.active_listen_port = Some(listen_port);
     tunnel_runtime
-        .apply(app, own_pubkey, peer_announcements)
+        .apply(
+            app,
+            own_pubkey,
+            peer_announcements,
+            path_book,
+            unix_timestamp(),
+        )
         .context("failed to re-apply tunnel runtime after nat punch")?;
 
     if let Some(error) = punch_error {
@@ -2190,14 +2298,22 @@ fn peer_signal_timeout_secs(announce_interval_secs: u64) -> u64 {
         .max(MIN_PEER_SIGNAL_TIMEOUT_SECS)
 }
 
+fn peer_path_cache_timeout_secs(announce_interval_secs: u64) -> u64 {
+    peer_signal_timeout_secs(announce_interval_secs)
+        .saturating_mul(PEER_PATH_CACHE_TIMEOUT_MULTIPLIER)
+        .max(MIN_PEER_PATH_CACHE_TIMEOUT_SECS)
+}
+
 fn apply_presence_runtime_update(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     presence: &PeerPresenceBook,
+    path_book: &mut PeerPathBook,
+    now: u64,
     tunnel_runtime: &mut CliTunnelRuntime,
     magic_dns_runtime: Option<&ConnectMagicDnsRuntime>,
 ) -> Result<()> {
-    tunnel_runtime.apply(app, own_pubkey, presence.active())?;
+    tunnel_runtime.apply(app, own_pubkey, presence.active(), path_book, now)?;
     if let Some(runtime) = magic_dns_runtime {
         runtime.refresh_records(app, presence.active());
     }
@@ -2267,6 +2383,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let own_pubkey = app.own_nostr_pubkey_hex().ok();
     let expected_peers = expected_peer_count(&app);
     let mut presence = PeerPresenceBook::default();
+    let mut path_book = PeerPathBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
     let mut public_signal_endpoint = None;
@@ -2282,6 +2399,8 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
         &app,
         own_pubkey.as_deref(),
         &presence,
+        &mut path_book,
+        unix_timestamp(),
         &mut tunnel_runtime,
         magic_dns_runtime.as_ref(),
     )
@@ -2327,16 +2446,21 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 }
             }
             _ = announce_interval.tick() => {
+                let now = unix_timestamp();
                 let removed = presence.prune_stale(
-                    unix_timestamp(),
+                    now,
                     peer_signal_timeout_secs(args.announce_interval_secs),
                 );
-                if !removed.is_empty() {
+                let paths_pruned =
+                    path_book.prune_stale(now, peer_path_cache_timeout_secs(args.announce_interval_secs));
+                if !removed.is_empty() || paths_pruned {
                     last_nat_punch_attempt = None;
                     apply_presence_runtime_update(
                         &app,
                         own_pubkey.as_deref(),
                         &presence,
+                        &mut path_book,
+                        now,
                         &mut tunnel_runtime,
                         magic_dns_runtime.as_ref(),
                     )
@@ -2353,6 +2477,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &app,
                     own_pubkey.as_deref(),
                     presence.active(),
+                    &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2384,6 +2509,8 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &app,
                     own_pubkey.as_deref(),
                     &presence,
+                    &mut path_book,
+                    unix_timestamp(),
                     &mut tunnel_runtime,
                     magic_dns_runtime.as_ref(),
                 )
@@ -2392,6 +2519,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &app,
                     own_pubkey.as_deref(),
                     presence.active(),
+                    &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2457,6 +2585,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let state_file = daemon_state_file_path(&config_path);
     let _ = fs::remove_file(daemon_control_file_path(&config_path));
     let mut presence = PeerPresenceBook::default();
+    let mut path_book = PeerPathBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
     let mut public_signal_endpoint = None;
@@ -2471,6 +2600,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         &app,
         own_pubkey.as_deref(),
         &presence,
+        &mut path_book,
+        unix_timestamp(),
         &mut tunnel_runtime,
         magic_dns_runtime.as_ref(),
     )
@@ -2581,6 +2712,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &app,
                     own_pubkey.as_deref(),
                     presence.active(),
+                    &mut path_book,
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2651,6 +2783,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 &app,
                                 own_pubkey.as_deref(),
                                 &presence,
+                                &mut path_book,
+                                unix_timestamp(),
                                 &mut tunnel_runtime,
                                 magic_dns_runtime.as_ref(),
                             ) {
@@ -2690,6 +2824,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                             .cloned()
                                             .collect::<HashSet<_>>();
                                         presence.retain_participants(&configured_set);
+                                        path_book.retain_participants(&configured_set);
                                         last_nat_punch_attempt = None;
                                         client.disconnect().await;
                                         match NostrSignalingClient::from_secret_key(
@@ -2754,6 +2889,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                             &app,
                                             own_pubkey.as_deref(),
                                             &presence,
+                                            &mut path_book,
+                                            unix_timestamp(),
                                             &mut tunnel_runtime,
                                             magic_dns_runtime.as_ref(),
                                         ) {
@@ -2772,16 +2909,21 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     }
                 }
                 if session_enabled {
+                    let now = unix_timestamp();
                     let removed = presence.prune_stale(
-                        unix_timestamp(),
+                        now,
                         peer_signal_timeout_secs(args.announce_interval_secs),
                     );
-                    if !removed.is_empty() {
+                    let paths_pruned =
+                        path_book.prune_stale(now, peer_path_cache_timeout_secs(args.announce_interval_secs));
+                    if !removed.is_empty() || paths_pruned {
                         last_nat_punch_attempt = None;
                         if let Err(error) = apply_presence_runtime_update(
                             &app,
                             own_pubkey.as_deref(),
                             &presence,
+                            &mut path_book,
+                            now,
                             &mut tunnel_runtime,
                             magic_dns_runtime.as_ref(),
                         ) {
@@ -2837,6 +2979,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &app,
                     own_pubkey.as_deref(),
                     &presence,
+                    &mut path_book,
+                    unix_timestamp(),
                     &mut tunnel_runtime,
                     magic_dns_runtime.as_ref(),
                 ) {
@@ -2847,6 +2991,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         &app,
                         own_pubkey.as_deref(),
                         presence.active(),
+                        &mut path_book,
                         &mut tunnel_runtime,
                         &mut public_signal_endpoint,
                         &mut last_nat_punch_attempt,
@@ -5431,8 +5576,9 @@ mod tests {
         install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
         kill_error_requires_control_fallback, linux_service_status_from_show_output,
         macos_service_disabled_from_print_disabled_output, parse_nonzero_pid,
-        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, public_endpoint_for_listen_port,
-        publish_error_requires_reconnect, request_daemon_reload, request_daemon_stop,
+        peer_path_cache_timeout_secs, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
+        planned_tunnel_peers, public_endpoint_for_listen_port, publish_error_requires_reconnect,
+        record_successful_runtime_paths, request_daemon_reload, request_daemon_stop,
         runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
         utun_interface_candidates, windows_service_status_from_query_output,
     };
@@ -5443,6 +5589,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use nostr_vpn_core::crypto::generate_keypair;
+    use nostr_vpn_core::paths::PeerPathBook;
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -5604,6 +5751,13 @@ mod tests {
     }
 
     #[test]
+    fn peer_path_cache_timeout_keeps_endpoint_memory_longer_than_presence_timeout() {
+        assert_eq!(peer_path_cache_timeout_secs(1), 60);
+        assert_eq!(peer_path_cache_timeout_secs(5), 60);
+        assert_eq!(peer_path_cache_timeout_secs(10), 90);
+    }
+
+    #[test]
     fn utun_candidates_expand_for_default_style_names() {
         let candidates = utun_interface_candidates("utun100");
         assert_eq!(candidates.len(), 16);
@@ -5746,6 +5900,131 @@ mod tests {
         let pending =
             pending_tunnel_heartbeat_ips(&config, None, &announcements, Some(&runtime_peers));
         assert!(pending.is_empty(), "handshaken peer should not be probed");
+    }
+
+    #[test]
+    fn runtime_handshake_updates_path_cache() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            timestamp: 10,
+        };
+        let announcements = HashMap::from([(participant.clone(), announcement.clone())]);
+        let mut paths = PeerPathBook::default();
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &announcements,
+            &mut paths,
+            Some("192.168.1.33:51820"),
+            10,
+        )
+        .expect("initial tunnel peers");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
+        paths.note_selected(&participant, &selected[0].endpoint, 10);
+
+        let runtime_peers = HashMap::from([(
+            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
+            WireGuardPeerStatus {
+                endpoint: Some("203.0.113.20:51820".to_string()),
+                last_handshake_sec: Some(12),
+                last_handshake_nsec: Some(0),
+            },
+        )]);
+        assert!(record_successful_runtime_paths(
+            &announcements,
+            Some(&runtime_peers),
+            &mut paths,
+            16,
+        ));
+
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &announcements,
+            &mut paths,
+            Some("192.168.1.33:51820"),
+            16,
+        )
+        .expect("tunnel peers after handshake");
+        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
+    }
+
+    #[test]
+    fn cached_successful_endpoint_survives_announcement_flap_until_path_cache_expires() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let original = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            timestamp: 10,
+        };
+        let flapped = PeerAnnouncement {
+            public_endpoint: None,
+            endpoint: "192.168.1.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            timestamp: 20,
+            ..original.clone()
+        };
+
+        let mut paths = PeerPathBook::default();
+        let original_announcements = HashMap::from([(participant.clone(), original)]);
+        let runtime_peers = HashMap::from([(
+            key_b64_to_hex(&peer_keys.public_key).expect("peer pubkey hex"),
+            WireGuardPeerStatus {
+                endpoint: Some("203.0.113.20:51820".to_string()),
+                last_handshake_sec: Some(12),
+                last_handshake_nsec: Some(0),
+            },
+        )]);
+        assert!(record_successful_runtime_paths(
+            &original_announcements,
+            Some(&runtime_peers),
+            &mut paths,
+            12,
+        ));
+
+        let flapped_announcements = HashMap::from([(participant.clone(), flapped.clone())]);
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &flapped_announcements,
+            &mut paths,
+            Some("10.0.0.33:51820"),
+            21,
+        )
+        .expect("cached tunnel peers");
+        assert_eq!(selected[0].endpoint, "203.0.113.20:51820");
+
+        paths.prune_stale(200, peer_path_cache_timeout_secs(5));
+
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &flapped_announcements,
+            &mut paths,
+            Some("10.0.0.33:51820"),
+            200,
+        )
+        .expect("fallback tunnel peers");
+        assert_eq!(selected[0].endpoint, "192.168.1.20:51820");
     }
 
     #[test]
