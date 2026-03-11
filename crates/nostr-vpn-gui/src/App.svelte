@@ -25,7 +25,15 @@
     uninstallSystemService,
     updateSettings,
   } from './lib/tauri'
-  import type { NetworkView, ParticipantView, PeerState, PresenceState, SettingsPatch, UiState } from './lib/types'
+  import type {
+    HealthIssue,
+    NetworkView,
+    ParticipantView,
+    PeerState,
+    PresenceState,
+    SettingsPatch,
+    UiState,
+  } from './lib/types'
 
   let state: UiState | null = null
   let relayInput = ''
@@ -42,6 +50,7 @@
   let exitNodeDraft = ''
   let advertisedRoutesDraft = ''
   let magicDnsSuffixDraft = ''
+  let exitNodeSearch = ''
   let draftsInitialized = false
 
   let networkNameDrafts: Record<string, string> = {}
@@ -106,6 +115,51 @@
     return 'muted'
   }
 
+  const peerStatePriority = (state: PeerState) => {
+    switch (state) {
+      case 'online':
+        return 0
+      case 'pending':
+        return 1
+      case 'offline':
+        return 2
+      case 'checking':
+        return 3
+      case 'unknown':
+        return 4
+      case 'local':
+      default:
+        return 5
+    }
+  }
+
+  const healthBadgeClass = (severity: HealthIssue['severity']) => {
+    switch (severity) {
+      case 'critical':
+        return 'bad'
+      case 'warning':
+        return 'warn'
+      case 'info':
+      default:
+        return 'muted'
+    }
+  }
+
+  const healthSummaryText = (state: UiState) => {
+    if (state.health.length === 0) {
+      return 'No active warnings'
+    }
+    const critical = state.health.filter((issue) => issue.severity === 'critical').length
+    const warning = state.health.filter((issue) => issue.severity === 'warning').length
+    if (critical > 0) {
+      return `${critical} critical`
+    }
+    if (warning > 0) {
+      return `${warning} warning${warning === 1 ? '' : 's'}`
+    }
+    return `${state.health.length} info`
+  }
+
   const participantTransportBadgeText = (participant: ParticipantView) => {
     switch (participant.state) {
       case 'local':
@@ -159,7 +213,17 @@
       }
     }
 
-    return participants
+    return participants.sort((left, right) => {
+      const exitScore = Number(right.offersExitNode) - Number(left.offersExitNode)
+      if (exitScore !== 0) {
+        return exitScore
+      }
+      const stateScore = peerStatePriority(left.state) - peerStatePriority(right.state)
+      if (stateScore !== 0) {
+        return stateScore
+      }
+      return exitNodeOptionLabel(left).localeCompare(exitNodeOptionLabel(right))
+    })
   }
 
   const exitNodeOptionLabel = (participant: ParticipantView) => {
@@ -167,6 +231,80 @@
     return participant.offersExitNode
       ? `${base} (offers exit node)`
       : `${base} (no exit routes advertised)`
+  }
+
+  const filteredExitNodeCandidates = (state: UiState, query: string) => {
+    const normalized = query.trim().toLowerCase()
+    return exitNodeCandidates(state).filter((participant) => {
+      if (!normalized) {
+        return true
+      }
+      return (
+        participant.magicDnsName.toLowerCase().includes(normalized) ||
+        participant.magicDnsAlias.toLowerCase().includes(normalized) ||
+        participant.npub.toLowerCase().includes(normalized) ||
+        participant.tunnelIp.toLowerCase().includes(normalized)
+      )
+    })
+  }
+
+  const exitNodeAvailabilityClass = (participant: ParticipantView) => {
+    if (!participant.offersExitNode) {
+      return 'muted'
+    }
+    switch (participant.state) {
+      case 'online':
+        return 'ok'
+      case 'pending':
+        return 'warn'
+      case 'offline':
+        return 'bad'
+      default:
+        return 'muted'
+    }
+  }
+
+  const exitNodeAvailabilityText = (participant: ParticipantView) => {
+    if (!participant.offersExitNode) {
+      return 'No exit routes'
+    }
+    switch (participant.state) {
+      case 'online':
+        return 'Ready'
+      case 'pending':
+        return 'Waiting'
+      case 'offline':
+        return 'Offline'
+      default:
+        return 'Unknown'
+    }
+  }
+
+  const selectedExitNodeStatusText = (state: UiState) => {
+    if (!state.exitNode) {
+      return 'Default-route traffic stays direct across the mesh.'
+    }
+
+    const selected = exitNodeCandidates(state).find((participant) => participant.npub === state.exitNode)
+    if (!selected) {
+      return 'Selected exit node is not present in the current network view.'
+    }
+
+    const label = selected.magicDnsName || short(selected.npub, 18, 12)
+    if (!selected.offersExitNode) {
+      return `${label} is selected, but it is not advertising default routes right now.`
+    }
+
+    switch (selected.state) {
+      case 'online':
+        return `${label} is selected and ready to carry default-route traffic.`
+      case 'pending':
+        return `${label} is selected, but WireGuard is still waiting for a handshake.`
+      case 'offline':
+        return `${label} is selected, but it is currently offline.`
+      default:
+        return `${label} is selected; availability is still being checked.`
+    }
   }
 
   async function refresh() {
@@ -423,6 +561,11 @@
     await runAction(() => updateSettings(patch))
   }
 
+  async function onSelectExitNode(npub: string) {
+    exitNodeDraft = npub
+    await onUpdateSettings({ exitNode: npub })
+  }
+
   function onParticipantAliasInput(
     participantNpub: string,
     participantHex: string,
@@ -585,6 +728,71 @@
   {/if}
 
   {#if state}
+    <section class="panel diagnostics-panel">
+      <div class="section-title-row">
+        <h2>Diagnostics</h2>
+        <div class="section-meta">{healthSummaryText(state)}</div>
+      </div>
+
+      <div class="row status-row diagnostics-badges">
+        <span class="badge muted">
+          IF {state.network.defaultInterface || 'unknown'}
+        </span>
+        <span
+          class={`badge ${
+            state.network.captivePortal === true
+              ? 'bad'
+              : state.network.captivePortal === false
+                ? 'ok'
+                : 'muted'
+          }`}
+        >
+          {state.network.captivePortal === true
+            ? 'Captive portal'
+            : state.network.captivePortal === false
+              ? 'Open internet'
+              : 'Portal unknown'}
+        </span>
+        <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
+          Mapping {state.portMapping.activeProtocol || 'none'}
+        </span>
+      </div>
+
+      <div class="diagnostics-copy">
+        <div class="config-path">
+          Local addresses:
+          {state.network.primaryIpv4 || 'no IPv4'}
+          {#if state.network.primaryIpv6}
+            | {state.network.primaryIpv6}
+          {/if}
+        </div>
+        <div class="config-path">
+          Gateway:
+          {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
+        </div>
+        <div class="config-path">
+          External endpoint:
+          {state.portMapping.externalEndpoint || 'stun / direct only'}
+        </div>
+      </div>
+
+      {#if state.health.length === 0}
+        <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
+      {:else}
+        <div class="stack rows">
+          {#each state.health as issue}
+            <div class="health-card" data-testid="health-issue">
+              <div class="row spread health-card-header">
+                <div class="item-title">{issue.summary}</div>
+                <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
+              </div>
+              <div class="item-sub">{issue.detail}</div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
     <section class="panel network-controls-panel">
       <div class="section-title-row">
         <h2>Networks</h2>
@@ -1045,24 +1253,54 @@
       </label>
 
       <div class="field-grid">
-        <label>
+        <div class="field-span field-panel">
           <span>Use Exit Node</span>
-          <select
+          <input
             class="text-input"
-            data-testid="exit-node-select"
-            bind:value={exitNodeDraft}
-            on:change={(event) =>
-              onUpdateSettings({
-                exitNode: (event.currentTarget as HTMLSelectElement).value,
-              })}
-          >
-            <option value="">No exit node</option>
-            {#each exitNodeCandidates(state) as participant}
-              <option value={participant.npub}>{exitNodeOptionLabel(participant)}</option>
+            placeholder="Search peers by alias, npub, or tunnel IP"
+            data-testid="exit-node-search"
+            bind:value={exitNodeSearch}
+          />
+          <div class="exit-node-list" data-testid="exit-node-select">
+            <button
+              class={`exit-node-card ${!state.exitNode ? 'selected' : ''}`}
+              type="button"
+              on:click={() => onSelectExitNode('')}
+            >
+              <div class="row spread">
+                <div class="item-title">No exit node</div>
+                <span class="badge muted">Direct mesh</span>
+              </div>
+              <div class="item-sub">Keep default-route traffic off peer relays and use mesh routing only.</div>
+            </button>
+
+            {#each filteredExitNodeCandidates(state, exitNodeSearch) as participant}
+              <button
+                class={`exit-node-card ${
+                  state.exitNode === participant.npub ? 'selected' : ''
+                } ${!participant.offersExitNode ? 'disabled' : ''}`}
+                type="button"
+                on:click={() => onSelectExitNode(participant.npub)}
+                disabled={!participant.offersExitNode}
+              >
+                <div class="row spread">
+                  <div class="item-title">{participant.magicDnsName || short(participant.npub, 18, 12)}</div>
+                  <span class={`badge ${exitNodeAvailabilityClass(participant)}`}>
+                    {exitNodeAvailabilityText(participant)}
+                  </span>
+                </div>
+                <div class="item-sub">
+                  {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+                </div>
+              </button>
             {/each}
-          </select>
-          <div class="config-path">Only peers marked Exit node will carry default-route traffic.</div>
-        </label>
+
+            {#if filteredExitNodeCandidates(state, exitNodeSearch).length === 0}
+              <div class="config-path">No peers match that search.</div>
+            {/if}
+          </div>
+          <div class="config-path">{selectedExitNodeStatusText(state)}</div>
+        </div>
 
         <label>
           <span>Advertised Routes</span>

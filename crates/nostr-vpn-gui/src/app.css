@@ -673,7 +673,17 @@ body {
   gap: 12px;
 }
 
+.field-span {
+  grid-column: 1 / -1;
+}
+
 .field-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.field-grid .field-panel {
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -701,6 +711,71 @@ body {
   font-size: 12px;
   color: var(--muted);
   overflow-wrap: anywhere;
+}
+
+.diagnostics-panel {
+  gap: 14px;
+}
+
+.diagnostics-badges {
+  flex-wrap: wrap;
+}
+
+.diagnostics-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.health-card {
+  border: 1px solid rgba(118, 130, 173, 0.24);
+  border-radius: 16px;
+  padding: 14px 16px;
+  background: rgba(12, 15, 40, 0.68);
+}
+
+.health-card-header {
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.exit-node-list {
+  display: grid;
+  gap: 10px;
+}
+
+.exit-node-card {
+  width: 100%;
+  border-radius: 16px;
+  border: 1px solid rgba(118, 130, 173, 0.24);
+  background: rgba(12, 15, 40, 0.68);
+  color: var(--text);
+  padding: 14px 16px;
+  text-align: left;
+  display: grid;
+  gap: 8px;
+  transition:
+    border-color 140ms ease,
+    transform 140ms ease,
+    background 140ms ease;
+}
+
+.exit-node-card:hover:not(:disabled) {
+  border-color: rgba(120, 206, 255, 0.46);
+  background: rgba(17, 22, 54, 0.9);
+  transform: translateY(-1px);
+}
+
+.exit-node-card.selected {
+  border-color: rgba(100, 220, 174, 0.55);
+  background: rgba(15, 36, 32, 0.86);
+}
+
+.exit-node-card.disabled {
+  opacity: 0.72;
+}
+
+.exit-node-card:disabled {
+  cursor: not-allowed;
 }
 
 .lan-title {

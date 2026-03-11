@@ -17,8 +17,12 @@ serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing-subscriber.workspace = true
+tracing.workspace = true
 
 nostr-vpn-core = { path = "../nostr-vpn-core" }
+crab_nat = "0.7"
+igd-next = { version = "0.16", features = ["aio_tokio"] }
+netdev = "0.40"
 
 [[bin]]
 name = "nvpn"

@@ -17,6 +17,7 @@ use nostr_vpn_core::config::{
     AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_advertised_route,
     normalize_nostr_pubkey,
 };
+use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
@@ -150,6 +151,12 @@ struct DaemonRuntimeState {
     expected_peer_count: usize,
     connected_peer_count: usize,
     mesh_ready: bool,
+    #[serde(default)]
+    health: Vec<HealthIssue>,
+    #[serde(default)]
+    network: NetworkSummary,
+    #[serde(default)]
+    port_mapping: PortMappingStatus,
     peers: Vec<DaemonPeerState>,
 }
 
@@ -251,6 +258,9 @@ struct UiState {
     connected_peer_count: usize,
     expected_peer_count: usize,
     mesh_ready: bool,
+    health: Vec<HealthIssue>,
+    network: NetworkSummary,
+    port_mapping: PortMappingStatus,
     networks: Vec<NetworkView>,
     relays: Vec<RelayView>,
     relay_summary: RelaySummary,
@@ -2008,6 +2018,21 @@ impl NvpnBackend {
             .as_ref()
             .map(|state| state.mesh_ready)
             .unwrap_or_else(|| is_mesh_complete(connected_peer_count, expected_peer_count));
+        let health = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.health.clone())
+            .unwrap_or_default();
+        let network = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.network.clone())
+            .unwrap_or_default();
+        let port_mapping = self
+            .daemon_state
+            .as_ref()
+            .map(|state| state.port_mapping.clone())
+            .unwrap_or_default();
 
         UiState {
             daemon_running: self.daemon_running,
@@ -2047,6 +2072,9 @@ impl NvpnBackend {
             connected_peer_count,
             expected_peer_count,
             mesh_ready,
+            health,
+            network,
+            port_mapping,
             networks,
             relays,
             relay_summary,
@@ -3932,31 +3960,22 @@ mod tests {
                 ..
             }) if text == "VPN On"
         ));
-        assert!(matches!(
-            spec.iter().find(|item| matches!(
-                item,
-                TrayMenuItemSpec::Submenu { text, .. } if text == "Network Devices"
-            )),
-            Some(_)
-        ));
-        assert!(matches!(
-            spec.iter().find(|item| matches!(
-                item,
-                TrayMenuItemSpec::Submenu { text, .. } if text == "Exit Nodes"
-            )),
-            Some(_)
-        ));
-        assert!(matches!(
-            spec.iter().find(|item| matches!(
-                item,
-                TrayMenuItemSpec::Text {
-                    text,
-                    enabled: true,
-                    ..
-                } if text == "Settings..."
-            )),
-            Some(_)
-        ));
+        assert!(spec.iter().any(|item| matches!(
+            item,
+            TrayMenuItemSpec::Submenu { text, .. } if text == "Network Devices"
+        )));
+        assert!(spec.iter().any(|item| matches!(
+            item,
+            TrayMenuItemSpec::Submenu { text, .. } if text == "Exit Nodes"
+        )));
+        assert!(spec.iter().any(|item| matches!(
+            item,
+            TrayMenuItemSpec::Text {
+                text,
+                enabled: true,
+                ..
+            } if text == "Settings..."
+        )));
         assert!(matches!(
             spec.last(),
             Some(TrayMenuItemSpec::Text {

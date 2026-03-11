@@ -5,7 +5,7 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,10 +212,7 @@ pub fn install_system_resolver(config: &MagicDnsResolverConfig) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        Err(anyhow!(
-            "system magic dns is not implemented on Windows yet (suffix '{}')",
-            suffix
-        ))
+        install_windows_resolver(&suffix, config.nameserver, config.port)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -245,10 +242,7 @@ pub fn uninstall_system_resolver(suffix: &str) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        Err(anyhow!(
-            "system magic dns uninstall is not implemented on Windows yet (suffix '{}')",
-            suffix
-        ))
+        uninstall_windows_resolver(&suffix)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -373,6 +367,158 @@ fn run_linux_resolvectl(args: &[&str]) -> Result<()> {
     Err(anyhow!("resolvectl {} failed: {details}", args.join(" ")))
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn windows_nameserver(nameserver: Ipv4Addr, port: u16) -> Result<String> {
+    if port != 53 {
+        return Err(anyhow!(
+            "Windows split DNS requires the local MagicDNS server to listen on port 53"
+        ));
+    }
+    Ok(nameserver.to_string())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_nrpt_display_name(suffix: &str) -> String {
+    format!("nostr-vpn MagicDNS ({suffix})")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_nrpt_comment(suffix: &str) -> String {
+    format!("nostr-vpn split DNS for {suffix}")
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_install_nrpt_script(suffix: &str, nameserver: Ipv4Addr, port: u16) -> Result<String> {
+    let namespace = suffix.trim().trim_matches('.').to_ascii_lowercase();
+    let display_name = windows_nrpt_display_name(&namespace);
+    let comment = windows_nrpt_comment(&namespace);
+    let name_servers = windows_nameserver(nameserver, port)?;
+
+    Ok(format!(
+        concat!(
+            "$ErrorActionPreference = 'Stop'\n",
+            "$namespace = {}\n",
+            "$displayName = {}\n",
+            "$comment = {}\n",
+            "$nameServers = {}\n",
+            "Get-DnsClientNrptRule -ErrorAction SilentlyContinue |\n",
+            "  Where-Object {{\n",
+            "    $_.DisplayName -eq $displayName -or $_.Comment -eq $comment -or $_.Namespace -contains $namespace\n",
+            "  }} |\n",
+            "  ForEach-Object {{\n",
+            "    $_ | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue | Out-Null\n",
+            "  }}\n",
+            "Add-DnsClientNrptRule -Namespace $namespace -NameServers $nameServers -DisplayName $displayName -Comment $comment -ErrorAction Stop | Out-Null\n",
+        ),
+        windows_powershell_quote(&namespace),
+        windows_powershell_quote(&display_name),
+        windows_powershell_quote(&comment),
+        windows_powershell_quote(&name_servers),
+    ))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_uninstall_nrpt_script(suffix: &str) -> String {
+    let namespace = suffix.trim().trim_matches('.').to_ascii_lowercase();
+    let display_name = windows_nrpt_display_name(&namespace);
+    let comment = windows_nrpt_comment(&namespace);
+
+    format!(
+        concat!(
+            "$namespace = {}\n",
+            "$displayName = {}\n",
+            "$comment = {}\n",
+            "Get-DnsClientNrptRule -ErrorAction SilentlyContinue |\n",
+            "  Where-Object {{\n",
+            "    $_.DisplayName -eq $displayName -or $_.Comment -eq $comment -or $_.Namespace -contains $namespace\n",
+            "  }} |\n",
+            "  ForEach-Object {{\n",
+            "    $_ | Remove-DnsClientNrptRule -Force -ErrorAction SilentlyContinue | Out-Null\n",
+            "  }}\n",
+        ),
+        windows_powershell_quote(&namespace),
+        windows_powershell_quote(&display_name),
+        windows_powershell_quote(&comment),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows_resolver(suffix: &str, nameserver: Ipv4Addr, port: u16) -> Result<()> {
+    let script = windows_install_nrpt_script(suffix, nameserver, port)?;
+    run_windows_powershell(&script)
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_windows_resolver(suffix: &str) -> Result<()> {
+    run_windows_powershell(&windows_uninstall_nrpt_script(suffix))
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_powershell(script: &str) -> Result<()> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "powershell not found; configure Windows NRPT manually for split DNS"
+            ));
+        }
+        Err(error) => {
+            return Err(anyhow!("failed to execute powershell: {error}"));
+        }
+    };
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(anyhow!("powershell NRPT update failed: {details}"))
+}
+
 fn strip_cidr(value: &str) -> &str {
     value.split('/').next().unwrap_or(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{windows_install_nrpt_script, windows_nameserver, windows_uninstall_nrpt_script};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn windows_nrpt_install_script_targets_suffix_and_nameserver() {
+        let script = windows_install_nrpt_script("mesh.example", Ipv4Addr::LOCALHOST, 53)
+            .expect("build windows nrpt install script");
+        assert!(script.contains("Add-DnsClientNrptRule"));
+        assert!(script.contains("mesh.example"));
+        assert!(script.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn windows_nrpt_uninstall_script_matches_suffix() {
+        let script = windows_uninstall_nrpt_script("mesh.example");
+        assert!(script.contains("Get-DnsClientNrptRule"));
+        assert!(script.contains("Remove-DnsClientNrptRule"));
+        assert!(script.contains("mesh.example"));
+    }
+
+    #[test]
+    fn windows_nrpt_requires_port_53() {
+        let error = windows_nameserver(Ipv4Addr::LOCALHOST, 1053)
+            .expect_err("non-53 port should be rejected");
+        assert!(error.to_string().contains("port 53"));
+    }
 }

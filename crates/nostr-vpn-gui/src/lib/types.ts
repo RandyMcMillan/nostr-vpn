@@ -1,6 +1,8 @@
 export type RelayState = 'up' | 'down' | 'checking' | 'unknown'
 export type PeerState = 'local' | 'online' | 'pending' | 'offline' | 'checking' | 'unknown'
 export type PresenceState = 'local' | 'present' | 'absent' | 'unknown'
+export type HealthSeverity = 'info' | 'warning' | 'critical'
+export type ProbeState = 'available' | 'unavailable' | 'unsupported' | 'error' | 'unknown'
 
 export interface RelaySummary {
   up: number
@@ -46,6 +48,38 @@ export interface LanPeerView {
   configured: boolean
 }
 
+export interface HealthIssue {
+  code: string
+  severity: HealthSeverity
+  summary: string
+  detail: string
+}
+
+export interface NetworkSummary {
+  defaultInterface?: string
+  primaryIpv4?: string
+  primaryIpv6?: string
+  gatewayIpv4?: string
+  gatewayIpv6?: string
+  changedAt?: number
+  captivePortal?: boolean
+}
+
+export interface ProbeStatus {
+  state: ProbeState
+  detail: string
+}
+
+export interface PortMappingStatus {
+  upnp: ProbeStatus
+  natPmp: ProbeStatus
+  pcp: ProbeStatus
+  activeProtocol?: string
+  externalEndpoint?: string
+  gateway?: string
+  goodUntil?: number
+}
+
 export interface UiState {
   daemonRunning: boolean
   sessionActive: boolean
@@ -80,6 +114,9 @@ export interface UiState {
   connectedPeerCount: number
   expectedPeerCount: number
   meshReady: boolean
+  health: HealthIssue[]
+  network: NetworkSummary
+  portMapping: PortMappingStatus
   networks: NetworkView[]
   relays: RelayView[]
   relaySummary: RelaySummary

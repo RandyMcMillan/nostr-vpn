@@ -1,3 +1,5 @@
+mod diagnostics;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::fs::OpenOptions;
@@ -25,6 +27,9 @@ use nostr_vpn_core::config::{
 };
 use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
 use nostr_vpn_core::crypto::generate_keypair;
+use nostr_vpn_core::diagnostics::{
+    HealthIssue, HealthSeverity, NetworkSummary, PortMappingStatus, ProbeState,
+};
 use nostr_vpn_core::magic_dns::{
     MagicDnsResolverConfig, MagicDnsServer, build_magic_dns_records, install_system_resolver,
     uninstall_system_resolver,
@@ -38,6 +43,11 @@ use nostr_vpn_core::signaling::{NostrSignalingClient, SignalEnvelope, SignalPayl
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use crate::diagnostics::{
+    PortMappingRuntime, build_health_issues, capture_network_snapshot, detect_captive_portal,
+    run_netcheck_report, write_doctor_bundle,
+};
 
 const DAEMON_CONTROL_STOP_REQUEST: &str = "stop";
 const DAEMON_CONTROL_RELOAD_REQUEST: &str = "reload";
@@ -161,6 +171,8 @@ enum Command {
     Ping(PingArgs),
     /// Check relay reachability and latency.
     Netcheck(NetcheckArgs),
+    /// Diagnose runtime/network issues and optionally write a support bundle.
+    Doctor(DoctorArgs),
     /// Show local or peer tunnel IPs.
     Ip(IpArgs),
     /// Resolve a node/tunnel IP to peer metadata.
@@ -513,6 +525,24 @@ struct NetcheckArgs {
     timeout_secs: u64,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[arg(long)]
+    network_id: Option<String>,
+    #[arg(long = "participant")]
+    participants: Vec<String>,
+    #[arg(long)]
+    relay: Vec<String>,
+    #[arg(long, default_value_t = 4)]
+    timeout_secs: u64,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    write_bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -922,21 +952,49 @@ async fn main() -> Result<()> {
             let (app, network_id) =
                 load_config_with_overrides(&config_path, args.network_id, args.participants)?;
             let relays = resolve_relays(&args.relay, &app);
-            let checks = run_netcheck(&app, &network_id, &relays, args.timeout_secs).await;
+            let report = run_netcheck_report(&app, &network_id, &relays, args.timeout_secs).await;
 
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&checks)?);
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                for check in &checks {
+                println!(
+                    "udp={} ipv4={} ipv6={} captive_portal={}",
+                    report.udp,
+                    report.ipv4,
+                    report.ipv6,
+                    report
+                        .captive_portal
+                        .map_or("unknown".to_string(), |value| value.to_string())
+                );
+                if let Some(public_ipv4) = report.public_ipv4.as_deref() {
+                    println!("public_ipv4: {public_ipv4}");
+                }
+                if let Some(preferred_relay) = report.preferred_relay.as_deref() {
+                    println!("preferred_relay: {preferred_relay}");
+                }
+                for check in &report.relay_checks {
                     if let Some(error) = &check.error {
                         println!("relay {}: down ({error})", check.relay);
                     } else {
                         println!("relay {}: up ({} ms)", check.relay, check.latency_ms);
                     }
                 }
-                let ok = checks.iter().filter(|item| item.error.is_none()).count();
-                println!("summary: {ok}/{} relays reachable", checks.len());
+                let ok = report
+                    .relay_checks
+                    .iter()
+                    .filter(|item| item.error.is_none())
+                    .count();
+                println!(
+                    "summary: {ok}/{} relays reachable, upnp={}, nat_pmp={}, pcp={}",
+                    report.relay_checks.len(),
+                    format_probe_state(report.port_mapping.upnp.state),
+                    format_probe_state(report.port_mapping.nat_pmp.state),
+                    format_probe_state(report.port_mapping.pcp.state),
+                );
             }
+        }
+        Command::Doctor(args) => {
+            run_doctor(args).await?;
         }
         Command::Ip(args) => {
             let config_path = args.config.unwrap_or_else(default_config_path);
@@ -1191,13 +1249,6 @@ struct PublishedAnnouncement {
     announcement: PeerAnnouncement,
 }
 
-#[derive(Debug, Serialize)]
-struct RelayCheck {
-    relay: String,
-    latency_ms: u128,
-    error: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonPidRecord {
     pid: u32,
@@ -1236,6 +1287,12 @@ struct DaemonRuntimeState {
     expected_peer_count: usize,
     connected_peer_count: usize,
     mesh_ready: bool,
+    #[serde(default)]
+    health: Vec<HealthIssue>,
+    #[serde(default)]
+    network: NetworkSummary,
+    #[serde(default)]
+    port_mapping: PortMappingStatus,
     peers: Vec<DaemonPeerState>,
 }
 
@@ -1488,6 +1545,9 @@ impl WireGuardPeerStatus {
     }
 }
 
+#[cfg(target_os = "windows")]
+const MAGIC_DNS_PORT: u16 = 53;
+#[cfg(not(target_os = "windows"))]
 const MAGIC_DNS_PORT: u16 = 1053;
 
 struct ConnectMagicDnsRuntime {
@@ -2378,6 +2438,61 @@ fn refresh_public_signal_endpoint(
             endpoint,
         }
     });
+}
+
+fn sync_public_signal_endpoint_from_mapping_or_stun(
+    app: &AppConfig,
+    listen_port: u16,
+    port_mapping_runtime: &PortMappingRuntime,
+    public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
+) {
+    if !app.nat.enabled {
+        *public_signal_endpoint = None;
+        return;
+    }
+
+    if let Some(endpoint) = port_mapping_runtime.advertised_endpoint() {
+        *public_signal_endpoint = Some(DiscoveredPublicSignalEndpoint {
+            listen_port,
+            endpoint,
+        });
+        return;
+    }
+
+    refresh_public_signal_endpoint(app, listen_port, public_signal_endpoint);
+}
+
+async fn refresh_public_signal_endpoint_with_port_mapping(
+    app: &AppConfig,
+    network_snapshot: &diagnostics::NetworkSnapshot,
+    listen_port: u16,
+    port_mapping_runtime: &mut PortMappingRuntime,
+    public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
+) {
+    if !app.nat.enabled {
+        port_mapping_runtime.stop().await;
+        *public_signal_endpoint = None;
+        return;
+    }
+
+    let timeout = Duration::from_secs(app.nat.discovery_timeout_secs.max(1));
+    if let Err(error) = port_mapping_runtime
+        .refresh(network_snapshot, listen_port, timeout)
+        .await
+    {
+        eprintln!("nat: port mapping refresh failed: {error}");
+    }
+
+    sync_public_signal_endpoint_from_mapping_or_stun(
+        app,
+        listen_port,
+        port_mapping_runtime,
+        public_signal_endpoint,
+    );
+}
+
+fn network_probe_timeout(app: &AppConfig) -> Duration {
+    Duration::from_secs(app.nat.discovery_timeout_secs.max(2))
 }
 
 fn build_peer_announcement(
@@ -3433,6 +3548,9 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let mut outbound_announces = OutboundAnnounceBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let mut network_snapshot = capture_network_snapshot();
+    let timeout = network_probe_timeout(&app);
+    let mut port_mapping_runtime = PortMappingRuntime::default();
     let mut public_signal_endpoint = None;
 
     let mut client = NostrSignalingClient::from_secret_key(
@@ -3453,6 +3571,17 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
         magic_dns_runtime.as_ref(),
     )
     .context("failed to initialize tunnel runtime")?;
+    let runtime_listen_port = tunnel_runtime
+        .active_listen_port
+        .unwrap_or(app.node.listen_port);
+    refresh_public_signal_endpoint_with_port_mapping(
+        &app,
+        &network_snapshot,
+        runtime_listen_port,
+        &mut port_mapping_runtime,
+        &mut public_signal_endpoint,
+    )
+    .await;
     let _ = client.publish(SignalPayload::Hello).await;
 
     println!(
@@ -3468,6 +3597,8 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tunnel_heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
     tunnel_heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut network_interval = tokio::time::interval(Duration::from_secs(5));
+    network_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut last_mesh_count = 0_usize;
     let mut last_nat_punch_attempt: Option<(String, Instant)> = None;
@@ -3587,6 +3718,107 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
+                }
+            }
+            _ = network_interval.tick() => {
+                let latest_snapshot = capture_network_snapshot();
+                let runtime_listen_port =
+                    tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
+                let network_changed = latest_snapshot.changed_since(&network_snapshot);
+                let endpoint_changed = if network_changed {
+                    network_snapshot = latest_snapshot;
+                    println!("connect: network change detected; refreshing paths");
+                    refresh_public_signal_endpoint_with_port_mapping(
+                        &app,
+                        &network_snapshot,
+                        runtime_listen_port,
+                        &mut port_mapping_runtime,
+                        &mut public_signal_endpoint,
+                    )
+                    .await;
+                    public_signal_endpoint
+                        .as_ref()
+                        .is_some_and(|endpoint| endpoint.listen_port == runtime_listen_port)
+                } else {
+                    match port_mapping_runtime
+                        .renew_if_due(&network_snapshot, runtime_listen_port, timeout)
+                        .await
+                    {
+                        Ok(changed) => {
+                            if changed {
+                                sync_public_signal_endpoint_from_mapping_or_stun(
+                                    &app,
+                                    runtime_listen_port,
+                                    &port_mapping_runtime,
+                                    &mut public_signal_endpoint,
+                                );
+                            }
+                            changed
+                        }
+                        Err(error) => {
+                            eprintln!("nat: port mapping renew failed: {error}");
+                            false
+                        }
+                    }
+                };
+
+                if !network_changed && !endpoint_changed {
+                    continue;
+                }
+
+                if network_changed {
+                    last_nat_punch_attempt = None;
+                    if let Err(error) = apply_presence_runtime_update(
+                        &app,
+                        own_pubkey.as_deref(),
+                        &presence,
+                        &mut path_book,
+                        unix_timestamp(),
+                        &mut tunnel_runtime,
+                        magic_dns_runtime.as_ref(),
+                    ) {
+                        eprintln!("connect: tunnel refresh after network change failed: {error}");
+                    }
+                }
+
+                let peer_announcements = direct_peer_announcements(&presence, relay_connected);
+                if let Err(error) = maybe_run_nat_punch(
+                    &app,
+                    own_pubkey.as_deref(),
+                    peer_announcements,
+                    &mut path_book,
+                    &mut tunnel_runtime,
+                    &mut public_signal_endpoint,
+                    &mut last_nat_punch_attempt,
+                ) {
+                    eprintln!("nat: hole-punch after network refresh failed: {error}");
+                }
+                if let Err(error) = heartbeat_pending_tunnel_peers(
+                    &app,
+                    own_pubkey.as_deref(),
+                    peer_announcements,
+                    &tunnel_runtime,
+                ) {
+                    eprintln!("tunnel: peer heartbeat failed after network refresh: {error}");
+                }
+                if relay_connected
+                    && let Err(error) = publish_private_announce_to_active_peers(
+                        &client,
+                        &app,
+                        own_pubkey.as_deref(),
+                        &presence,
+                        &tunnel_runtime,
+                        public_signal_endpoint.as_ref(),
+                        &mut outbound_announces,
+                    )
+                    .await
+                {
+                    eprintln!("signal: active peer announce refresh failed after network change: {error}");
+                }
+                if relay_connected
+                    && let Err(error) = client.publish(SignalPayload::Hello).await
+                {
+                    eprintln!("signal: hello publish failed after network change: {error}");
                 }
             }
             _ = announce_interval.tick() => {
@@ -3804,6 +4036,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             .await;
     }
     client.disconnect().await;
+    port_mapping_runtime.stop().await;
     tunnel_runtime.stop();
     println!("connect: disconnected");
 
@@ -3842,6 +4075,11 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut outbound_announces = OutboundAnnounceBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
+    let mut network_snapshot = capture_network_snapshot();
+    let mut network_changed_at = Some(unix_timestamp());
+    let timeout = network_probe_timeout(&app);
+    let mut captive_portal = detect_captive_portal(timeout).await;
+    let mut port_mapping_runtime = PortMappingRuntime::default();
     let mut public_signal_endpoint = None;
     let mut last_written_peer_cache = None;
 
@@ -3880,6 +4118,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         magic_dns_runtime.as_ref(),
     )
     .context("failed to initialize tunnel runtime")?;
+    let runtime_listen_port = tunnel_runtime
+        .active_listen_port
+        .unwrap_or(app.node.listen_port);
+    refresh_public_signal_endpoint_with_port_mapping(
+        &app,
+        &network_snapshot,
+        runtime_listen_port,
+        &mut port_mapping_runtime,
+        &mut public_signal_endpoint,
+    )
+    .await;
     if restored_peer_cache {
         let mut bootstrap_nat_attempt = None;
         if let Err(error) = maybe_run_nat_punch(
@@ -3911,6 +4160,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     reconnect_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tunnel_heartbeat_interval = tokio::time::interval(Duration::from_secs(2));
     tunnel_heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut network_interval = tokio::time::interval(Duration::from_secs(5));
+    network_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     #[cfg(unix)]
     let mut terminate_signal =
@@ -3950,6 +4201,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             &tunnel_runtime,
             &session_status,
             relay_connected,
+            &network_snapshot.summary(network_changed_at, captive_portal),
+            &port_mapping_runtime.status(),
         ),
     )?;
 
@@ -4115,6 +4368,121 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
                 }
             }
+            _ = network_interval.tick() => {
+                let latest_snapshot = capture_network_snapshot();
+                let runtime_listen_port =
+                    tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
+                let network_changed = latest_snapshot.changed_since(&network_snapshot);
+                let endpoint_changed = if network_changed {
+                    network_snapshot = latest_snapshot;
+                    network_changed_at = Some(unix_timestamp());
+                    captive_portal = detect_captive_portal(timeout).await;
+                    refresh_public_signal_endpoint_with_port_mapping(
+                        &app,
+                        &network_snapshot,
+                        runtime_listen_port,
+                        &mut port_mapping_runtime,
+                        &mut public_signal_endpoint,
+                    )
+                    .await;
+                    true
+                } else {
+                    match port_mapping_runtime
+                        .renew_if_due(&network_snapshot, runtime_listen_port, timeout)
+                        .await
+                    {
+                        Ok(changed) => {
+                            if changed {
+                                sync_public_signal_endpoint_from_mapping_or_stun(
+                                    &app,
+                                    runtime_listen_port,
+                                    &port_mapping_runtime,
+                                    &mut public_signal_endpoint,
+                                );
+                            }
+                            changed
+                        }
+                        Err(error) => {
+                            eprintln!("daemon: port mapping renew failed: {error}");
+                            false
+                        }
+                    }
+                };
+
+                if !network_changed && !endpoint_changed {
+                    continue;
+                }
+
+                if network_changed {
+                    eprintln!("daemon: network change detected; refreshing peer paths");
+                    last_nat_punch_attempt = None;
+                    match apply_presence_runtime_update(
+                        &app,
+                        own_pubkey.as_deref(),
+                        &presence,
+                        &mut path_book,
+                        unix_timestamp(),
+                        &mut tunnel_runtime,
+                        magic_dns_runtime.as_ref(),
+                    ) {
+                        Ok(()) => {
+                            session_status = if session_enabled {
+                                "Connected (network refresh)".to_string()
+                            } else {
+                                "Paused".to_string()
+                            };
+                        }
+                        Err(error) => {
+                            session_status =
+                                format!("Network change refresh failed ({error})");
+                        }
+                    }
+                }
+
+                if !session_enabled {
+                    continue;
+                }
+
+                let peer_announcements = direct_peer_announcements(&presence, relay_connected);
+                if let Err(error) = maybe_run_nat_punch(
+                    &app,
+                    own_pubkey.as_deref(),
+                    peer_announcements,
+                    &mut path_book,
+                    &mut tunnel_runtime,
+                    &mut public_signal_endpoint,
+                    &mut last_nat_punch_attempt,
+                ) {
+                    eprintln!("nat: hole-punch after network refresh failed: {error}");
+                }
+                if let Err(error) = heartbeat_pending_tunnel_peers(
+                    &app,
+                    own_pubkey.as_deref(),
+                    peer_announcements,
+                    &tunnel_runtime,
+                ) {
+                    eprintln!("tunnel: peer heartbeat failed after network refresh: {error}");
+                }
+                if relay_connected
+                    && let Err(error) = publish_private_announce_to_active_peers(
+                        &client,
+                        &app,
+                        own_pubkey.as_deref(),
+                        &presence,
+                        &tunnel_runtime,
+                        public_signal_endpoint.as_ref(),
+                        &mut outbound_announces,
+                    )
+                    .await
+                {
+                    eprintln!("signal: active peer announce refresh failed after network change: {error}");
+                }
+                if relay_connected
+                    && let Err(error) = client.publish(SignalPayload::Hello).await
+                {
+                    eprintln!("signal: hello publish failed after network change: {error}");
+                }
+            }
             _ = state_interval.tick() => {
                 if let Some(request) = take_daemon_control_request(&config_path) {
                     match request {
@@ -4132,6 +4500,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             session_enabled = false;
                             reconnect_attempt = 0;
                             reconnect_due = Instant::now();
+                            port_mapping_runtime.stop().await;
+                            public_signal_endpoint = None;
                             presence = PeerPresenceBook::default();
                             outbound_announces.clear();
                             last_nat_punch_attempt = None;
@@ -4184,6 +4554,16 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 ) {
                                     session_status = format!("Resume failed ({error})");
                                 } else {
+                                    let runtime_listen_port =
+                                        tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
+                                    refresh_public_signal_endpoint_with_port_mapping(
+                                        &app,
+                                        &network_snapshot,
+                                        runtime_listen_port,
+                                        &mut port_mapping_runtime,
+                                        &mut public_signal_endpoint,
+                                    )
+                                    .await;
                                     session_status = if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
                                         reconnect_due = Instant::now() + Duration::from_secs(DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS);
                                         "Resuming with cached mesh".to_string()
@@ -4295,6 +4675,18 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                 "Config reloaded; tunnel update failed ({})",
                                                 error
                                             );
+                                        } else {
+                                            let runtime_listen_port = tunnel_runtime
+                                                .active_listen_port
+                                                .unwrap_or(app.node.listen_port);
+                                            refresh_public_signal_endpoint_with_port_mapping(
+                                                &app,
+                                                &network_snapshot,
+                                                runtime_listen_port,
+                                                &mut port_mapping_runtime,
+                                                &mut public_signal_endpoint,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -4393,6 +4785,8 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         &tunnel_runtime,
                         &session_status,
                         relay_connected,
+                        &network_snapshot.summary(network_changed_at, captive_portal),
+                        &port_mapping_runtime.status(),
                     ),
                 );
             }
@@ -4507,6 +4901,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             .await;
     }
     client.disconnect().await;
+    port_mapping_runtime.stop().await;
     tunnel_runtime.stop();
 
     let final_state = DaemonRuntimeState {
@@ -4517,6 +4912,9 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         expected_peer_count: expected_peers,
         connected_peer_count: 0,
         mesh_ready: false,
+        health: Vec::new(),
+        network: network_snapshot.summary(network_changed_at, captive_portal),
+        port_mapping: PortMappingStatus::default(),
         peers: Vec::new(),
     };
     let _ = write_daemon_state(&state_file, &final_state);
@@ -4546,6 +4944,7 @@ fn publish_error_requires_reconnect(message: &str) -> bool {
         || lower.contains("broken pipe")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_daemon_runtime_state(
     app: &AppConfig,
     session_active: bool,
@@ -4554,6 +4953,8 @@ fn build_daemon_runtime_state(
     tunnel_runtime: &CliTunnelRuntime,
     session_status: &str,
     relay_connected: bool,
+    network: &NetworkSummary,
+    port_mapping: &PortMappingStatus,
 ) -> DaemonRuntimeState {
     let own_pubkey = app.own_nostr_pubkey_hex().ok();
     let runtime_peers = tunnel_runtime.peer_status().ok();
@@ -4621,6 +5022,14 @@ fn build_daemon_runtime_state(
         now,
     );
     let mesh_ready = expected_peers > 0 && connected_peer_count >= expected_peers;
+    let health = build_health_issues(
+        app,
+        session_active,
+        relay_connected,
+        network,
+        port_mapping,
+        &peers,
+    );
     DaemonRuntimeState {
         updated_at: now,
         session_active,
@@ -4629,6 +5038,9 @@ fn build_daemon_runtime_state(
         expected_peer_count: expected_peers,
         connected_peer_count,
         mesh_ready,
+        health,
+        network: network.clone(),
+        port_mapping: port_mapping.clone(),
         peers,
     }
 }
@@ -5450,48 +5862,179 @@ fn expected_peer_count(config: &AppConfig) -> usize {
     expected
 }
 
-async fn run_netcheck(
-    app: &AppConfig,
-    network_id: &str,
-    relays: &[String],
-    timeout_secs: u64,
-) -> Vec<RelayCheck> {
-    let mut checks = Vec::with_capacity(relays.len());
+fn format_probe_state(state: ProbeState) -> &'static str {
+    match state {
+        ProbeState::Available => "available",
+        ProbeState::Unavailable => "unavailable",
+        ProbeState::Unsupported => "unsupported",
+        ProbeState::Error => "error",
+        ProbeState::Unknown => "unknown",
+    }
+}
 
-    for relay in relays {
-        let started = std::time::Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), async {
-            let client = NostrSignalingClient::from_secret_key(
-                network_id.to_string(),
-                &app.nostr.secret_key,
-                app.participant_pubkeys_hex(),
-            )?;
-            client.connect(std::slice::from_ref(relay)).await?;
-            client.disconnect().await;
-            Result::<(), anyhow::Error>::Ok(())
+fn format_health_severity(severity: HealthSeverity) -> &'static str {
+    match severity {
+        HealthSeverity::Info => "info",
+        HealthSeverity::Warning => "warning",
+        HealthSeverity::Critical => "critical",
+    }
+}
+
+async fn run_doctor(args: DoctorArgs) -> Result<()> {
+    let config_path = args.config.unwrap_or_else(default_config_path);
+    let (app, network_id) =
+        load_config_with_overrides(&config_path, args.network_id, args.participants)?;
+    let relays = resolve_relays(&args.relay, &app);
+    let daemon = daemon_status(&config_path)?;
+    let netcheck = run_netcheck_report(&app, &network_id, &relays, args.timeout_secs).await;
+
+    let mut network = daemon
+        .state
+        .as_ref()
+        .map(|state| state.network.clone())
+        .unwrap_or_else(|| capture_network_snapshot().summary(None, netcheck.captive_portal));
+    if network.captive_portal.is_none() {
+        network.captive_portal = netcheck.captive_portal;
+    }
+    let port_mapping = daemon
+        .state
+        .as_ref()
+        .map(|state| state.port_mapping.clone())
+        .unwrap_or_else(|| netcheck.port_mapping.clone());
+    let issues = daemon
+        .state
+        .as_ref()
+        .map(|state| {
+            if state.health.is_empty() {
+                build_health_issues(
+                    &app,
+                    state.session_active,
+                    state.relay_connected,
+                    &network,
+                    &port_mapping,
+                    &state.peers,
+                )
+            } else {
+                state.health.clone()
+            }
         })
-        .await;
+        .unwrap_or_default();
+    let log_tail = read_daemon_log_tail(&daemon.log_file, 80);
+    let bundle_path = if let Some(path) = args.write_bundle.as_deref() {
+        Some(
+            write_doctor_bundle(
+                path,
+                &app,
+                &network_id,
+                &daemon,
+                &network,
+                &port_mapping,
+                &issues,
+                &netcheck,
+                &log_tail,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
-        match result {
-            Ok(Ok(())) => checks.push(RelayCheck {
-                relay: relay.clone(),
-                latency_ms: started.elapsed().as_millis(),
-                error: None,
-            }),
-            Ok(Err(error)) => checks.push(RelayCheck {
-                relay: relay.clone(),
-                latency_ms: started.elapsed().as_millis(),
-                error: Some(error.to_string()),
-            }),
-            Err(_) => checks.push(RelayCheck {
-                relay: relay.clone(),
-                latency_ms: started.elapsed().as_millis(),
-                error: Some("timeout".to_string()),
-            }),
-        }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "networkId": network_id,
+                "daemon": {
+                    "running": daemon.running,
+                    "pid": daemon.pid,
+                    "logFile": daemon.log_file,
+                    "stateFile": daemon.state_file,
+                    "state": daemon.state,
+                },
+                "network": network,
+                "portMapping": port_mapping,
+                "health": issues,
+                "netcheck": netcheck,
+                "bundlePath": bundle_path,
+            }))?
+        );
+        return Ok(());
     }
 
-    checks
+    println!("network: {network_id}");
+    if daemon.running {
+        println!("daemon: running (pid {})", daemon.pid.unwrap_or_default());
+    } else {
+        println!("daemon: stopped");
+    }
+    if let Some(state) = daemon.state.as_ref() {
+        println!("session: {}", state.session_status);
+    }
+    println!(
+        "netcheck: udp={} ipv4={} ipv6={} captive_portal={}",
+        netcheck.udp,
+        netcheck.ipv4,
+        netcheck.ipv6,
+        netcheck
+            .captive_portal
+            .map_or("unknown".to_string(), |value| value.to_string())
+    );
+    if let Some(interface) = network.default_interface.as_deref() {
+        println!("default_interface: {interface}");
+    }
+    if let Some(primary_ipv4) = network.primary_ipv4.as_deref() {
+        println!("primary_ipv4: {primary_ipv4}");
+    }
+    if let Some(primary_ipv6) = network.primary_ipv6.as_deref() {
+        println!("primary_ipv6: {primary_ipv6}");
+    }
+    if let Some(public_ipv4) = netcheck.public_ipv4.as_deref() {
+        println!("public_ipv4: {public_ipv4}");
+    }
+    if let Some(preferred_relay) = netcheck.preferred_relay.as_deref() {
+        println!("preferred_relay: {preferred_relay}");
+    }
+    println!(
+        "port_mapping: active={} upnp={} nat_pmp={} pcp={}",
+        port_mapping.active_protocol.as_deref().unwrap_or("none"),
+        format_probe_state(port_mapping.upnp.state),
+        format_probe_state(port_mapping.nat_pmp.state),
+        format_probe_state(port_mapping.pcp.state),
+    );
+    let reachable_relays = netcheck
+        .relay_checks
+        .iter()
+        .filter(|item| item.error.is_none())
+        .count();
+    println!(
+        "relays: {reachable_relays}/{} reachable",
+        netcheck.relay_checks.len()
+    );
+    for check in &netcheck.relay_checks {
+        if let Some(error) = check.error.as_deref() {
+            println!("  relay {}: down ({error})", check.relay);
+        } else {
+            println!("  relay {}: up ({} ms)", check.relay, check.latency_ms);
+        }
+    }
+    if issues.is_empty() {
+        println!("health: ok");
+    } else {
+        println!("health:");
+        for issue in &issues {
+            println!(
+                "  [{}] {}",
+                format_health_severity(issue.severity),
+                issue.summary
+            );
+            println!("    {}", issue.detail);
+        }
+    }
+    if let Some(path) = bundle_path {
+        println!("bundle: {}", path.display());
+    }
+
+    Ok(())
 }
 
 fn run_service_command(args: ServiceArgs) -> Result<()> {
@@ -7682,6 +8225,7 @@ mod tests {
             "set",
             "ping",
             "netcheck",
+            "doctor",
             "ip",
             "whois",
             "nat-discover",
