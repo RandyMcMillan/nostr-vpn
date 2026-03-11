@@ -30,6 +30,7 @@ use nostr_vpn_core::magic_dns::{
 use nostr_vpn_core::nat::{
     discover_public_udp_endpoint, discover_public_udp_endpoint_via_stun, hole_punch_udp,
 };
+use nostr_vpn_core::presence::PeerPresenceBook;
 use nostr_vpn_core::signaling::{NostrSignalingClient, SignalEnvelope, SignalPayload};
 use nostr_vpn_core::wireguard::{InterfaceConfig, PeerConfig, render_wireguard_config};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ const TUNNEL_HEARTBEAT_PORT: u16 = 9;
 const PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS: usize = 40;
 const PRIMARY_LISTEN_PORT_RETRY_DELAY_MS: u64 = 100;
 const POST_PUNCH_REAPPLY_DELAY_MS: u64 = 1_000;
+const MIN_PEER_SIGNAL_TIMEOUT_SECS: u64 = 20;
+const PEER_SIGNAL_TIMEOUT_MULTIPLIER: u64 = 3;
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -2180,6 +2183,53 @@ fn local_interface_address_for_tunnel(tunnel_ip: &str) -> String {
     format!("{}/24", strip_cidr(tunnel_ip))
 }
 
+fn peer_signal_timeout_secs(announce_interval_secs: u64) -> u64 {
+    announce_interval_secs
+        .max(5)
+        .saturating_mul(PEER_SIGNAL_TIMEOUT_MULTIPLIER)
+        .max(MIN_PEER_SIGNAL_TIMEOUT_SECS)
+}
+
+fn apply_presence_runtime_update(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    presence: &PeerPresenceBook,
+    tunnel_runtime: &mut CliTunnelRuntime,
+    magic_dns_runtime: Option<&ConnectMagicDnsRuntime>,
+) -> Result<()> {
+    tunnel_runtime.apply(app, own_pubkey, presence.active())?;
+    if let Some(runtime) = magic_dns_runtime {
+        runtime.refresh_records(app, presence.active());
+    }
+    Ok(())
+}
+
+fn presence_peer_count(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+) -> usize {
+    app.participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .filter(|participant| peer_announcements.contains_key(*participant))
+        .count()
+}
+
+fn maybe_log_presence_mesh_count(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    expected_peers: usize,
+    last_mesh_count: &mut usize,
+) {
+    let connected = presence_peer_count(app, own_pubkey, peer_announcements);
+    if connected != *last_mesh_count {
+        println!("mesh: {connected}/{expected_peers} peers with presence");
+        *last_mesh_count = connected;
+    }
+}
+
 fn tunnel_fingerprint(
     iface: &str,
     private_key: &str,
@@ -2216,7 +2266,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let relays = resolve_relays(&args.relay, &app);
     let own_pubkey = app.own_nostr_pubkey_hex().ok();
     let expected_peers = expected_peer_count(&app);
-    let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
+    let mut presence = PeerPresenceBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
     let mut public_signal_endpoint = None;
@@ -2228,12 +2278,14 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     )?;
     client.connect(&relays).await?;
 
-    tunnel_runtime
-        .apply(&app, own_pubkey.as_deref(), &peer_announcements)
-        .context("failed to initialize tunnel runtime")?;
-    if let Some(runtime) = magic_dns_runtime.as_ref() {
-        runtime.refresh_records(&app, &peer_announcements);
-    }
+    apply_presence_runtime_update(
+        &app,
+        own_pubkey.as_deref(),
+        &presence,
+        &mut tunnel_runtime,
+        magic_dns_runtime.as_ref(),
+    )
+    .context("failed to initialize tunnel runtime")?;
     let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
     let public_endpoint =
         public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), actual_listen_port);
@@ -2268,17 +2320,39 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
                 }
             }
             _ = announce_interval.tick() => {
+                let removed = presence.prune_stale(
+                    unix_timestamp(),
+                    peer_signal_timeout_secs(args.announce_interval_secs),
+                );
+                if !removed.is_empty() {
+                    last_nat_punch_attempt = None;
+                    apply_presence_runtime_update(
+                        &app,
+                        own_pubkey.as_deref(),
+                        &presence,
+                        &mut tunnel_runtime,
+                        magic_dns_runtime.as_ref(),
+                    )
+                    .context("failed to apply tunnel update after stale peer expiry")?;
+                    maybe_log_presence_mesh_count(
+                        &app,
+                        own_pubkey.as_deref(),
+                        presence.active(),
+                        expected_peers,
+                        &mut last_mesh_count,
+                    );
+                }
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2300,30 +2374,24 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     break;
                 };
 
-                match message.payload {
-                    SignalPayload::Announce(announcement) => {
-                        if let Some(existing) = peer_announcements.get(&message.sender_pubkey)
-                            && existing.timestamp > announcement.timestamp
-                        {
-                            continue;
-                        }
-                        peer_announcements.insert(message.sender_pubkey, announcement);
-                    }
-                    SignalPayload::Disconnect { .. } => {
-                        peer_announcements.remove(&message.sender_pubkey);
-                    }
+                let changed =
+                    presence.apply_signal(message.sender_pubkey, message.payload, unix_timestamp());
+                if !changed {
+                    continue;
                 }
 
-                tunnel_runtime
-                    .apply(&app, own_pubkey.as_deref(), &peer_announcements)
-                    .context("failed to apply tunnel update")?;
-                if let Some(runtime) = magic_dns_runtime.as_ref() {
-                    runtime.refresh_records(&app, &peer_announcements);
-                }
+                apply_presence_runtime_update(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &presence,
+                    &mut tunnel_runtime,
+                    magic_dns_runtime.as_ref(),
+                )
+                .context("failed to apply tunnel update")?;
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2333,22 +2401,19 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
                 }
 
-                let connected = app
-                    .participant_pubkeys_hex()
-                    .iter()
-                    .filter(|participant| Some(participant.as_str()) != own_pubkey.as_deref())
-                    .filter(|participant| peer_announcements.contains_key(*participant))
-                    .count();
-                if connected != last_mesh_count {
-                    println!("mesh: {connected}/{expected_peers} peers with presence");
-                    last_mesh_count = connected;
-                }
+                maybe_log_presence_mesh_count(
+                    &app,
+                    own_pubkey.as_deref(),
+                    presence.active(),
+                    expected_peers,
+                    &mut last_mesh_count,
+                );
             }
         }
     }
@@ -2391,8 +2456,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut expected_peers = expected_peer_count(&app);
     let state_file = daemon_state_file_path(&config_path);
     let _ = fs::remove_file(daemon_control_file_path(&config_path));
-    let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
-    let mut peer_signal_seen_at = HashMap::<String, u64>::new();
+    let mut presence = PeerPresenceBook::default();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
     let mut public_signal_endpoint = None;
@@ -2403,12 +2467,14 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         configured_participants.clone(),
     )?;
 
-    tunnel_runtime
-        .apply(&app, own_pubkey.as_deref(), &peer_announcements)
-        .context("failed to initialize tunnel runtime")?;
-    if let Some(runtime) = magic_dns_runtime.as_ref() {
-        runtime.refresh_records(&app, &peer_announcements);
-    }
+    apply_presence_runtime_update(
+        &app,
+        own_pubkey.as_deref(),
+        &presence,
+        &mut tunnel_runtime,
+        magic_dns_runtime.as_ref(),
+    )
+    .context("failed to initialize tunnel runtime")?;
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2444,8 +2510,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
             &app,
             session_enabled,
             expected_peers,
-            &peer_announcements,
-            &peer_signal_seen_at,
+            &presence,
             &tunnel_runtime,
             &session_status,
             relay_connected,
@@ -2515,7 +2580,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 if let Err(error) = maybe_run_nat_punch(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &mut tunnel_runtime,
                     &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
@@ -2557,7 +2622,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
-                    &peer_announcements,
+                    presence.active(),
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
@@ -2580,17 +2645,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             session_enabled = false;
                             reconnect_attempt = 0;
                             reconnect_due = Instant::now();
-                            peer_announcements.clear();
-                            peer_signal_seen_at.clear();
+                            presence = PeerPresenceBook::default();
                             last_nat_punch_attempt = None;
-                            if let Err(error) =
-                                tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements)
-                            {
+                            if let Err(error) = apply_presence_runtime_update(
+                                &app,
+                                own_pubkey.as_deref(),
+                                &presence,
+                                &mut tunnel_runtime,
+                                magic_dns_runtime.as_ref(),
+                            ) {
                                 session_status = format!("Pause failed ({error})");
                             } else {
-                                if let Some(runtime) = magic_dns_runtime.as_ref() {
-                                    runtime.refresh_records(&app, &peer_announcements);
-                                }
                                 session_status = "Paused".to_string();
                             }
                         }
@@ -2624,10 +2689,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                             .iter()
                                             .cloned()
                                             .collect::<HashSet<_>>();
-                                        peer_announcements
-                                            .retain(|participant, _| configured_set.contains(participant));
-                                        peer_signal_seen_at
-                                            .retain(|participant, _| configured_set.contains(participant));
+                                        presence.retain_participants(&configured_set);
                                         last_nat_punch_attempt = None;
                                         client.disconnect().await;
                                         match NostrSignalingClient::from_secret_key(
@@ -2688,15 +2750,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                             }
                                         }
 
-                                        if let Err(error) = tunnel_runtime
-                                            .apply(&app, own_pubkey.as_deref(), &peer_announcements)
-                                        {
+                                        if let Err(error) = apply_presence_runtime_update(
+                                            &app,
+                                            own_pubkey.as_deref(),
+                                            &presence,
+                                            &mut tunnel_runtime,
+                                            magic_dns_runtime.as_ref(),
+                                        ) {
                                             session_status = format!(
                                                 "Config reloaded; tunnel update failed ({})",
                                                 error
                                             );
-                                        } else if let Some(runtime) = magic_dns_runtime.as_ref() {
-                                            runtime.refresh_records(&app, &peer_announcements);
                                         }
                                     }
                                 }
@@ -2707,14 +2771,39 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         }
                     }
                 }
+                if session_enabled {
+                    let removed = presence.prune_stale(
+                        unix_timestamp(),
+                        peer_signal_timeout_secs(args.announce_interval_secs),
+                    );
+                    if !removed.is_empty() {
+                        last_nat_punch_attempt = None;
+                        if let Err(error) = apply_presence_runtime_update(
+                            &app,
+                            own_pubkey.as_deref(),
+                            &presence,
+                            &mut tunnel_runtime,
+                            magic_dns_runtime.as_ref(),
+                        ) {
+                            session_status = format!("Stale peer expiry update failed ({error})");
+                        } else {
+                            maybe_log_presence_mesh_count(
+                                &app,
+                                own_pubkey.as_deref(),
+                                presence.active(),
+                                expected_peers,
+                                &mut last_mesh_count,
+                            );
+                        }
+                    }
+                }
                 let _ = write_daemon_state(
                     &state_file,
                     &build_daemon_runtime_state(
                         &app,
                         session_enabled,
                         expected_peers,
-                        &peer_announcements,
-                        &peer_signal_seen_at,
+                        &presence,
                         &tunnel_runtime,
                         &session_status,
                         relay_connected,
@@ -2738,32 +2827,26 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     continue;
                 };
 
-                peer_signal_seen_at.insert(message.sender_pubkey.clone(), unix_timestamp());
-                match message.payload {
-                    SignalPayload::Announce(announcement) => {
-                        if let Some(existing) = peer_announcements.get(&message.sender_pubkey)
-                            && existing.timestamp > announcement.timestamp
-                        {
-                            continue;
-                        }
-                        peer_announcements.insert(message.sender_pubkey, announcement);
-                    }
-                    SignalPayload::Disconnect { .. } => {
-                        peer_announcements.remove(&message.sender_pubkey);
-                    }
+                let changed =
+                    presence.apply_signal(message.sender_pubkey, message.payload, unix_timestamp());
+                if !changed {
+                    continue;
                 }
 
-                if let Err(error) = tunnel_runtime.apply(&app, own_pubkey.as_deref(), &peer_announcements) {
+                if let Err(error) = apply_presence_runtime_update(
+                    &app,
+                    own_pubkey.as_deref(),
+                    &presence,
+                    &mut tunnel_runtime,
+                    magic_dns_runtime.as_ref(),
+                ) {
                     let error_text = error.to_string();
                     session_status = format!("Tunnel update failed ({error_text})");
                 } else {
-                    if let Some(runtime) = magic_dns_runtime.as_ref() {
-                        runtime.refresh_records(&app, &peer_announcements);
-                    }
                     if let Err(error) = maybe_run_nat_punch(
                         &app,
                         own_pubkey.as_deref(),
-                        &peer_announcements,
+                        presence.active(),
                         &mut tunnel_runtime,
                         &mut public_signal_endpoint,
                         &mut last_nat_punch_attempt,
@@ -2773,7 +2856,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     if let Err(error) = heartbeat_pending_tunnel_peers(
                         &app,
                         own_pubkey.as_deref(),
-                        &peer_announcements,
+                        presence.active(),
                         &tunnel_runtime,
                     ) {
                         eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
@@ -2785,16 +2868,13 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     };
                 }
 
-                let connected = app
-                    .participant_pubkeys_hex()
-                    .iter()
-                    .filter(|participant| Some(participant.as_str()) != own_pubkey.as_deref())
-                    .filter(|participant| peer_announcements.contains_key(*participant))
-                    .count();
-                if connected != last_mesh_count {
-                    println!("mesh: {connected}/{expected_peers} peers with presence");
-                    last_mesh_count = connected;
-                }
+                maybe_log_presence_mesh_count(
+                    &app,
+                    own_pubkey.as_deref(),
+                    presence.active(),
+                    expected_peers,
+                    &mut last_mesh_count,
+                );
             }
         }
     }
@@ -2850,8 +2930,7 @@ fn build_daemon_runtime_state(
     app: &AppConfig,
     session_active: bool,
     expected_peers: usize,
-    peer_announcements: &HashMap<String, PeerAnnouncement>,
-    peer_signal_seen_at: &HashMap<String, u64>,
+    presence: &PeerPresenceBook,
     tunnel_runtime: &CliTunnelRuntime,
     session_status: &str,
     relay_connected: bool,
@@ -2866,7 +2945,7 @@ fn build_daemon_runtime_state(
             continue;
         }
 
-        let Some(announcement) = peer_announcements.get(participant) else {
+        let Some(announcement) = presence.active().get(participant) else {
             peers.push(DaemonPeerState {
                 participant_pubkey: participant.clone(),
                 node_id: String::new(),
@@ -2911,7 +2990,7 @@ fn build_daemon_runtime_state(
             endpoint: announcement.endpoint.clone(),
             public_key: announcement.public_key.clone(),
             presence_timestamp: announcement.timestamp,
-            last_signal_seen_at: peer_signal_seen_at.get(participant).copied(),
+            last_signal_seen_at: presence.last_seen_at(participant),
             reachable,
             last_handshake_at: runtime_peer.and_then(WireGuardPeerStatus::last_handshake_epoch),
             error,
@@ -3783,37 +3862,37 @@ fn service_install(args: ServiceInstallArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        return macos_install_service(
+        macos_install_service(
             &executable,
             &config_path,
             &args.iface,
             args.announce_interval_secs.max(1),
             &log_path,
             args.force,
-        );
+        )
     }
 
     #[cfg(target_os = "linux")]
     {
-        return linux_install_service(
+        linux_install_service(
             &executable,
             &config_path,
             &args.iface,
             args.announce_interval_secs.max(1),
             &log_path,
             args.force,
-        );
+        )
     }
 
     #[cfg(target_os = "windows")]
     {
-        return windows_install_service(
+        windows_install_service(
             &executable,
             &config_path,
             &args.iface,
             args.announce_interval_secs.max(1),
             args.force,
-        );
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -3837,17 +3916,17 @@ fn service_uninstall(args: ServiceUninstallArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        return macos_uninstall_service();
+        macos_uninstall_service()
     }
 
     #[cfg(target_os = "linux")]
     {
-        return linux_uninstall_service();
+        linux_uninstall_service()
     }
 
     #[cfg(target_os = "windows")]
     {
-        return windows_uninstall_service();
+        windows_uninstall_service()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -3863,7 +3942,7 @@ fn service_enable(args: ServiceControlArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        return macos_enable_service();
+        macos_enable_service()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -3879,7 +3958,7 @@ fn service_disable(args: ServiceControlArgs) -> Result<()> {
 
     #[cfg(target_os = "macos")]
     {
-        return macos_disable_service();
+        macos_disable_service()
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5310,10 +5389,10 @@ fn parse_wg_peer_status(response: &str) -> HashMap<String, WireGuardPeerStatus> 
             continue;
         }
 
-        if let Some(value) = line.strip_prefix("last_handshake_time_nsec=") {
-            if let Ok(parsed) = value.trim().parse::<u64>() {
-                current.last_handshake_nsec = Some(parsed);
-            }
+        if let Some(value) = line.strip_prefix("last_handshake_time_nsec=")
+            && let Ok(parsed) = value.trim().parse::<u64>()
+        {
+            current.last_handshake_nsec = Some(parsed);
         }
     }
 
@@ -5352,7 +5431,7 @@ mod tests {
         install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
         kill_error_requires_control_fallback, linux_service_status_from_show_output,
         macos_service_disabled_from_print_disabled_output, parse_nonzero_pid,
-        pending_tunnel_heartbeat_ips, public_endpoint_for_listen_port,
+        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, public_endpoint_for_listen_port,
         publish_error_requires_reconnect, request_daemon_reload, request_daemon_stop,
         runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
         utun_interface_candidates, windows_service_status_from_query_output,
@@ -5515,6 +5594,13 @@ mod tests {
         assert!(!publish_error_requires_reconnect(
             "event not published: Policy violated and pubkey is not in our web of trust."
         ));
+    }
+
+    #[test]
+    fn peer_signal_timeout_has_reasonable_floor_and_scale() {
+        assert_eq!(peer_signal_timeout_secs(1), 20);
+        assert_eq!(peer_signal_timeout_secs(5), 20);
+        assert_eq!(peer_signal_timeout_secs(10), 30);
     }
 
     #[test]
