@@ -65,6 +65,19 @@ impl PeerPresenceBook {
             .or_else(|| self.known.get(sender_pubkey))
     }
 
+    pub fn restore_known(
+        &mut self,
+        sender_pubkey: impl Into<String>,
+        announcement: PeerAnnouncement,
+        last_seen_at: Option<u64>,
+    ) {
+        let sender_pubkey = sender_pubkey.into();
+        self.known.insert(sender_pubkey.clone(), announcement);
+        if let Some(last_seen_at) = last_seen_at {
+            self.last_seen_at.insert(sender_pubkey, last_seen_at);
+        }
+    }
+
     pub fn last_seen(&self) -> &HashMap<String, u64> {
         &self.last_seen_at
     }

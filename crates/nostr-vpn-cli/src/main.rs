@@ -51,6 +51,11 @@ const MIN_PEER_PATH_CACHE_TIMEOUT_SECS: u64 = 60;
 const PEER_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 3;
 const PEER_PATH_RETRY_AFTER_SECS: u64 = 5;
 const PEER_ONLINE_GRACE_SECS: u64 = 20;
+const DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS: u64 = 5;
+const MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS: u64 = 600;
+const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
+const MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS: u64 = 1_800;
+const PERSISTED_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 90;
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -1223,6 +1228,43 @@ struct DaemonPeerState {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonPeerCacheEntry {
+    participant_pubkey: String,
+    announcement: PeerAnnouncement,
+    last_signal_seen_at: Option<u64>,
+    cached_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonPeerCacheState {
+    version: u8,
+    network_id: String,
+    own_pubkey: Option<String>,
+    updated_at: u64,
+    peers: Vec<DaemonPeerCacheEntry>,
+    path_book: PeerPathBook,
+}
+
+struct DaemonPeerCacheRestore<'a> {
+    path: &'a Path,
+    app: &'a AppConfig,
+    network_id: &'a str,
+    own_pubkey: Option<&'a str>,
+    now: u64,
+    announce_interval_secs: u64,
+}
+
+struct DaemonPeerCacheWrite<'a> {
+    path: &'a Path,
+    network_id: &'a str,
+    own_pubkey: Option<&'a str>,
+    presence: &'a PeerPresenceBook,
+    path_book: &'a PeerPathBook,
+    tunnel_runtime: &'a CliTunnelRuntime,
+    now: u64,
+}
+
 fn load_config_with_overrides(
     path: &Path,
     network_id: Option<String>,
@@ -2095,6 +2137,17 @@ fn connected_peer_count_for_runtime(
         .count()
 }
 
+fn direct_peer_announcements(
+    presence: &PeerPresenceBook,
+    relay_connected: bool,
+) -> &HashMap<String, PeerAnnouncement> {
+    if relay_connected {
+        presence.active()
+    } else {
+        presence.known()
+    }
+}
+
 fn mesh_ready_for_tunnel_runtime(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -2110,6 +2163,132 @@ fn mesh_ready_for_tunnel_runtime(
     let runtime_peers = tunnel_runtime.peer_status().ok();
     connected_peer_count_for_runtime(app, own_pubkey, presence, runtime_peers.as_ref(), now)
         >= expected_peers
+}
+
+fn build_daemon_peer_cache_state(
+    network_id: &str,
+    own_pubkey: Option<&str>,
+    presence: &PeerPresenceBook,
+    path_book: &PeerPathBook,
+    tunnel_runtime: &CliTunnelRuntime,
+    now: u64,
+) -> Option<DaemonPeerCacheState> {
+    let runtime_peers = tunnel_runtime.peer_status().ok();
+    let mut peers = presence
+        .known()
+        .iter()
+        .map(|(participant, announcement)| {
+            let handshake_at = peer_runtime_lookup(announcement, runtime_peers.as_ref())
+                .and_then(WireGuardPeerStatus::last_handshake_epoch);
+            let cached_at = presence
+                .last_seen_at(participant)
+                .unwrap_or(announcement.timestamp)
+                .max(handshake_at.unwrap_or(0))
+                .max(announcement.timestamp);
+            DaemonPeerCacheEntry {
+                participant_pubkey: participant.clone(),
+                announcement: announcement.clone(),
+                last_signal_seen_at: presence.last_seen_at(participant),
+                cached_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    peers.sort_by(|left, right| left.participant_pubkey.cmp(&right.participant_pubkey));
+    if peers.is_empty() {
+        return None;
+    }
+
+    Some(DaemonPeerCacheState {
+        version: 1,
+        network_id: network_id.to_string(),
+        own_pubkey: own_pubkey.map(str::to_string),
+        updated_at: now,
+        peers,
+        path_book: path_book.clone(),
+    })
+}
+
+fn restore_daemon_peer_cache(
+    restore: DaemonPeerCacheRestore<'_>,
+    presence: &mut PeerPresenceBook,
+    path_book: &mut PeerPathBook,
+) -> Result<bool> {
+    let Some(cache) = read_daemon_peer_cache(restore.path)? else {
+        return Ok(false);
+    };
+    if cache.version != 1 || cache.network_id != restore.network_id {
+        return Ok(false);
+    }
+    if let (Some(cached), Some(current)) = (cache.own_pubkey.as_deref(), restore.own_pubkey)
+        && cached != current
+    {
+        return Ok(false);
+    }
+
+    let configured_participants = restore
+        .app
+        .participant_pubkeys_hex()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let peer_cutoff = restore
+        .now
+        .saturating_sub(persisted_peer_cache_timeout_secs(
+            restore.announce_interval_secs,
+        ));
+    let mut restored = 0usize;
+    for entry in cache.peers {
+        if entry.cached_at <= peer_cutoff {
+            continue;
+        }
+        if !configured_participants.contains(&entry.participant_pubkey) {
+            continue;
+        }
+        if Some(entry.participant_pubkey.as_str()) == restore.own_pubkey {
+            continue;
+        }
+
+        presence.restore_known(
+            entry.participant_pubkey,
+            entry.announcement,
+            entry.last_signal_seen_at,
+        );
+        restored += 1;
+    }
+    if restored == 0 {
+        return Ok(false);
+    }
+
+    *path_book = cache.path_book;
+    path_book.retain_participants(&configured_participants);
+    path_book.prune_stale(
+        restore.now,
+        persisted_path_cache_timeout_secs(restore.announce_interval_secs),
+    );
+
+    Ok(true)
+}
+
+fn write_daemon_peer_cache_if_changed(
+    write: DaemonPeerCacheWrite<'_>,
+    last_written_cache: &mut Option<String>,
+) -> Result<()> {
+    let Some(cache) = build_daemon_peer_cache_state(
+        write.network_id,
+        write.own_pubkey,
+        write.presence,
+        write.path_book,
+        write.tunnel_runtime,
+        write.now,
+    ) else {
+        return Ok(());
+    };
+    let raw = serde_json::to_string(&cache)?;
+    if last_written_cache.as_deref() == Some(raw.as_str()) {
+        return Ok(());
+    }
+    write_daemon_peer_cache(write.path, &cache)?;
+    *last_written_cache = Some(raw);
+    Ok(())
 }
 
 async fn publish_private_announce_to_participants(
@@ -2252,22 +2431,6 @@ fn runtime_has_handshake(tunnel_runtime: &CliTunnelRuntime) -> bool {
         .is_some_and(|peers| peers.values().any(WireGuardPeerStatus::has_handshake))
 }
 
-fn peers_have_public_signal_endpoints(
-    app: &AppConfig,
-    own_pubkey: Option<&str>,
-    peer_announcements: &HashMap<String, PeerAnnouncement>,
-) -> bool {
-    app.participant_pubkeys_hex()
-        .iter()
-        .filter(|participant| Some(participant.as_str()) != own_pubkey)
-        .all(|participant| {
-            peer_announcements
-                .get(participant)
-                .and_then(|announcement| announcement.public_endpoint.as_deref())
-                .is_some_and(|endpoint| !endpoint.trim().is_empty())
-        })
-}
-
 fn nat_punch_targets(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -2353,15 +2516,9 @@ fn maybe_run_nat_punch(
     }
 
     let listen_port = tunnel_runtime.listen_port(app.node.listen_port);
-    let public_endpoint =
-        public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), listen_port);
 
-    if public_endpoint.is_some()
-        && peers_have_public_signal_endpoints(app, own_pubkey, peer_announcements)
-    {
-        *last_attempt = None;
-        return Ok(());
-    }
+    // Keep punching selected endpoints until the tunnel actually handshakes.
+    // Advertising public endpoints alone is not enough for double-NAT cases.
     let targets = nat_punch_targets(app, own_pubkey, peer_announcements, listen_port);
     let Some(fingerprint) = nat_punch_fingerprint(&targets, listen_port) else {
         *last_attempt = None;
@@ -2519,6 +2676,20 @@ fn peer_path_cache_timeout_secs(announce_interval_secs: u64) -> u64 {
     peer_signal_timeout_secs(announce_interval_secs)
         .saturating_mul(PEER_PATH_CACHE_TIMEOUT_MULTIPLIER)
         .max(MIN_PEER_PATH_CACHE_TIMEOUT_SECS)
+}
+
+fn persisted_peer_cache_timeout_secs(announce_interval_secs: u64) -> u64 {
+    announce_interval_secs
+        .max(5)
+        .saturating_mul(PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER)
+        .max(MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS)
+}
+
+fn persisted_path_cache_timeout_secs(announce_interval_secs: u64) -> u64 {
+    announce_interval_secs
+        .max(5)
+        .saturating_mul(PERSISTED_PATH_CACHE_TIMEOUT_MULTIPLIER)
+        .max(MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS)
 }
 
 fn apply_presence_runtime_update(
@@ -2837,6 +3008,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut own_pubkey = app.own_nostr_pubkey_hex().ok();
     let mut expected_peers = expected_peer_count(&app);
     let state_file = daemon_state_file_path(&config_path);
+    let peer_cache_file = daemon_peer_cache_file_path(&config_path);
     let _ = fs::remove_file(daemon_control_file_path(&config_path));
     let mut presence = PeerPresenceBook::default();
     let mut path_book = PeerPathBook::default();
@@ -2844,12 +3016,32 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
     let mut public_signal_endpoint = None;
+    let mut last_written_peer_cache = None;
 
     let mut client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
         &app.nostr.secret_key,
         configured_participants.clone(),
     )?;
+
+    let restored_peer_cache = match restore_daemon_peer_cache(
+        DaemonPeerCacheRestore {
+            path: &peer_cache_file,
+            app: &app,
+            network_id: &network_id,
+            own_pubkey: own_pubkey.as_deref(),
+            now: unix_timestamp(),
+            announce_interval_secs: args.announce_interval_secs,
+        },
+        &mut presence,
+        &mut path_book,
+    ) {
+        Ok(restored) => restored,
+        Err(error) => {
+            eprintln!("daemon: failed to restore peer cache: {error}");
+            false
+        }
+    };
 
     apply_presence_runtime_update(
         &app,
@@ -2861,6 +3053,28 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         magic_dns_runtime.as_ref(),
     )
     .context("failed to initialize tunnel runtime")?;
+    if restored_peer_cache {
+        let mut bootstrap_nat_attempt = None;
+        if let Err(error) = maybe_run_nat_punch(
+            &app,
+            own_pubkey.as_deref(),
+            direct_peer_announcements(&presence, false),
+            &mut path_book,
+            &mut tunnel_runtime,
+            &mut public_signal_endpoint,
+            &mut bootstrap_nat_attempt,
+        ) {
+            eprintln!("daemon: cached peer nat bootstrap failed: {error}");
+        }
+        if let Err(error) = heartbeat_pending_tunnel_peers(
+            &app,
+            own_pubkey.as_deref(),
+            direct_peer_announcements(&presence, false),
+            &tunnel_runtime,
+        ) {
+            eprintln!("daemon: cached peer heartbeat bootstrap failed: {error}");
+        }
+    }
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(args.announce_interval_secs.max(5)));
     announce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -2884,10 +3098,19 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     tokio::pin!(terminate_wait);
 
     let mut session_enabled = true;
-    let mut session_status = "Connecting to relays".to_string();
+    let mut session_status = if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
+        "Trying cached mesh before relays".to_string()
+    } else {
+        "Connecting to relays".to_string()
+    };
     let mut relay_connected = false;
     let mut reconnect_attempt = 0u32;
-    let mut reconnect_due = Instant::now();
+    let mut reconnect_due = Instant::now()
+        + if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
+            Duration::from_secs(DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS)
+        } else {
+            Duration::ZERO
+        };
     let mut last_mesh_count = 0_usize;
     let mut last_nat_punch_attempt: Option<(String, Instant)> = None;
     write_daemon_state(
@@ -3033,10 +3256,24 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     continue;
                 }
 
+                let peer_announcements = direct_peer_announcements(&presence, relay_connected);
+                if !relay_connected
+                    && let Err(error) = maybe_run_nat_punch(
+                        &app,
+                        own_pubkey.as_deref(),
+                        peer_announcements,
+                        &mut path_book,
+                        &mut tunnel_runtime,
+                        &mut public_signal_endpoint,
+                        &mut last_nat_punch_attempt,
+                    )
+                {
+                    eprintln!("nat: cached peer hole-punch failed: {error}");
+                }
                 if let Err(error) = heartbeat_pending_tunnel_peers(
                     &app,
                     own_pubkey.as_deref(),
-                    presence.active(),
+                    peer_announcements,
                     &tunnel_runtime,
                 ) {
                     eprintln!("tunnel: peer heartbeat failed: {error}");
@@ -3082,7 +3319,42 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 relay_connected = false;
                                 reconnect_attempt = 0;
                                 reconnect_due = Instant::now();
-                                session_status = "Resuming".to_string();
+                                let restored_peer_cache = match restore_daemon_peer_cache(
+                                    DaemonPeerCacheRestore {
+                                        path: &peer_cache_file,
+                                        app: &app,
+                                        network_id: &network_id,
+                                        own_pubkey: own_pubkey.as_deref(),
+                                        now: unix_timestamp(),
+                                        announce_interval_secs: args.announce_interval_secs,
+                                    },
+                                    &mut presence,
+                                    &mut path_book,
+                                ) {
+                                    Ok(restored) => restored,
+                                    Err(error) => {
+                                        eprintln!("daemon: failed to restore peer cache on resume: {error}");
+                                        false
+                                    }
+                                };
+                                if let Err(error) = apply_presence_runtime_update(
+                                    &app,
+                                    own_pubkey.as_deref(),
+                                    &presence,
+                                    &mut path_book,
+                                    unix_timestamp(),
+                                    &mut tunnel_runtime,
+                                    magic_dns_runtime.as_ref(),
+                                ) {
+                                    session_status = format!("Resume failed ({error})");
+                                } else {
+                                    session_status = if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
+                                        reconnect_due = Instant::now() + Duration::from_secs(DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS);
+                                        "Resuming with cached mesh".to_string()
+                                    } else {
+                                        "Resuming".to_string()
+                                    };
+                                }
                             }
                         }
                         DaemonControlRequest::Reload => {
@@ -3254,6 +3526,20 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     reconnect_attempt = 0;
                     reconnect_due = Instant::now();
                     session_status = "Mesh ready (relays paused)".to_string();
+                }
+                if let Err(error) = write_daemon_peer_cache_if_changed(
+                    DaemonPeerCacheWrite {
+                        path: &peer_cache_file,
+                        network_id: &network_id,
+                        own_pubkey: own_pubkey.as_deref(),
+                        presence: &presence,
+                        path_book: &path_book,
+                        tunnel_runtime: &tunnel_runtime,
+                        now: unix_timestamp(),
+                    },
+                    &mut last_written_peer_cache,
+                ) {
+                    eprintln!("daemon: failed to persist peer cache: {error}");
                 }
                 let _ = write_daemon_state(
                     &state_file,
@@ -3769,6 +4055,13 @@ fn daemon_control_file_path(config_path: &Path) -> PathBuf {
     parent.join("daemon.control")
 }
 
+fn daemon_peer_cache_file_path(config_path: &Path) -> PathBuf {
+    let parent = config_path
+        .parent()
+        .map_or_else(|| Path::new(".").to_path_buf(), PathBuf::from);
+    parent.join("daemon.mesh-cache.json")
+}
+
 fn ensure_no_other_daemon_processes_for_config(config_path: &Path, current_pid: u32) -> Result<()> {
     let mut daemon_pids = find_daemon_pids_by_config(config_path);
     daemon_pids.retain(|pid| *pid != current_pid);
@@ -3923,6 +4216,30 @@ fn write_daemon_state(path: &Path, state: &DaemonRuntimeState) -> Result<()> {
     write_runtime_file_atomically(path, raw.as_bytes())
         .with_context(|| format!("failed to write daemon state file {}", path.display()))?;
     set_daemon_runtime_file_permissions(path)?;
+    Ok(())
+}
+
+fn read_daemon_peer_cache(path: &Path) -> Result<Option<DaemonPeerCacheState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read daemon peer cache {}", path.display()))?;
+    let parsed = serde_json::from_str::<DaemonPeerCacheState>(&raw)
+        .with_context(|| format!("failed to parse daemon peer cache {}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn write_daemon_peer_cache(path: &Path, state: &DaemonPeerCacheState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(state)?;
+    fs::write(path, raw)
+        .with_context(|| format!("failed to write daemon peer cache {}", path.display()))?;
+    set_private_cache_file_permissions(path)?;
     Ok(())
 }
 
@@ -4171,6 +4488,20 @@ fn set_daemon_runtime_file_permissions(path: &Path) -> Result<()> {
         fs::set_permissions(path, permissions).with_context(|| {
             format!(
                 "failed to set daemon runtime file permissions on {}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn set_private_cache_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).with_context(|| {
+            format!(
+                "failed to set daemon peer cache file permissions on {}",
                 path.display()
             )
         })?;
@@ -5941,21 +6272,26 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 mod tests {
     use clap::CommandFactory;
 
+    use crate::unix_timestamp;
+
     use super::{
-        AppConfig, Cli, DiscoveredPublicSignalEndpoint, InstallCliArgs, OutboundAnnounceBook,
-        PeerAnnouncement, UninstallCliArgs, WireGuardPeerStatus, announcement_fingerprint,
-        build_peer_announcement, build_runtime_magic_dns_records, can_reuse_active_listen_port,
-        connected_peer_count_for_runtime, daemon_control_file_path, daemon_pids_from_ps_output,
-        daemon_reconnect_backoff_delay, default_cli_install_path, endpoint_with_listen_port,
-        install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        AppConfig, Cli, DaemonPeerCacheEntry, DaemonPeerCacheRestore, DaemonPeerCacheState,
+        DiscoveredPublicSignalEndpoint, InstallCliArgs, OutboundAnnounceBook, PeerAnnouncement,
+        UninstallCliArgs, WireGuardPeerStatus, announcement_fingerprint, build_peer_announcement,
+        build_runtime_magic_dns_records, can_reuse_active_listen_port,
+        connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
+        daemon_pids_from_ps_output, daemon_reconnect_backoff_delay, default_cli_install_path,
+        endpoint_with_listen_port, install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
         kill_error_requires_control_fallback, linux_service_status_from_show_output,
         macos_service_disabled_from_print_disabled_output, parse_nonzero_pid,
         peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
-        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, planned_tunnel_peers,
-        public_endpoint_for_listen_port, publish_error_requires_reconnect,
-        record_successful_runtime_paths, request_daemon_reload, request_daemon_stop,
+        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
+        persisted_peer_cache_timeout_secs, planned_tunnel_peers, public_endpoint_for_listen_port,
+        publish_error_requires_reconnect, read_daemon_peer_cache, record_successful_runtime_paths,
+        request_daemon_reload, request_daemon_stop, restore_daemon_peer_cache,
         runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
         utun_interface_candidates, windows_service_status_from_query_output,
+        write_daemon_peer_cache,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -6223,6 +6559,156 @@ mod tests {
         };
 
         assert!(!peer_has_recent_handshake(&runtime_peer, now));
+    }
+
+    #[test]
+    fn persisted_peer_cache_roundtrips_known_peers_and_path_hints() {
+        let nonce = unix_timestamp();
+        let dir = std::env::temp_dir().join(format!("nvpn-peer-cache-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp cache dir");
+        let config_path = dir.join("config.toml");
+        let cache_path = daemon_peer_cache_file_path(&config_path);
+
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+        let network_id = config.effective_network_id();
+        let own_pubkey = config.own_nostr_pubkey_hex().ok();
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 100,
+        };
+
+        let mut path_book = PeerPathBook::default();
+        assert!(path_book.note_success(participant.clone(), "203.0.113.20:51820", 120,));
+
+        let cache = DaemonPeerCacheState {
+            version: 1,
+            network_id: network_id.clone(),
+            own_pubkey: own_pubkey.clone(),
+            updated_at: 130,
+            peers: vec![DaemonPeerCacheEntry {
+                participant_pubkey: participant.clone(),
+                announcement: announcement.clone(),
+                last_signal_seen_at: Some(110),
+                cached_at: 125,
+            }],
+            path_book,
+        };
+        write_daemon_peer_cache(&cache_path, &cache).expect("write peer cache");
+        let loaded = read_daemon_peer_cache(&cache_path)
+            .expect("read peer cache")
+            .expect("cache should exist");
+        assert_eq!(loaded.network_id, network_id);
+        assert_eq!(loaded.peers.len(), 1);
+
+        let mut restored_presence = PeerPresenceBook::default();
+        let mut restored_paths = PeerPathBook::default();
+        assert!(
+            restore_daemon_peer_cache(
+                DaemonPeerCacheRestore {
+                    path: &cache_path,
+                    app: &config,
+                    network_id: &network_id,
+                    own_pubkey: own_pubkey.as_deref(),
+                    now: 130,
+                    announce_interval_secs: 20,
+                },
+                &mut restored_presence,
+                &mut restored_paths,
+            )
+            .expect("restore peer cache")
+        );
+        assert!(restored_presence.active().is_empty());
+        assert!(restored_presence.known().contains_key(&participant));
+
+        let planned = planned_tunnel_peers(
+            &config,
+            own_pubkey.as_deref(),
+            restored_presence.known(),
+            &mut restored_paths,
+            Some("10.0.0.33:51820"),
+            130,
+        )
+        .expect("planned peers from restored cache");
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].endpoint, "203.0.113.20:51820");
+
+        let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_persisted_peer_cache_is_ignored() {
+        let nonce = unix_timestamp();
+        let dir = std::env::temp_dir().join(format!("nvpn-stale-peer-cache-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp cache dir");
+        let config_path = dir.join("config.toml");
+        let cache_path = daemon_peer_cache_file_path(&config_path);
+
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.networks[0].participants = vec![participant.clone()];
+        let network_id = config.effective_network_id();
+        let own_pubkey = config.own_nostr_pubkey_hex().ok();
+
+        let cache = DaemonPeerCacheState {
+            version: 1,
+            network_id: network_id.clone(),
+            own_pubkey: own_pubkey.clone(),
+            updated_at: 10,
+            peers: vec![DaemonPeerCacheEntry {
+                participant_pubkey: participant,
+                announcement: PeerAnnouncement {
+                    node_id: "peer-a".to_string(),
+                    public_key: generate_keypair().public_key,
+                    endpoint: "203.0.113.20:51820".to_string(),
+                    local_endpoint: None,
+                    public_endpoint: Some("203.0.113.20:51820".to_string()),
+                    tunnel_ip: "10.44.0.2/32".to_string(),
+                    advertised_routes: Vec::new(),
+                    timestamp: 1,
+                },
+                last_signal_seen_at: Some(10),
+                cached_at: 10,
+            }],
+            path_book: PeerPathBook::default(),
+        };
+        write_daemon_peer_cache(&cache_path, &cache).expect("write stale peer cache");
+
+        let mut restored_presence = PeerPresenceBook::default();
+        let mut restored_paths = PeerPathBook::default();
+        assert!(
+            !restore_daemon_peer_cache(
+                DaemonPeerCacheRestore {
+                    path: &cache_path,
+                    app: &config,
+                    network_id: &network_id,
+                    own_pubkey: own_pubkey.as_deref(),
+                    now: 10 + persisted_peer_cache_timeout_secs(20) + 1,
+                    announce_interval_secs: 20,
+                },
+                &mut restored_presence,
+                &mut restored_paths,
+            )
+            .expect("restore stale cache")
+        );
+        assert!(restored_presence.known().is_empty());
+        assert!(!restored_paths.prune_stale(
+            10 + persisted_path_cache_timeout_secs(20) + 1,
+            persisted_path_cache_timeout_secs(20),
+        ));
+
+        let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

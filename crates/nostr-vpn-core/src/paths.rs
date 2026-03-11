@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::control::{PeerAnnouncement, select_peer_endpoint};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum PeerPathSource {
     Local,
     Public,
@@ -28,13 +30,13 @@ impl PeerPathSource {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PeerPathState {
     current_endpoint: Option<String>,
     endpoints: HashMap<String, TrackedPeerPath>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrackedPeerPath {
     source: PeerPathSource,
     announced_at: u64,
@@ -59,7 +61,7 @@ impl TrackedPeerPath {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerPathBook {
     peers: HashMap<String, PeerPathState>,
 }
