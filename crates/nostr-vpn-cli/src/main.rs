@@ -40,8 +40,9 @@ const DAEMON_CONTROL_RELOAD_REQUEST: &str = "reload";
 const DAEMON_CONTROL_PAUSE_REQUEST: &str = "pause";
 const DAEMON_CONTROL_RESUME_REQUEST: &str = "resume";
 const TUNNEL_HEARTBEAT_PORT: u16 = 9;
-const PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS: usize = 10;
-const PRIMARY_LISTEN_PORT_RETRY_DELAY_MS: u64 = 50;
+const PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS: usize = 40;
+const PRIMARY_LISTEN_PORT_RETRY_DELAY_MS: u64 = 100;
+const POST_PUNCH_REAPPLY_DELAY_MS: u64 = 1_000;
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -1594,6 +1595,14 @@ impl CliTunnelRuntime {
         let mut last_bind_conflict = None;
         let mut try_listen_port =
             |listen_port: u16, warn_on_fallback: bool| -> Result<Option<u16>> {
+                if can_reuse_active_listen_port(
+                    self.handle.is_some(),
+                    self.last_fingerprint.is_some(),
+                    self.active_listen_port,
+                    listen_port,
+                ) {
+                    return Ok(Some(listen_port));
+                }
                 match wg_set(
                     socket,
                     &format!("private_key={private_key_hex}\nlisten_port={listen_port}"),
@@ -1732,6 +1741,15 @@ fn pick_available_udp_port() -> Result<u16> {
     Ok(addr.port())
 }
 
+fn can_reuse_active_listen_port(
+    handle_running: bool,
+    config_applied: bool,
+    active_listen_port: Option<u16>,
+    requested_listen_port: u16,
+) -> bool {
+    handle_running && config_applied && active_listen_port == Some(requested_listen_port)
+}
+
 fn endpoint_with_listen_port(endpoint: &str, listen_port: u16) -> String {
     endpoint
         .parse::<SocketAddr>()
@@ -1836,6 +1854,25 @@ fn discover_public_signal_endpoint(app: &AppConfig, listen_port: u16) -> Option<
     None
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveredPublicSignalEndpoint {
+    listen_port: u16,
+    endpoint: String,
+}
+
+fn refresh_public_signal_endpoint(
+    app: &AppConfig,
+    listen_port: u16,
+    public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
+) {
+    *public_signal_endpoint = discover_public_signal_endpoint(app, listen_port).map(|endpoint| {
+        DiscoveredPublicSignalEndpoint {
+            listen_port,
+            endpoint,
+        }
+    });
+}
+
 fn build_peer_announcement(
     app: &AppConfig,
     listen_port: u16,
@@ -1860,16 +1897,13 @@ fn build_peer_announcement(
     }
 }
 
-fn compatible_public_endpoint<'a>(
-    public_endpoint: Option<&'a str>,
-    configured_listen_port: u16,
+fn public_endpoint_for_listen_port(
+    public_signal_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
     actual_listen_port: u16,
-) -> Option<&'a str> {
-    if configured_listen_port == actual_listen_port {
-        public_endpoint
-    } else {
-        None
-    }
+) -> Option<String> {
+    public_signal_endpoint
+        .filter(|endpoint| endpoint.listen_port == actual_listen_port)
+        .map(|endpoint| endpoint.endpoint.clone())
 }
 
 fn tunnel_peer_from_announcement(
@@ -1895,6 +1929,22 @@ fn runtime_has_handshake(tunnel_runtime: &CliTunnelRuntime) -> bool {
         .peer_status()
         .ok()
         .is_some_and(|peers| peers.values().any(WireGuardPeerStatus::has_handshake))
+}
+
+fn peers_have_public_signal_endpoints(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+) -> bool {
+    app.participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+        .all(|participant| {
+            peer_announcements
+                .get(participant)
+                .and_then(|announcement| announcement.public_endpoint.as_deref())
+                .is_some_and(|endpoint| !endpoint.trim().is_empty())
+        })
 }
 
 fn nat_punch_targets(
@@ -1972,13 +2022,24 @@ fn maybe_run_nat_punch(
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     tunnel_runtime: &mut CliTunnelRuntime,
+    public_signal_endpoint: &mut Option<DiscoveredPublicSignalEndpoint>,
     last_attempt: &mut Option<(String, Instant)>,
 ) -> Result<()> {
     if !app.nat.enabled {
+        *public_signal_endpoint = None;
         return Ok(());
     }
 
     let listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+    let public_endpoint =
+        public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), listen_port);
+
+    if public_endpoint.is_some()
+        && peers_have_public_signal_endpoints(app, own_pubkey, peer_announcements)
+    {
+        *last_attempt = None;
+        return Ok(());
+    }
     let targets = nat_punch_targets(app, own_pubkey, peer_announcements, listen_port);
     let Some(fingerprint) = nat_punch_fingerprint(&targets, listen_port) else {
         *last_attempt = None;
@@ -2002,6 +2063,7 @@ fn maybe_run_nat_punch(
 
     tunnel_runtime.stop();
     thread::sleep(Duration::from_millis(150));
+    refresh_public_signal_endpoint(app, listen_port, public_signal_endpoint);
 
     let mut punch_error = None;
     for target in &targets {
@@ -2010,6 +2072,9 @@ fn maybe_run_nat_punch(
             break;
         }
     }
+
+    // macOS can briefly hold the UDP port after STUN/hole-punch sockets close.
+    thread::sleep(Duration::from_millis(POST_PUNCH_REAPPLY_DELAY_MS));
 
     tunnel_runtime.active_listen_port = Some(listen_port);
     tunnel_runtime
@@ -2154,7 +2219,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
     let mut peer_announcements = HashMap::<String, PeerAnnouncement>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
-    let public_signal_endpoint = discover_public_signal_endpoint(&app, app.node.listen_port);
+    let mut public_signal_endpoint = None;
 
     let client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -2170,15 +2235,13 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
         runtime.refresh_records(&app, &peer_announcements);
     }
     let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+    let public_endpoint =
+        public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), actual_listen_port);
     let _ = client
         .publish(SignalPayload::Announce(build_peer_announcement(
             &app,
             actual_listen_port,
-            compatible_public_endpoint(
-                public_signal_endpoint.as_deref(),
-                app.node.listen_port,
-                actual_listen_port,
-            ),
+            public_endpoint.as_deref(),
         )))
         .await;
 
@@ -2217,19 +2280,18 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     own_pubkey.as_deref(),
                     &peer_announcements,
                     &mut tunnel_runtime,
+                    &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
                 ) {
                     eprintln!("nat: periodic hole-punch failed: {error}");
                 }
                 let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                let public_endpoint =
+                    public_endpoint_for_listen_port(public_signal_endpoint.as_ref(), actual_listen_port);
                 let refreshed = build_peer_announcement(
                     &app,
                     actual_listen_port,
-                    compatible_public_endpoint(
-                        public_signal_endpoint.as_deref(),
-                        app.node.listen_port,
-                        actual_listen_port,
-                    ),
+                    public_endpoint.as_deref(),
                 );
                 let _ = client.publish(SignalPayload::Announce(refreshed)).await;
             }
@@ -2263,6 +2325,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     own_pubkey.as_deref(),
                     &peer_announcements,
                     &mut tunnel_runtime,
+                    &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
                 ) {
                     eprintln!("nat: hole-punch after peer signal failed: {error}");
@@ -2332,7 +2395,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let mut peer_signal_seen_at = HashMap::<String, u64>::new();
     let mut tunnel_runtime = CliTunnelRuntime::new(args.iface);
     let magic_dns_runtime = ConnectMagicDnsRuntime::start(&app);
-    let public_signal_endpoint = discover_public_signal_endpoint(&app, app.node.listen_port);
+    let mut public_signal_endpoint = None;
 
     let mut client = NostrSignalingClient::from_secret_key(
         network_id.clone(),
@@ -2415,14 +2478,14 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         reconnect_attempt = 0;
                         session_status = "Connected".to_string();
                         let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                        let public_endpoint = public_endpoint_for_listen_port(
+                            public_signal_endpoint.as_ref(),
+                            actual_listen_port,
+                        );
                         let refreshed = build_peer_announcement(
                             &app,
                             actual_listen_port,
-                            compatible_public_endpoint(
-                                public_signal_endpoint.as_deref(),
-                                app.node.listen_port,
-                                actual_listen_port,
-                            ),
+                            public_endpoint.as_deref(),
                         );
                         if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                             let error_text = error.to_string();
@@ -2454,19 +2517,20 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     own_pubkey.as_deref(),
                     &peer_announcements,
                     &mut tunnel_runtime,
+                    &mut public_signal_endpoint,
                     &mut last_nat_punch_attempt,
                 ) {
                     eprintln!("nat: periodic hole-punch failed: {error}");
                 }
                 let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                let public_endpoint = public_endpoint_for_listen_port(
+                    public_signal_endpoint.as_ref(),
+                    actual_listen_port,
+                );
                 let refreshed = build_peer_announcement(
                     &app,
                     actual_listen_port,
-                    compatible_public_endpoint(
-                        public_signal_endpoint.as_deref(),
-                        app.node.listen_port,
-                        actual_listen_port,
-                    ),
+                    public_endpoint.as_deref(),
                 );
                 if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                     let error_text = error.to_string();
@@ -2581,14 +2645,14 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                             reconnect_due = Instant::now();
                                                             session_status = "Config reloaded".to_string();
                                                             let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
+                                                            let public_endpoint = public_endpoint_for_listen_port(
+                                                                public_signal_endpoint.as_ref(),
+                                                                actual_listen_port,
+                                                            );
                                                             let refreshed = build_peer_announcement(
                                                                 &app,
                                                                 actual_listen_port,
-                                                                compatible_public_endpoint(
-                                                                    public_signal_endpoint.as_deref(),
-                                                                    app.node.listen_port,
-                                                                    actual_listen_port,
-                                                                ),
+                                                                public_endpoint.as_deref(),
                                                             );
                                                             if let Err(error) = client.publish(SignalPayload::Announce(refreshed)).await {
                                                                 session_status = format!(
@@ -2701,6 +2765,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         own_pubkey.as_deref(),
                         &peer_announcements,
                         &mut tunnel_runtime,
+                        &mut public_signal_endpoint,
                         &mut last_nat_punch_attempt,
                     ) {
                         eprintln!("nat: hole-punch after peer signal failed: {error}");
@@ -5280,15 +5345,17 @@ mod tests {
     use clap::CommandFactory;
 
     use super::{
-        AppConfig, Cli, InstallCliArgs, PeerAnnouncement, UninstallCliArgs, WireGuardPeerStatus,
-        build_runtime_magic_dns_records, daemon_control_file_path, daemon_pids_from_ps_output,
+        AppConfig, Cli, DiscoveredPublicSignalEndpoint, InstallCliArgs, PeerAnnouncement,
+        UninstallCliArgs, WireGuardPeerStatus, build_runtime_magic_dns_records,
+        can_reuse_active_listen_port, daemon_control_file_path, daemon_pids_from_ps_output,
         daemon_reconnect_backoff_delay, default_cli_install_path, endpoint_with_listen_port,
         install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
         kill_error_requires_control_fallback, linux_service_status_from_show_output,
         macos_service_disabled_from_print_disabled_output, parse_nonzero_pid,
-        pending_tunnel_heartbeat_ips, publish_error_requires_reconnect, request_daemon_reload,
-        request_daemon_stop, runtime_local_signal_endpoint, take_daemon_control_request,
-        uninstall_cli, utun_interface_candidates, windows_service_status_from_query_output,
+        pending_tunnel_heartbeat_ips, public_endpoint_for_listen_port,
+        publish_error_requires_reconnect, request_daemon_reload, request_daemon_stop,
+        runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
+        utun_interface_candidates, windows_service_status_from_query_output,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -5518,6 +5585,47 @@ mod tests {
             ),
             "93.184.216.34:52000"
         );
+    }
+
+    #[test]
+    fn public_endpoint_for_listen_port_requires_matching_discovery_port() {
+        let endpoint = DiscoveredPublicSignalEndpoint {
+            listen_port: 51820,
+            endpoint: "198.51.100.20:43127".to_string(),
+        };
+
+        assert_eq!(
+            public_endpoint_for_listen_port(Some(&endpoint), 51820),
+            Some("198.51.100.20:43127".to_string())
+        );
+        assert_eq!(
+            public_endpoint_for_listen_port(Some(&endpoint), 51821),
+            None
+        );
+    }
+
+    #[test]
+    fn reuses_running_listen_port_without_rebind() {
+        assert!(can_reuse_active_listen_port(true, true, Some(51820), 51820));
+        assert!(!can_reuse_active_listen_port(
+            true,
+            true,
+            Some(51820),
+            51821
+        ));
+        assert!(!can_reuse_active_listen_port(
+            false,
+            true,
+            Some(51820),
+            51820
+        ));
+        assert!(!can_reuse_active_listen_port(
+            true,
+            false,
+            Some(51820),
+            51820
+        ));
+        assert!(!can_reuse_active_listen_port(true, true, None, 51820));
     }
 
     #[test]
