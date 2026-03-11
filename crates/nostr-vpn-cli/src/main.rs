@@ -6253,12 +6253,12 @@ fn query_service_status() -> Result<ServiceStatusView> {
 
     #[cfg(target_os = "linux")]
     {
-        return linux_query_service_status();
+        linux_query_service_status()
     }
 
     #[cfg(target_os = "windows")]
     {
-        return windows_query_service_status();
+        windows_query_service_status()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
