@@ -81,6 +81,8 @@ pub struct AppConfig {
     pub launch_on_startup: bool,
     #[serde(default = "default_autoconnect")]
     pub autoconnect: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub exit_node: String,
     #[serde(default = "default_close_to_tray_on_close")]
     pub close_to_tray_on_close: bool,
     #[serde(default = "default_magic_dns_suffix")]
@@ -135,6 +137,7 @@ impl Default for AppConfig {
             lan_discovery_enabled: default_lan_discovery_enabled(),
             launch_on_startup: default_launch_on_startup(),
             autoconnect: default_autoconnect(),
+            exit_node: String::new(),
             close_to_tray_on_close: default_close_to_tray_on_close(),
             magic_dns_suffix: default_magic_dns_suffix(),
             peer_aliases: default_peer_aliases(),
@@ -272,6 +275,12 @@ impl AppConfig {
         }
 
         self.ensure_nostr_identity();
+        self.exit_node = normalize_nostr_pubkey(self.exit_node.trim()).unwrap_or_default();
+        if let Ok(own_pubkey) = self.own_nostr_pubkey_hex()
+            && self.exit_node == own_pubkey
+        {
+            self.exit_node.clear();
+        }
 
         if self.networks.is_empty() {
             self.networks.push(NetworkConfig {

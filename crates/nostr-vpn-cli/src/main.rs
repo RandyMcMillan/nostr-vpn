@@ -3,6 +3,8 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(target_os = "linux")]
+use std::net::ToSocketAddrs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -456,6 +458,8 @@ struct SetArgs {
     #[arg(long = "participant")]
     participants: Vec<String>,
     #[arg(long)]
+    exit_node: Option<String>,
+    #[arg(long)]
     advertise_routes: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     advertise_exit_node: Option<bool>,
@@ -761,6 +765,11 @@ async fn main() -> Result<()> {
                         "node_id": app.node.id,
                         "tunnel_ip": app.node.tunnel_ip,
                         "endpoint": app.node.endpoint,
+                        "exit_node": if app.exit_node.is_empty() {
+                            None::<String>
+                        } else {
+                            Some(app.exit_node.clone())
+                        },
                         "advertise_exit_node": app.node.advertise_exit_node,
                         "advertised_routes": app.node.advertised_routes,
                         "effective_advertised_routes": app.effective_advertised_routes(),
@@ -780,6 +789,11 @@ async fn main() -> Result<()> {
                 println!("node: {}", app.node.id);
                 println!("tunnel_ip: {}", app.node.tunnel_ip);
                 println!("endpoint: {}", app.node.endpoint);
+                if app.exit_node.is_empty() {
+                    println!("exit_node: none");
+                } else {
+                    println!("exit_node: {}", app.exit_node);
+                }
                 println!("advertise_exit_node: {}", app.node.advertise_exit_node);
                 let effective_routes = app.effective_advertised_routes();
                 if effective_routes.is_empty() {
@@ -849,6 +863,9 @@ async fn main() -> Result<()> {
             }
             if let Some(value) = args.listen_port {
                 app.node.listen_port = value;
+            }
+            if let Some(value) = args.exit_node {
+                app.exit_node = parse_exit_node_arg(&value)?.unwrap_or_default();
             }
             if let Some(value) = args.advertise_routes {
                 app.node.advertised_routes = parse_advertised_routes_arg(&value)?;
@@ -1394,7 +1411,7 @@ async fn discover_peers(
 struct TunnelPeer {
     pubkey_hex: String,
     endpoint: String,
-    allowed_ip: String,
+    allowed_ips: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1592,6 +1609,20 @@ struct CliTunnelRuntime {
     uapi_socket_path: Option<String>,
     last_fingerprint: Option<String>,
     active_listen_port: Option<u16>,
+    #[cfg(target_os = "linux")]
+    endpoint_bypass_routes: Vec<String>,
+    #[cfg(target_os = "linux")]
+    exit_node_runtime: LinuxExitNodeRuntime,
+    #[cfg(target_os = "linux")]
+    original_default_route: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Default)]
+struct LinuxExitNodeRuntime {
+    outbound_iface: Option<String>,
+    tunnel_source_cidr: Option<String>,
+    ip_forward_was_enabled: Option<bool>,
 }
 
 impl CliTunnelRuntime {
@@ -1602,6 +1633,12 @@ impl CliTunnelRuntime {
             uapi_socket_path: None,
             last_fingerprint: None,
             active_listen_port: None,
+            #[cfg(target_os = "linux")]
+            endpoint_bypass_routes: Vec::new(),
+            #[cfg(target_os = "linux")]
+            exit_node_runtime: LinuxExitNodeRuntime::default(),
+            #[cfg(target_os = "linux")]
+            original_default_route: None,
         }
     }
 
@@ -1710,6 +1747,24 @@ impl CliTunnelRuntime {
         }
 
         let local_address = local_interface_address_for_tunnel(&app.node.tunnel_ip);
+        let route_targets = route_targets_for_tunnel_peers(&peers);
+        #[cfg(target_os = "linux")]
+        if route_targets.iter().any(|route| route == "0.0.0.0/0") {
+            self.capture_linux_original_default_route();
+        } else {
+            self.restore_linux_original_default_route();
+        }
+        #[cfg(target_os = "linux")]
+        let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
+            linux_bypass_route_specs(
+                app,
+                &peers,
+                &self.iface,
+                self.original_default_route.as_deref(),
+            )?
+        } else {
+            Vec::new()
+        };
         let fingerprint = tunnel_fingerprint(
             &self.iface,
             &app.node.private_key,
@@ -1805,17 +1860,25 @@ impl CliTunnelRuntime {
         wg_set(socket, "replace_peers=true")?;
 
         for peer in &peers {
+            let mut body = format!(
+                "public_key={}\nendpoint={}\nreplace_allowed_ips=true",
+                peer.pubkey_hex, peer.endpoint
+            );
+            for allowed_ip in &peer.allowed_ips {
+                body.push_str(&format!("\nallowed_ip={allowed_ip}"));
+            }
+            body.push_str("\npersistent_keepalive_interval=5");
             wg_set(
                 socket,
-                &format!(
-                    "public_key={}\nendpoint={}\nreplace_allowed_ips=true\nallowed_ip={}\npersistent_keepalive_interval=5",
-                    peer.pubkey_hex, peer.endpoint, peer.allowed_ip
-                ),
+                &body,
             )?;
         }
 
-        let route_targets = route_targets_for_tunnel_peers(&peers);
         apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
+        #[cfg(target_os = "linux")]
+        self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
+        #[cfg(target_os = "linux")]
+        self.reconcile_linux_exit_node_forwarding(app);
 
         let applied_fingerprint = tunnel_fingerprint(
             &self.iface,
@@ -1841,6 +1904,12 @@ impl CliTunnelRuntime {
     }
 
     fn stop(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            self.reconcile_linux_endpoint_bypass_routes(&[]);
+            self.reconcile_linux_exit_node_forwarding_cleanup();
+            self.restore_linux_original_default_route();
+        }
         self.handle = None;
         self.uapi_socket_path = None;
         self.last_fingerprint = None;
@@ -1849,6 +1918,239 @@ impl CliTunnelRuntime {
 
     fn listen_port(&self, configured: u16) -> u16 {
         self.active_listen_port.unwrap_or(configured)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_linux_original_default_route(&mut self) {
+        if self.original_default_route.is_some() {
+            return;
+        }
+
+        let default_route = match linux_default_route() {
+            Ok(route) => route,
+            Err(error) => {
+                eprintln!("exit-node: failed to snapshot default route: {error}");
+                return;
+            }
+        };
+
+        if default_route.dev != self.iface {
+            self.original_default_route = Some(default_route.line);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn restore_linux_original_default_route(&mut self) {
+        let Some(route) = self.original_default_route.as_deref() else {
+            return;
+        };
+        if let Err(error) = restore_linux_default_route(route) {
+            eprintln!("exit-node: failed to restore default route '{route}': {error}");
+            return;
+        }
+        self.original_default_route = None;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_linux_endpoint_bypass_routes(&mut self, routes: &[LinuxEndpointBypassRoute]) {
+        let desired = routes
+            .iter()
+            .map(|route| route.target.clone())
+            .collect::<HashSet<_>>();
+
+        let stale = self
+            .endpoint_bypass_routes
+            .iter()
+            .filter(|route| !desired.contains(*route))
+            .cloned()
+            .collect::<Vec<_>>();
+        for route in stale {
+            if let Err(error) = delete_linux_endpoint_bypass_route(&route) {
+                eprintln!("tunnel: failed to remove endpoint bypass route {route}: {error}");
+            }
+        }
+
+        for route in routes {
+            if let Err(error) = apply_linux_endpoint_bypass_route(route) {
+                eprintln!(
+                    "tunnel: failed to install endpoint bypass route {}: {}",
+                    route.target, error
+                );
+            }
+        }
+
+        self.endpoint_bypass_routes = desired.into_iter().collect();
+        self.endpoint_bypass_routes.sort();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_linux_exit_node_forwarding(&mut self, app: &AppConfig) {
+        if !app
+            .effective_advertised_routes()
+            .iter()
+            .any(|route| route == "0.0.0.0/0")
+        {
+            self.reconcile_linux_exit_node_forwarding_cleanup();
+            return;
+        }
+
+        let Some(tunnel_source_cidr) = linux_exit_node_source_cidr(&app.node.tunnel_ip) else {
+            eprintln!("exit-node: invalid IPv4 tunnel address '{}'", app.node.tunnel_ip);
+            self.reconcile_linux_exit_node_forwarding_cleanup();
+            return;
+        };
+
+        let outbound_iface = match linux_default_route() {
+            Ok(route) => route.dev,
+            Err(error) => {
+                eprintln!("exit-node: failed to resolve default IPv4 route device: {error}");
+                self.reconcile_linux_exit_node_forwarding_cleanup();
+                return;
+            }
+        };
+
+        let already_configured = self.exit_node_runtime.outbound_iface.as_deref()
+            == Some(outbound_iface.as_str())
+            && self.exit_node_runtime.tunnel_source_cidr.as_deref()
+                == Some(tunnel_source_cidr.as_str());
+        if already_configured {
+            return;
+        }
+
+        self.reconcile_linux_exit_node_forwarding_cleanup();
+
+        match read_linux_ip_forward() {
+            Ok(previous) => {
+                self.exit_node_runtime.ip_forward_was_enabled = Some(previous);
+                if !previous && let Err(error) = write_linux_ip_forward(true) {
+                    eprintln!("exit-node: failed to enable IPv4 forwarding: {error}");
+                    self.reconcile_linux_exit_node_forwarding_cleanup();
+                    return;
+                }
+            }
+            Err(error) => {
+                eprintln!("exit-node: failed to read IPv4 forwarding state: {error}");
+                return;
+            }
+        }
+
+        let forward_in = [
+            "FORWARD",
+            "-i",
+            self.iface.as_str(),
+            "-m",
+            "comment",
+            "--comment",
+            "nvpn-exit-forward-in",
+            "-j",
+            "ACCEPT",
+        ];
+        let forward_out = [
+            "FORWARD",
+            "-o",
+            self.iface.as_str(),
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "RELATED,ESTABLISHED",
+            "-m",
+            "comment",
+            "--comment",
+            "nvpn-exit-forward-out",
+            "-j",
+            "ACCEPT",
+        ];
+        let masquerade = [
+            "POSTROUTING",
+            "-o",
+            outbound_iface.as_str(),
+            "-s",
+            tunnel_source_cidr.as_str(),
+            "-m",
+            "comment",
+            "--comment",
+            "nvpn-exit-masq",
+            "-j",
+            "MASQUERADE",
+        ];
+
+        if let Err(error) = linux_iptables_ensure_rule(None, &forward_in)
+            .and_then(|()| linux_iptables_ensure_rule(None, &forward_out))
+            .and_then(|()| linux_iptables_ensure_rule(Some("nat"), &masquerade))
+        {
+            eprintln!("exit-node: failed to install iptables rules: {error}");
+            self.reconcile_linux_exit_node_forwarding_cleanup();
+            return;
+        }
+
+        self.exit_node_runtime.outbound_iface = Some(outbound_iface);
+        self.exit_node_runtime.tunnel_source_cidr = Some(tunnel_source_cidr);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconcile_linux_exit_node_forwarding_cleanup(&mut self) {
+        if let (Some(outbound_iface), Some(tunnel_source_cidr)) = (
+            self.exit_node_runtime.outbound_iface.as_deref(),
+            self.exit_node_runtime.tunnel_source_cidr.as_deref(),
+        ) {
+            let forward_in = [
+                "FORWARD",
+                "-i",
+                self.iface.as_str(),
+                "-m",
+                "comment",
+                "--comment",
+                "nvpn-exit-forward-in",
+                "-j",
+                "ACCEPT",
+            ];
+            let forward_out = [
+                "FORWARD",
+                "-o",
+                self.iface.as_str(),
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-m",
+                "comment",
+                "--comment",
+                "nvpn-exit-forward-out",
+                "-j",
+                "ACCEPT",
+            ];
+            let masquerade = [
+                "POSTROUTING",
+                "-o",
+                outbound_iface,
+                "-s",
+                tunnel_source_cidr,
+                "-m",
+                "comment",
+                "--comment",
+                "nvpn-exit-masq",
+                "-j",
+                "MASQUERADE",
+            ];
+
+            if let Err(error) = linux_iptables_delete_rule(Some("nat"), &masquerade) {
+                eprintln!("exit-node: failed to remove masquerade rule: {error}");
+            }
+            if let Err(error) = linux_iptables_delete_rule(None, &forward_out) {
+                eprintln!("exit-node: failed to remove forward-out rule: {error}");
+            }
+            if let Err(error) = linux_iptables_delete_rule(None, &forward_in) {
+                eprintln!("exit-node: failed to remove forward-in rule: {error}");
+            }
+        }
+
+        if self.exit_node_runtime.ip_forward_was_enabled == Some(false)
+            && let Err(error) = write_linux_ip_forward(false)
+        {
+            eprintln!("exit-node: failed to restore IPv4 forwarding state: {error}");
+        }
+
+        self.exit_node_runtime = LinuxExitNodeRuntime::default();
     }
 }
 
@@ -2057,6 +2359,120 @@ fn announcement_fingerprint(announcement: &PeerAnnouncement) -> String {
     .join("|")
 }
 
+fn parse_exit_node_arg(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "off" | "none" | "disable" | "disabled" | "clear"
+        )
+    {
+        return Ok(None);
+    }
+
+    normalize_nostr_pubkey(value).map(Some)
+}
+
+fn is_exit_node_route(route: &str) -> bool {
+    route == "0.0.0.0/0" || route == "::/0"
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn route_is_host_route(route: &str) -> bool {
+    let Some((host, bits)) = route.split_once('/') else {
+        return true;
+    };
+    let Ok(bits) = bits.parse::<u8>() else {
+        return false;
+    };
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => bits == 32,
+        Ok(IpAddr::V6(_)) => bits == 128,
+        Err(_) => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn route_targets_require_endpoint_bypass(route_targets: &[String]) -> bool {
+    route_targets.iter().any(|route| !route_is_host_route(route))
+}
+
+fn normalized_peer_ipv4_routes(announcement: &PeerAnnouncement) -> Vec<String> {
+    let mut routes = Vec::new();
+    let mut seen = HashSet::new();
+
+    for route in &announcement.advertised_routes {
+        let Some(route) = normalize_advertised_route(route) else {
+            continue;
+        };
+        if strip_cidr(&route).parse::<Ipv4Addr>().is_err() {
+            continue;
+        }
+        if seen.insert(route.clone()) {
+            routes.push(route);
+        }
+    }
+
+    routes
+}
+
+fn selected_exit_node_participant(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+) -> Option<String> {
+    if app.exit_node.is_empty() || Some(app.exit_node.as_str()) == own_pubkey {
+        return None;
+    }
+
+    let announcement = peer_announcements.get(&app.exit_node)?;
+    normalized_peer_ipv4_routes(announcement)
+        .iter()
+        .any(|route| route == "0.0.0.0/0")
+        .then(|| app.exit_node.clone())
+}
+
+fn advertised_route_assignments(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+) -> HashMap<String, Vec<String>> {
+    let selected_exit_node = selected_exit_node_participant(app, own_pubkey, peer_announcements);
+    let mut route_owner = HashMap::<String, String>::new();
+
+    for participant in app
+        .participant_pubkeys_hex()
+        .iter()
+        .filter(|participant| Some(participant.as_str()) != own_pubkey)
+    {
+        let Some(announcement) = peer_announcements.get(participant) else {
+            continue;
+        };
+
+        for route in normalized_peer_ipv4_routes(announcement) {
+            if is_exit_node_route(&route)
+                && selected_exit_node.as_deref() != Some(participant.as_str())
+            {
+                continue;
+            }
+            route_owner.entry(route).or_insert_with(|| participant.clone());
+        }
+    }
+
+    let mut assignments = HashMap::<String, Vec<String>>::new();
+    for (route, participant) in route_owner {
+        assignments.entry(participant).or_default().push(route);
+    }
+
+    for routes in assignments.values_mut() {
+        routes.sort();
+        routes.dedup();
+    }
+
+    assignments
+}
+
 fn public_endpoint_for_listen_port(
     public_signal_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
     actual_listen_port: u16,
@@ -2069,17 +2485,23 @@ fn public_endpoint_for_listen_port(
 fn tunnel_peer_from_endpoint(
     announcement: &PeerAnnouncement,
     endpoint: &str,
+    routed_ips: &[String],
 ) -> Result<TunnelPeer> {
     let endpoint: SocketAddr = endpoint
         .parse()
         .with_context(|| format!("invalid peer endpoint {}", endpoint))?;
     let pubkey_hex = key_b64_to_hex(&announcement.public_key)?;
-    let allowed_ip = format!("{}/32", strip_cidr(&announcement.tunnel_ip));
+    let mut allowed_ips = vec![format!("{}/32", strip_cidr(&announcement.tunnel_ip))];
+    for routed_ip in routed_ips {
+        if !allowed_ips.iter().any(|existing| existing == routed_ip) {
+            allowed_ips.push(routed_ip.clone());
+        }
+    }
 
     Ok(TunnelPeer {
         pubkey_hex,
         endpoint: endpoint.to_string(),
-        allowed_ip,
+        allowed_ips,
     })
 }
 
@@ -2399,6 +2821,7 @@ fn planned_tunnel_peers(
     now: u64,
 ) -> Result<Vec<PlannedTunnelPeer>> {
     let configured_participants = app.participant_pubkeys_hex();
+    let route_assignments = advertised_route_assignments(app, own_pubkey, peer_announcements);
     let configured_set = configured_participants
         .iter()
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
@@ -2436,7 +2859,14 @@ fn planned_tunnel_peers(
         peers.push(PlannedTunnelPeer {
             participant: participant.clone(),
             endpoint: selected_endpoint.clone(),
-            peer: tunnel_peer_from_endpoint(announcement, &selected_endpoint)?,
+            peer: tunnel_peer_from_endpoint(
+                announcement,
+                &selected_endpoint,
+                route_assignments
+                    .get(participant)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+            )?,
         });
     }
 
@@ -2769,7 +3199,7 @@ fn build_runtime_magic_dns_records(
 fn route_targets_for_tunnel_peers(peers: &[TunnelPeer]) -> Vec<String> {
     let mut route_targets = peers
         .iter()
-        .map(|peer| peer.allowed_ip.clone())
+        .flat_map(|peer| peer.allowed_ips.iter().cloned())
         .collect::<Vec<_>>();
     route_targets.sort();
     route_targets.dedup();
@@ -2865,7 +3295,14 @@ fn tunnel_fingerprint(
 ) -> String {
     let mut peer_entries = peers
         .iter()
-        .map(|peer| format!("{}|{}|{}", peer.pubkey_hex, peer.endpoint, peer.allowed_ip))
+        .map(|peer| {
+            format!(
+                "{}|{}|{}",
+                peer.pubkey_hex,
+                peer.endpoint,
+                peer.allowed_ips.join(",")
+            )
+        })
         .collect::<Vec<_>>();
     peer_entries.sort();
     format!(
@@ -6157,6 +6594,384 @@ fn parse_advertised_routes_arg(value: &str) -> Result<Vec<String>> {
     Ok(routes)
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinuxRouteGetSpec {
+    gateway: Option<String>,
+    dev: String,
+    src: Option<String>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_default_route_device_from_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        tokens
+            .windows(2)
+            .find(|window| window[0] == "dev")
+            .map(|window| window[1].to_string())
+    })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_route_get_spec_from_output(output: &str) -> Option<LinuxRouteGetSpec> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?.trim();
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+
+    let mut gateway = None;
+    let mut dev = None;
+    let mut src = None;
+    let mut index = 0;
+    while index < tokens.len() {
+        match tokens[index] {
+            "via" => {
+                gateway = tokens.get(index + 1).map(|value| (*value).to_string());
+                index += 2;
+            }
+            "dev" => {
+                dev = tokens.get(index + 1).map(|value| (*value).to_string());
+                index += 2;
+            }
+            "src" => {
+                src = tokens.get(index + 1).map(|value| (*value).to_string());
+                index += 2;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+
+    Some(LinuxRouteGetSpec {
+        gateway,
+        dev: dev?,
+        src,
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct LinuxEndpointBypassRoute {
+    target: String,
+    gateway: Option<String>,
+    dev: String,
+    src: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct LinuxDefaultRouteSpec {
+    line: String,
+    dev: String,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_route_from_output(output: &str) -> Option<LinuxDefaultRouteSpec> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?.trim();
+    Some(LinuxDefaultRouteSpec {
+        line: line.to_string(),
+        dev: linux_default_route_device_from_output(line)?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn command_stdout_checked(command: &mut ProcessCommand) -> Result<String> {
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute {display}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow!(
+            "command failed: {display}\nstdout: {}\nstderr: {}",
+            stdout.trim(),
+            stderr.trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_default_route() -> Result<LinuxDefaultRouteSpec> {
+    let output = command_stdout_checked(
+        ProcessCommand::new("ip")
+            .arg("-4")
+            .arg("route")
+            .arg("show")
+            .arg("default"),
+    )?;
+    linux_default_route_from_output(&output)
+        .ok_or_else(|| anyhow!("failed to resolve default IPv4 route"))
+}
+
+#[cfg(target_os = "linux")]
+fn restore_linux_default_route(route: &str) -> Result<()> {
+    let mut command = ProcessCommand::new("ip");
+    command.arg("-4").arg("route").arg("replace");
+    for token in route.split_whitespace() {
+        command.arg(token);
+    }
+    run_checked(&mut command)
+}
+
+#[cfg(target_os = "linux")]
+fn relay_bypass_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
+    let mut hosts = app
+        .nostr
+        .relays
+        .iter()
+        .flat_map(|relay| relay_ipv4_hosts(relay))
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+#[cfg(target_os = "linux")]
+fn relay_ipv4_hosts(relay: &str) -> Vec<Ipv4Addr> {
+    let Some((host, port)) = relay_host_port(relay) else {
+        return Vec::new();
+    };
+
+    if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        return vec![ip];
+    }
+
+    if host.parse::<IpAddr>().is_ok() {
+        return Vec::new();
+    }
+
+    (host.as_str(), port)
+        .to_socket_addrs()
+        .map(|addrs| {
+            addrs
+                .filter_map(|addr| match addr.ip() {
+                    IpAddr::V4(ip) => Some(ip),
+                    IpAddr::V6(_) => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn relay_host_port(relay: &str) -> Option<(String, u16)> {
+    let relay = relay.trim();
+    if relay.is_empty() {
+        return None;
+    }
+
+    let (scheme, remainder) = relay
+        .split_once("://")
+        .map_or(("", relay), |(scheme, rest)| (scheme, rest));
+    let authority = remainder.split('/').next().unwrap_or(remainder);
+    let default_port = match scheme {
+        "wss" | "https" => 443,
+        _ => 80,
+    };
+
+    split_host_port(authority, default_port)
+}
+
+#[cfg(target_os = "linux")]
+fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after_host) = rest.split_once(']')?;
+        let port = after_host
+            .strip_prefix(':')
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((host.to_string(), port));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !host.contains(':') && !host.is_empty() && port.parse::<u16>().is_ok() =>
+        {
+            Some((host.to_string(), port.parse::<u16>().ok()?))
+        }
+        _ => Some((authority.to_string(), default_port)),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bypass_route_specs(
+    app: &AppConfig,
+    peers: &[TunnelPeer],
+    tunnel_iface: &str,
+    original_default_route: Option<&str>,
+) -> Result<Vec<LinuxEndpointBypassRoute>> {
+    let mut hosts = peers
+        .iter()
+        .filter_map(|peer| match endpoint_host_ip(&peer.endpoint) {
+            Some(IpAddr::V4(ip)) => Some(ip),
+            _ => None,
+        })
+        .chain(relay_bypass_ipv4_hosts(app))
+        .collect::<Vec<_>>();
+    hosts.sort_unstable();
+    hosts.dedup();
+
+    let mut routes = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let output = command_stdout_checked(
+            ProcessCommand::new("ip")
+                .arg("-4")
+                .arg("route")
+                .arg("get")
+                .arg(host.to_string()),
+        )?;
+        let spec = linux_route_get_spec_from_output(&output)
+            .and_then(|spec| {
+                if spec.dev == tunnel_iface {
+                    None
+                } else {
+                    Some(spec)
+                }
+            })
+            .or_else(|| {
+                original_default_route
+                    .and_then(linux_route_get_spec_from_output)
+                    .filter(|spec| spec.dev != tunnel_iface)
+            })
+            .ok_or_else(|| anyhow!("failed to resolve bypass route for {host}"))?;
+        routes.push(LinuxEndpointBypassRoute {
+            target: format!("{host}/32"),
+            gateway: spec.gateway,
+            dev: spec.dev,
+            src: spec.src,
+        });
+    }
+
+    Ok(routes)
+}
+
+#[cfg(target_os = "linux")]
+fn apply_linux_endpoint_bypass_route(route: &LinuxEndpointBypassRoute) -> Result<()> {
+    let mut command = ProcessCommand::new("ip");
+    command
+        .arg("-4")
+        .arg("route")
+        .arg("replace")
+        .arg(&route.target);
+    if let Some(gateway) = route.gateway.as_deref() {
+        command.arg("via").arg(gateway);
+    }
+    command.arg("dev").arg(&route.dev);
+    if let Some(src) = route.src.as_deref() {
+        command.arg("src").arg(src);
+    }
+    run_checked(&mut command)
+}
+
+#[cfg(target_os = "linux")]
+fn delete_linux_endpoint_bypass_route(target: &str) -> Result<()> {
+    run_checked(
+        ProcessCommand::new("ip")
+            .arg("-4")
+            .arg("route")
+            .arg("del")
+            .arg(target),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_ip_forward() -> Result<bool> {
+    Ok(fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .context("failed to read /proc/sys/net/ipv4/ip_forward")?
+        .trim()
+        == "1")
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_ip_forward(enabled: bool) -> Result<()> {
+    fs::write(
+        "/proc/sys/net/ipv4/ip_forward",
+        if enabled { "1" } else { "0" },
+    )
+    .context("failed to write /proc/sys/net/ipv4/ip_forward")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_exit_node_source_cidr(tunnel_ip: &str) -> Option<String> {
+    let mut octets = strip_cidr(tunnel_ip).parse::<Ipv4Addr>().ok()?.octets();
+    octets[3] = 0;
+    Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_iptables_rule_exists(table: Option<&str>, rule: &[&str]) -> Result<bool> {
+    let mut command = ProcessCommand::new("iptables");
+    if let Some(table) = table {
+        command.arg("-t").arg(table);
+    }
+    command.arg("-C");
+    for arg in rule {
+        command.arg(arg);
+    }
+
+    let display = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("failed to execute {display}"))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(anyhow!(
+        "command failed: {display}\nstdout: {}\nstderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_iptables_ensure_rule(table: Option<&str>, rule: &[&str]) -> Result<()> {
+    if linux_iptables_rule_exists(table, rule)? {
+        return Ok(());
+    }
+
+    let mut command = ProcessCommand::new("iptables");
+    if let Some(table) = table {
+        command.arg("-t").arg(table);
+    }
+    command.arg("-A");
+    for arg in rule {
+        command.arg(arg);
+    }
+    run_checked(&mut command)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_iptables_delete_rule(table: Option<&str>, rule: &[&str]) -> Result<()> {
+    if !linux_iptables_rule_exists(table, rule)? {
+        return Ok(());
+    }
+
+    let mut command = ProcessCommand::new("iptables");
+    if let Some(table) = table {
+        command.arg("-t").arg(table);
+    }
+    command.arg("-D");
+    for arg in rule {
+        command.arg(arg);
+    }
+    run_checked(&mut command)
+}
+
 fn apply_local_interface_network(
     iface: &str,
     address: &str,
@@ -6397,6 +7212,7 @@ fn run_checked(command: &mut ProcessCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use nostr_sdk::prelude::ToBech32;
 
     use crate::unix_timestamp;
 
@@ -6408,15 +7224,17 @@ mod tests {
         connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
         daemon_pids_from_ps_output, daemon_reconnect_backoff_delay, default_cli_install_path,
         endpoint_with_listen_port, install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
-        kill_error_requires_control_fallback, linux_service_status_from_show_output,
+        kill_error_requires_control_fallback, linux_default_route_device_from_output,
+        linux_route_get_spec_from_output, linux_service_status_from_show_output,
         local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, parse_nonzero_pid, peer_has_recent_handshake,
+        nat_punch_targets, parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
         peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
         pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
         persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         public_endpoint_for_listen_port, publish_error_requires_reconnect,
         read_daemon_peer_cache, record_successful_runtime_paths, request_daemon_reload,
         request_daemon_stop, restore_daemon_peer_cache, route_targets_for_tunnel_peers,
+        route_targets_require_endpoint_bypass,
         runtime_local_signal_endpoint, take_daemon_control_request, uninstall_cli,
         utun_interface_candidates, windows_service_status_from_query_output,
         write_daemon_peer_cache, TunnelPeer,
@@ -6431,6 +7249,7 @@ mod tests {
     use nostr_vpn_core::paths::PeerPathBook;
     use nostr_vpn_core::presence::PeerPresenceBook;
     use nostr_vpn_core::signaling::SignalPayload;
+    use nostr_sdk::prelude::Keys;
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -6501,6 +7320,11 @@ mod tests {
             set.get_arguments()
                 .any(|argument| argument.get_long() == Some("advertise-exit-node")),
             "missing --advertise-exit-node on set command"
+        );
+        assert!(
+            set.get_arguments()
+                .any(|argument| argument.get_long() == Some("exit-node")),
+            "missing --exit-node on set command"
         );
     }
 
@@ -6905,24 +7729,50 @@ mod tests {
             TunnelPeer {
                 pubkey_hex: "a".repeat(64),
                 endpoint: "203.0.113.10:51820".to_string(),
-                allowed_ip: "10.44.0.3/32".to_string(),
+                allowed_ips: vec!["10.44.0.3/32".to_string()],
             },
             TunnelPeer {
                 pubkey_hex: "b".repeat(64),
                 endpoint: "203.0.113.11:51820".to_string(),
-                allowed_ip: "10.44.0.2/32".to_string(),
+                allowed_ips: vec!["10.44.0.2/32".to_string(), "10.55.0.0/24".to_string()],
             },
             TunnelPeer {
                 pubkey_hex: "c".repeat(64),
                 endpoint: "203.0.113.12:51820".to_string(),
-                allowed_ip: "10.44.0.2/32".to_string(),
+                allowed_ips: vec!["10.44.0.2/32".to_string()],
             },
         ]);
 
         assert_eq!(
             routes,
-            vec!["10.44.0.2/32".to_string(), "10.44.0.3/32".to_string()]
+            vec![
+                "10.44.0.2/32".to_string(),
+                "10.44.0.3/32".to_string(),
+                "10.55.0.0/24".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn route_targets_detect_when_endpoint_bypass_is_required() {
+        assert!(!route_targets_require_endpoint_bypass(&["10.44.0.2/32".to_string()]));
+        assert!(route_targets_require_endpoint_bypass(&["10.55.0.0/24".to_string()]));
+        assert!(route_targets_require_endpoint_bypass(&["0.0.0.0/0".to_string()]));
+    }
+
+    #[test]
+    fn parse_exit_node_arg_normalizes_and_clears() {
+        let peer = Keys::generate();
+        let peer_hex = peer.public_key().to_hex();
+        let peer_npub = peer.public_key().to_bech32().expect("peer npub");
+
+        assert_eq!(
+            parse_exit_node_arg(&peer_npub).expect("parse exit node"),
+            Some(peer_hex)
+        );
+        assert_eq!(parse_exit_node_arg("off").expect("clear"), None);
+        assert_eq!(parse_exit_node_arg("none").expect("clear"), None);
+        assert_eq!(parse_exit_node_arg("").expect("clear"), None);
     }
 
     #[test]
@@ -7003,6 +7853,140 @@ mod tests {
         let updated = build_peer_announcement(&config, 51820, None);
 
         assert_ne!(initial_fingerprint, announcement_fingerprint(&updated));
+    }
+
+    #[test]
+    fn planned_tunnel_peers_assign_selected_exit_node_default_route() {
+        let mut config = AppConfig::generated();
+        let exit_participant = Keys::generate().public_key().to_hex();
+        let routed_participant = Keys::generate().public_key().to_hex();
+        config.networks[0].participants = vec![exit_participant.clone(), routed_participant.clone()];
+        config.exit_node = exit_participant.clone();
+        config.ensure_defaults();
+
+        let announcements = HashMap::from([
+            (
+                exit_participant.clone(),
+                PeerAnnouncement {
+                    node_id: "exit-node".to_string(),
+                    public_key: generate_keypair().public_key,
+                    endpoint: "203.0.113.20:51820".to_string(),
+                    local_endpoint: None,
+                    public_endpoint: Some("203.0.113.20:51820".to_string()),
+                    tunnel_ip: "10.44.0.2/32".to_string(),
+                    advertised_routes: vec![
+                        "10.60.0.0/24".to_string(),
+                        "0.0.0.0/0".to_string(),
+                        "::/0".to_string(),
+                    ],
+                    timestamp: 1,
+                },
+            ),
+            (
+                routed_participant.clone(),
+                PeerAnnouncement {
+                    node_id: "routed-node".to_string(),
+                    public_key: generate_keypair().public_key,
+                    endpoint: "203.0.113.21:51820".to_string(),
+                    local_endpoint: None,
+                    public_endpoint: Some("203.0.113.21:51820".to_string()),
+                    tunnel_ip: "10.44.0.3/32".to_string(),
+                    advertised_routes: vec!["10.70.0.0/24".to_string()],
+                    timestamp: 1,
+                },
+            ),
+        ]);
+
+        let planned = planned_tunnel_peers(
+            &config,
+            None,
+            &announcements,
+            &mut PeerPathBook::default(),
+            Some("192.0.2.10:51820"),
+            10,
+        )
+        .expect("planned tunnel peers");
+
+        let exit_peer = planned
+            .iter()
+            .find(|planned| planned.participant == exit_participant)
+            .expect("exit peer");
+        assert_eq!(
+            exit_peer.peer.allowed_ips,
+            vec![
+                "10.44.0.2/32".to_string(),
+                "0.0.0.0/0".to_string(),
+                "10.60.0.0/24".to_string(),
+            ]
+        );
+
+        let routed_peer = planned
+            .iter()
+            .find(|planned| planned.participant == routed_participant)
+            .expect("routed peer");
+        assert_eq!(
+            routed_peer.peer.allowed_ips,
+            vec!["10.44.0.3/32".to_string(), "10.70.0.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn planned_tunnel_peers_ignore_default_route_without_selected_exit_node() {
+        let mut config = AppConfig::generated();
+        let exit_participant = Keys::generate().public_key().to_hex();
+        config.networks[0].participants = vec![exit_participant.clone()];
+        config.ensure_defaults();
+
+        let announcements = HashMap::from([(
+            exit_participant.clone(),
+            PeerAnnouncement {
+                node_id: "exit-node".to_string(),
+                public_key: generate_keypair().public_key,
+                endpoint: "203.0.113.20:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: Some("203.0.113.20:51820".to_string()),
+                tunnel_ip: "10.44.0.2/32".to_string(),
+                advertised_routes: vec!["0.0.0.0/0".to_string(), "10.60.0.0/24".to_string()],
+                timestamp: 1,
+            },
+        )]);
+
+        let planned = planned_tunnel_peers(
+            &config,
+            None,
+            &announcements,
+            &mut PeerPathBook::default(),
+            Some("192.0.2.10:51820"),
+            10,
+        )
+        .expect("planned tunnel peers");
+
+        assert_eq!(
+            planned[0].peer.allowed_ips,
+            vec!["10.44.0.2/32".to_string(), "10.60.0.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn linux_default_route_device_parser_extracts_interface() {
+        assert_eq!(
+            linux_default_route_device_from_output(
+                "default via 198.19.242.2 dev eth0 proto static\n"
+            ),
+            Some("eth0".to_string())
+        );
+    }
+
+    #[test]
+    fn linux_route_get_parser_extracts_gateway_interface_and_source() {
+        let spec = linux_route_get_spec_from_output(
+            "10.254.241.10 via 198.19.242.2 dev eth0 src 198.19.242.3 uid 0\n    cache\n",
+        )
+        .expect("linux route get spec");
+
+        assert_eq!(spec.gateway.as_deref(), Some("198.19.242.2"));
+        assert_eq!(spec.dev, "eth0");
+        assert_eq!(spec.src.as_deref(), Some("198.19.242.3"));
     }
 
     #[test]

@@ -66,6 +66,7 @@ export interface UiState {
   endpoint: string
   tunnelIp: string
   listenPort: number
+  exitNode: string
   advertiseExitNode: boolean
   advertisedRoutes: string[]
   effectiveAdvertisedRoutes: string[]
@@ -90,6 +91,7 @@ export interface SettingsPatch {
   endpoint?: string
   tunnelIp?: string
   listenPort?: number
+  exitNode?: string
   advertiseExitNode?: boolean
   advertisedRoutes?: string
   magicDnsSuffix?: string

@@ -64,6 +64,7 @@ const mockState: UiState = {
   endpoint: '192.168.1.4:51820',
   tunnelIp: '10.44.0.1/32',
   listenPort: 51820,
+  exitNode: '',
   advertiseExitNode: false,
   advertisedRoutes: [],
   effectiveAdvertisedRoutes: [],
@@ -480,6 +481,9 @@ export const updateSettings = (patch: SettingsPatch) =>
         }
         if (patch.listenPort !== undefined) {
           mockState.listenPort = patch.listenPort
+        }
+        if (patch.exitNode !== undefined) {
+          mockState.exitNode = patch.exitNode.trim()
         }
         if (patch.advertiseExitNode !== undefined) {
           mockState.advertiseExitNode = patch.advertiseExitNode

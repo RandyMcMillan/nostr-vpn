@@ -51,6 +51,7 @@ fn generated_config_auto_populates_keys() {
     assert!(config.close_to_tray_on_close);
     assert!(config.nat.enabled);
     assert!(!config.nat.stun_servers.is_empty());
+    assert!(config.exit_node.is_empty());
     assert!(!config.node.advertise_exit_node);
     assert!(config.node.advertised_routes.is_empty());
     assert!(config.effective_advertised_routes().is_empty());
@@ -81,6 +82,20 @@ fn default_routes_promote_to_exit_node_toggle() {
             "::/0".to_string(),
         ]
     );
+}
+
+#[test]
+fn exit_node_normalizes_from_npub() {
+    let peer = Keys::generate();
+    let peer_hex = peer.public_key().to_hex();
+    let peer_npub = peer.public_key().to_bech32().expect("peer npub");
+
+    let mut config = AppConfig::generated();
+    config.exit_node = peer_npub;
+
+    config.ensure_defaults();
+
+    assert_eq!(config.exit_node, peer_hex);
 }
 
 #[test]

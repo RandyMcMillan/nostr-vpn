@@ -232,6 +232,7 @@ struct UiState {
     endpoint: String,
     tunnel_ip: String,
     listen_port: u16,
+    exit_node: String,
     advertise_exit_node: bool,
     advertised_routes: Vec<String>,
     effective_advertised_routes: Vec<String>,
@@ -258,6 +259,7 @@ struct SettingsPatch {
     endpoint: Option<String>,
     tunnel_ip: Option<String>,
     listen_port: Option<u16>,
+    exit_node: Option<String>,
     advertise_exit_node: Option<bool>,
     advertised_routes: Option<String>,
     magic_dns_suffix: Option<String>,
@@ -595,6 +597,11 @@ impl NvpnBackend {
                 return Err(anyhow!("listen port must be > 0"));
             }
             self.config.node.listen_port = listen_port;
+            restart_required = true;
+        }
+
+        if let Some(exit_node) = patch.exit_node {
+            self.config.exit_node = parse_exit_node_input(&exit_node)?;
             restart_required = true;
         }
 
@@ -1956,6 +1963,7 @@ impl NvpnBackend {
             endpoint: self.config.node.endpoint.clone(),
             tunnel_ip: self.config.node.tunnel_ip.clone(),
             listen_port: self.config.node.listen_port,
+            exit_node: self.npub_or_none(&self.config.exit_node).unwrap_or_default(),
             advertise_exit_node: self.config.node.advertise_exit_node,
             advertised_routes: self.config.node.advertised_routes.clone(),
             effective_advertised_routes: self.config.effective_advertised_routes(),
@@ -2022,6 +2030,18 @@ fn peer_offers_exit_node(routes: &[String]) -> bool {
     routes
         .iter()
         .any(|route| route == "0.0.0.0/0" || route == "::/0")
+}
+
+fn parse_exit_node_input(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("none")
+    {
+        return Ok(String::new());
+    }
+
+    normalize_nostr_pubkey(trimmed)
 }
 
 fn parse_advertised_routes_input(value: &str) -> Result<Vec<String>> {
@@ -3013,10 +3033,10 @@ mod tests {
         ConfiguredPeerStatus, PeerPresenceStatus, cli_binary_installed_at, expected_peer_count,
         extract_json_document, gui_requires_service_enable, gui_requires_service_install,
         is_already_running_message, is_mesh_complete, is_not_running_message,
-        parse_advertised_routes_input, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
-        started_from_autostart_args, to_npub, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        parse_advertised_routes_input, parse_exit_node_input, peer_offers_exit_node,
+        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
+        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
+        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3142,6 +3162,30 @@ mod tests {
         assert!(peer_offers_exit_node(&["0.0.0.0/0".to_string()]));
         assert!(peer_offers_exit_node(&["::/0".to_string()]));
         assert!(!peer_offers_exit_node(&["10.0.0.0/24".to_string()]));
+    }
+
+    #[test]
+    fn parse_exit_node_input_normalizes_and_clears() {
+        let peer_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let peer_npub = to_npub(&peer_hex);
+
+        assert_eq!(
+            parse_exit_node_input(&peer_npub).expect("npub exit node should parse"),
+            peer_hex
+        );
+        assert_eq!(
+            parse_exit_node_input("off").expect("off should clear selection"),
+            String::new()
+        );
+        assert_eq!(
+            parse_exit_node_input("none").expect("none should clear selection"),
+            String::new()
+        );
+        assert_eq!(
+            parse_exit_node_input("").expect("empty should clear selection"),
+            String::new()
+        );
     }
 
     #[test]

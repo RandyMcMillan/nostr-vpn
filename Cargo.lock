@@ -3181,6 +3181,7 @@ dependencies = [
  "clap",
  "dirs 6.0.0",
  "hex",
+ "nostr-sdk",
  "nostr-vpn-core",
  "serde",
  "serde_json",

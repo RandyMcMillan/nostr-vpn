@@ -142,10 +142,20 @@ nvpn status --json
 ```bash
 nvpn set --advertise-routes 10.0.0.0/24,192.168.0.0/24
 nvpn set --advertise-exit-node
+nvpn set --exit-node npub1...peer
 ```
 
 This publishes route capability in peer announcements, `status --json`, and the GUI.
-Automatic route consumption by other peers is not enabled yet.
+
+On Linux, selecting an exit node installs `0.0.0.0/0` through that peer, preserves direct
+host routes for relays and the peer endpoint, and enables forwarding/NAT on the advertising
+peer so internet egress works through the mesh.
+
+Clear the selection with:
+
+```bash
+nvpn set --exit-node off
+```
 
 ### 7. Render WireGuard config
 
@@ -249,6 +259,12 @@ Run config-driven CLI connect e2e (same `config.toml` flow GUI uses):
 
 ```bash
 ./scripts/e2e-connect-docker.sh
+```
+
+Run exit-node routing e2e (node B egresses through node A):
+
+```bash
+./scripts/e2e-exit-node-docker.sh
 ```
 
 What it validates:

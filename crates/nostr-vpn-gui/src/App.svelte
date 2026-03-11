@@ -39,6 +39,7 @@
   let endpointDraft = ''
   let tunnelIpDraft = ''
   let listenPortDraft = ''
+  let exitNodeDraft = ''
   let advertisedRoutesDraft = ''
   let magicDnsSuffixDraft = ''
   let draftsInitialized = false
@@ -144,6 +145,30 @@
   const networkHasParticipant = (network: NetworkView, npub: string) =>
     network.participants.some((participant) => participant.npub === npub)
 
+  const exitNodeCandidates = (state: UiState) => {
+    const seen = new Set<string>()
+    const participants: ParticipantView[] = []
+
+    for (const network of state.networks) {
+      for (const participant of network.participants) {
+        if (participant.state === 'local' || seen.has(participant.npub)) {
+          continue
+        }
+        seen.add(participant.npub)
+        participants.push(participant)
+      }
+    }
+
+    return participants
+  }
+
+  const exitNodeOptionLabel = (participant: ParticipantView) => {
+    const base = participant.magicDnsName || short(participant.npub, 18, 12)
+    return participant.offersExitNode
+      ? `${base} (offers exit node)`
+      : `${base} (no exit routes advertised)`
+  }
+
   async function refresh() {
     if (refreshInFlight || actionInFlight) {
       return
@@ -169,6 +194,7 @@
     endpointDraft = state.endpoint
     tunnelIpDraft = state.tunnelIp
     listenPortDraft = String(state.listenPort)
+    exitNodeDraft = state.exitNode
     advertisedRoutesDraft = state.advertisedRoutes.join(', ')
     magicDnsSuffixDraft = state.magicDnsSuffix
     draftsInitialized = true
@@ -212,6 +238,7 @@
     if (!debouncers.has('magicDnsSuffix')) {
       magicDnsSuffixDraft = state.magicDnsSuffix
     }
+    exitNodeDraft = state.exitNode
     if (!debouncers.has('advertisedRoutes')) {
       advertisedRoutesDraft = state.advertisedRoutes.join(', ')
     }
@@ -711,6 +738,9 @@
                 {#if participant.offersExitNode}
                   <span class="badge participant-badge warn">Exit node</span>
                 {/if}
+                {#if state.exitNode === participant.npub}
+                  <span class="badge participant-badge ok">Selected exit</span>
+                {/if}
               </div>
               <button
                 class="btn ghost icon-btn"
@@ -1015,6 +1045,25 @@
       </label>
 
       <div class="field-grid">
+        <label>
+          <span>Use Exit Node</span>
+          <select
+            class="text-input"
+            data-testid="exit-node-select"
+            bind:value={exitNodeDraft}
+            on:change={(event) =>
+              onUpdateSettings({
+                exitNode: (event.currentTarget as HTMLSelectElement).value,
+              })}
+          >
+            <option value="">No exit node</option>
+            {#each exitNodeCandidates(state) as participant}
+              <option value={participant.npub}>{exitNodeOptionLabel(participant)}</option>
+            {/each}
+          </select>
+          <div class="config-path">Only peers marked Exit node will carry default-route traffic.</div>
+        </label>
+
         <label>
           <span>Advertised Routes</span>
           <input

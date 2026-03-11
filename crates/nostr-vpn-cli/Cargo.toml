@@ -23,3 +23,6 @@ nostr-vpn-core = { path = "../nostr-vpn-core" }
 [[bin]]
 name = "nvpn"
 path = "src/main.rs"
+
+[dev-dependencies]
+nostr-sdk.workspace = true
