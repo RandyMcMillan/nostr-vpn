@@ -272,6 +272,6 @@ The release workflow in [`.github/workflows/release.yml`](.github/workflows/rele
 
 - runs on pushed `v*` tags or manual dispatch
 - builds `nvpn` and `nostr-vpn-relay` for Linux and macOS targets
-- builds `nostr-vpn-gui` on selected macOS targets
+- builds `nostr-vpn-gui` on Apple Silicon macOS
 - packages Unix artifacts as `nvpn-<target>.tar.gz` with an `install.sh`
 - supports optional macOS code signing and notarization when the relevant secrets are present
