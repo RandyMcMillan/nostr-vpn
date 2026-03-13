@@ -194,24 +194,32 @@ jobs:
       - name: Install GUI dependencies
         run: pnpm --dir crates/nostr-vpn-gui install --frozen-lockfile
 
-      - name: Validate macOS signing secret completeness (optional)
-        if: ${{ (env.MACOS_SIGNING_IDENTITY != '' || env.MACOS_CERTIFICATE_P12 != '' || env.MACOS_CERTIFICATE_PASSWORD != '') && !(env.MACOS_SIGNING_IDENTITY != '' && env.MACOS_CERTIFICATE_P12 != '' && env.MACOS_CERTIFICATE_PASSWORD != '') }}
+      - name: Validate macOS release secrets
         shell: bash
         run: |
-          echo "macOS signing requires all three secrets or none."
-          echo "Required: MACOS_SIGNING_IDENTITY, MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD"
-          exit 1
+          required=(
+            MACOS_SIGNING_IDENTITY
+            MACOS_CERTIFICATE_P12
+            MACOS_CERTIFICATE_PASSWORD
+            MACOS_NOTARIZE_APPLE_ID
+            MACOS_NOTARIZE_APP_PASSWORD
+            MACOS_NOTARIZE_TEAM_ID
+          )
+          missing=()
 
-      - name: Validate macOS notarization secret completeness (optional)
-        if: ${{ (env.MACOS_NOTARIZE_APPLE_ID != '' || env.MACOS_NOTARIZE_APP_PASSWORD != '' || env.MACOS_NOTARIZE_TEAM_ID != '') && !(env.MACOS_NOTARIZE_APPLE_ID != '' && env.MACOS_NOTARIZE_APP_PASSWORD != '' && env.MACOS_NOTARIZE_TEAM_ID != '') }}
-        shell: bash
-        run: |
-          echo "macOS notarization requires all three secrets or none."
-          echo "Required: MACOS_NOTARIZE_APPLE_ID, MACOS_NOTARIZE_APP_PASSWORD, MACOS_NOTARIZE_TEAM_ID"
-          exit 1
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              missing+=("${name}")
+            fi
+          done
 
-      - name: Install macOS signing certificate (optional)
-        if: ${{ env.MACOS_SIGNING_IDENTITY != '' && env.MACOS_CERTIFICATE_P12 != '' && env.MACOS_CERTIFICATE_PASSWORD != '' }}
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "macOS releases require a signed and notarized app."
+            echo "Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Install macOS signing certificate
         shell: bash
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/nvpn-signing.keychain-db"
@@ -238,8 +246,7 @@ jobs:
       - name: Build macOS app bundle
         run: pnpm --dir crates/nostr-vpn-gui exec tauri build --target aarch64-apple-darwin --bundles app --no-sign --ci
 
-      - name: Code sign macOS app (optional)
-        if: ${{ env.MACOS_SIGNING_IDENTITY != '' && env.MACOS_CERTIFICATE_P12 != '' && env.MACOS_CERTIFICATE_PASSWORD != '' }}
+      - name: Code sign macOS app
         shell: bash
         run: |
           APP_PATH="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
@@ -261,8 +268,7 @@ jobs:
 
           codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
 
-      - name: Notarize macOS app (optional)
-        if: ${{ env.MACOS_SIGNING_IDENTITY != '' && env.MACOS_CERTIFICATE_P12 != '' && env.MACOS_CERTIFICATE_PASSWORD != '' && env.MACOS_NOTARIZE_APPLE_ID != '' && env.MACOS_NOTARIZE_APP_PASSWORD != '' && env.MACOS_NOTARIZE_TEAM_ID != '' }}
+      - name: Notarize macOS app
         shell: bash
         run: |
           APP_PATH="$(find target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
@@ -312,6 +318,24 @@ jobs:
 
           ditto -c -k --sequesterRsrc --keepParent "${APP_PATH}" "dist/nostr-vpn-macos-arm64.zip"
 
+      - name: Verify packaged macOS artifact
+        shell: bash
+        run: |
+          VERIFY_DIR="$RUNNER_TEMP/macos-package-verify"
+          rm -rf "${VERIFY_DIR}"
+          mkdir -p "${VERIFY_DIR}"
+
+          ditto -x -k "dist/nostr-vpn-macos-arm64.zip" "${VERIFY_DIR}"
+
+          APP_PATH="$(find "${VERIFY_DIR}" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "${APP_PATH}" ]; then
+            echo "Packaged zip did not contain a macOS .app bundle"
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "${APP_PATH}"
+          spctl --assess --type execute --verbose=4 "${APP_PATH}"
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -319,8 +343,8 @@ jobs:
           path: dist/nostr-vpn-macos-arm64.zip
           retention-days: 7
 
-      - name: Cleanup macOS signing keychain (optional)
-        if: ${{ always() && env.MACOS_SIGNING_IDENTITY != '' && env.MACOS_CERTIFICATE_P12 != '' && env.MACOS_CERTIFICATE_PASSWORD != '' }}
+      - name: Cleanup macOS signing keychain
+        if: ${{ always() }}
         shell: bash
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/nvpn-signing.keychain-db"
