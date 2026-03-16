@@ -69,6 +69,7 @@ const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
 const MIN_PERSISTED_PATH_CACHE_TIMEOUT_SECS: u64 = 1_800;
 const PERSISTED_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 90;
 const MESH_READY_RELAYS_PAUSED_STATUS: &str = "Mesh ready (relays paused)";
+const WAITING_FOR_PARTICIPANTS_STATUS: &str = "Waiting for participants";
 #[cfg(target_os = "macos")]
 const MACOS_SERVICE_LABEL: &str = "to.nostrvpn.nvpn";
 #[cfg(target_os = "linux")]
@@ -2777,6 +2778,18 @@ fn relay_connection_action(
     }
 }
 
+fn daemon_session_active(session_enabled: bool, expected_peers: usize) -> bool {
+    session_enabled && expected_peers > 0
+}
+
+fn daemon_session_idle_status(session_enabled: bool, expected_peers: usize) -> &'static str {
+    if session_enabled && expected_peers == 0 {
+        WAITING_FOR_PARTICIPANTS_STATUS
+    } else {
+        "Paused"
+    }
+}
+
 fn mesh_ready_for_tunnel_runtime(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -4058,12 +4071,6 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         participants_override.clone(),
     )?;
     let mut configured_participants = app.participant_pubkeys_hex();
-    if configured_participants.is_empty() {
-        return Err(anyhow!(
-            "at least one participant must be configured before running daemon"
-        ));
-    }
-
     let mut relays = resolve_relays(&args.relay, &app);
     let mut own_pubkey = app.own_nostr_pubkey_hex().ok();
     let mut expected_peers = expected_peer_count(&app);
@@ -4089,23 +4096,27 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         configured_participants.clone(),
     )?;
 
-    let restored_peer_cache = match restore_daemon_peer_cache(
-        DaemonPeerCacheRestore {
-            path: &peer_cache_file,
-            app: &app,
-            network_id: &network_id,
-            own_pubkey: own_pubkey.as_deref(),
-            now: unix_timestamp(),
-            announce_interval_secs: args.announce_interval_secs,
-        },
-        &mut presence,
-        &mut path_book,
-    ) {
-        Ok(restored) => restored,
-        Err(error) => {
-            eprintln!("daemon: failed to restore peer cache: {error}");
-            false
+    let restored_peer_cache = if daemon_session_active(true, expected_peers) {
+        match restore_daemon_peer_cache(
+            DaemonPeerCacheRestore {
+                path: &peer_cache_file,
+                app: &app,
+                network_id: &network_id,
+                own_pubkey: own_pubkey.as_deref(),
+                now: unix_timestamp(),
+                announce_interval_secs: args.announce_interval_secs,
+            },
+            &mut presence,
+            &mut path_book,
+        ) {
+            Ok(restored) => restored,
+            Err(error) => {
+                eprintln!("daemon: failed to restore peer cache: {error}");
+                false
+            }
         }
+    } else {
+        false
     };
 
     apply_presence_runtime_update(
@@ -4121,15 +4132,17 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     let runtime_listen_port = tunnel_runtime
         .active_listen_port
         .unwrap_or(app.node.listen_port);
-    refresh_public_signal_endpoint_with_port_mapping(
-        &app,
-        &network_snapshot,
-        runtime_listen_port,
-        &mut port_mapping_runtime,
-        &mut public_signal_endpoint,
-    )
-    .await;
-    if restored_peer_cache {
+    if daemon_session_active(true, expected_peers) {
+        refresh_public_signal_endpoint_with_port_mapping(
+            &app,
+            &network_snapshot,
+            runtime_listen_port,
+            &mut port_mapping_runtime,
+            &mut public_signal_endpoint,
+        )
+        .await;
+    }
+    if restored_peer_cache && daemon_session_active(true, expected_peers) {
         let mut bootstrap_nat_attempt = None;
         if let Err(error) = maybe_run_nat_punch(
             &app,
@@ -4176,7 +4189,9 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
     tokio::pin!(terminate_wait);
 
     let mut session_enabled = true;
-    let mut session_status = if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
+    let mut session_status = if !daemon_session_active(session_enabled, expected_peers) {
+        WAITING_FOR_PARTICIPANTS_STATUS.to_string()
+    } else if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
         "Trying cached mesh before relays".to_string()
     } else {
         "Connecting to relays".to_string()
@@ -4195,7 +4210,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         &state_file,
         &build_daemon_runtime_state(
             &app,
-            session_enabled,
+            daemon_session_active(session_enabled, expected_peers),
             expected_peers,
             &presence,
             &tunnel_runtime,
@@ -4215,7 +4230,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 break;
             }
             _ = reconnect_interval.tick() => {
-                if !session_enabled || relay_connected || Instant::now() < reconnect_due {
+                if !daemon_session_active(session_enabled, expected_peers)
+                    || relay_connected
+                    || Instant::now() < reconnect_due
+                {
                     continue;
                 }
 
@@ -4294,7 +4312,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
             }
             _ = announce_interval.tick() => {
-                if !session_enabled || !relay_connected {
+                if !daemon_session_active(session_enabled, expected_peers) || !relay_connected {
                     continue;
                 }
 
@@ -4341,7 +4359,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
             }
             _ = tunnel_heartbeat_interval.tick() => {
-                if !session_enabled {
+                if !daemon_session_active(session_enabled, expected_peers) {
                     continue;
                 }
 
@@ -4372,40 +4390,51 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 let latest_snapshot = capture_network_snapshot();
                 let runtime_listen_port =
                     tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
+                let session_active = daemon_session_active(session_enabled, expected_peers);
                 let network_changed = latest_snapshot.changed_since(&network_snapshot);
                 let endpoint_changed = if network_changed {
                     network_snapshot = latest_snapshot;
                     network_changed_at = Some(unix_timestamp());
                     captive_portal = detect_captive_portal(timeout).await;
-                    refresh_public_signal_endpoint_with_port_mapping(
-                        &app,
-                        &network_snapshot,
-                        runtime_listen_port,
-                        &mut port_mapping_runtime,
-                        &mut public_signal_endpoint,
-                    )
-                    .await;
-                    true
+                    if session_active {
+                        refresh_public_signal_endpoint_with_port_mapping(
+                            &app,
+                            &network_snapshot,
+                            runtime_listen_port,
+                            &mut port_mapping_runtime,
+                            &mut public_signal_endpoint,
+                        )
+                        .await;
+                        true
+                    } else {
+                        port_mapping_runtime.stop().await;
+                        public_signal_endpoint = None;
+                        false
+                    }
                 } else {
-                    match port_mapping_runtime
-                        .renew_if_due(&network_snapshot, runtime_listen_port, timeout)
-                        .await
-                    {
-                        Ok(changed) => {
-                            if changed {
-                                sync_public_signal_endpoint_from_mapping_or_stun(
-                                    &app,
-                                    runtime_listen_port,
-                                    &port_mapping_runtime,
-                                    &mut public_signal_endpoint,
-                                );
+                    if session_active {
+                        match port_mapping_runtime
+                            .renew_if_due(&network_snapshot, runtime_listen_port, timeout)
+                            .await
+                        {
+                            Ok(changed) => {
+                                if changed {
+                                    sync_public_signal_endpoint_from_mapping_or_stun(
+                                        &app,
+                                        runtime_listen_port,
+                                        &port_mapping_runtime,
+                                        &mut public_signal_endpoint,
+                                    );
+                                }
+                                changed
                             }
-                            changed
+                            Err(error) => {
+                                eprintln!("daemon: port mapping renew failed: {error}");
+                                false
+                            }
                         }
-                        Err(error) => {
-                            eprintln!("daemon: port mapping renew failed: {error}");
-                            false
-                        }
+                    } else {
+                        false
                     }
                 };
 
@@ -4426,10 +4455,12 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         magic_dns_runtime.as_ref(),
                     ) {
                         Ok(()) => {
-                            session_status = if session_enabled {
+                            session_status = if daemon_session_active(session_enabled, expected_peers)
+                            {
                                 "Connected (network refresh)".to_string()
                             } else {
-                                "Paused".to_string()
+                                daemon_session_idle_status(session_enabled, expected_peers)
+                                    .to_string()
                             };
                         }
                         Err(error) => {
@@ -4439,7 +4470,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     }
                 }
 
-                if !session_enabled {
+                if !daemon_session_active(session_enabled, expected_peers) {
                     continue;
                 }
 
@@ -4525,23 +4556,30 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 relay_connected = false;
                                 reconnect_attempt = 0;
                                 reconnect_due = Instant::now();
-                                let restored_peer_cache = match restore_daemon_peer_cache(
-                                    DaemonPeerCacheRestore {
-                                        path: &peer_cache_file,
-                                        app: &app,
-                                        network_id: &network_id,
-                                        own_pubkey: own_pubkey.as_deref(),
-                                        now: unix_timestamp(),
-                                        announce_interval_secs: args.announce_interval_secs,
-                                    },
-                                    &mut presence,
-                                    &mut path_book,
+                                let restored_peer_cache = if daemon_session_active(
+                                    session_enabled,
+                                    expected_peers,
                                 ) {
-                                    Ok(restored) => restored,
-                                    Err(error) => {
-                                        eprintln!("daemon: failed to restore peer cache on resume: {error}");
-                                        false
+                                    match restore_daemon_peer_cache(
+                                        DaemonPeerCacheRestore {
+                                            path: &peer_cache_file,
+                                            app: &app,
+                                            network_id: &network_id,
+                                            own_pubkey: own_pubkey.as_deref(),
+                                            now: unix_timestamp(),
+                                            announce_interval_secs: args.announce_interval_secs,
+                                        },
+                                        &mut presence,
+                                        &mut path_book,
+                                    ) {
+                                        Ok(restored) => restored,
+                                        Err(error) => {
+                                            eprintln!("daemon: failed to restore peer cache on resume: {error}");
+                                            false
+                                        }
                                     }
+                                } else {
+                                    false
                                 };
                                 if let Err(error) = apply_presence_runtime_update(
                                     &app,
@@ -4554,22 +4592,34 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                 ) {
                                     session_status = format!("Resume failed ({error})");
                                 } else {
-                                    let runtime_listen_port =
-                                        tunnel_runtime.active_listen_port.unwrap_or(app.node.listen_port);
-                                    refresh_public_signal_endpoint_with_port_mapping(
-                                        &app,
-                                        &network_snapshot,
-                                        runtime_listen_port,
-                                        &mut port_mapping_runtime,
-                                        &mut public_signal_endpoint,
-                                    )
-                                    .await;
-                                    session_status = if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
-                                        reconnect_due = Instant::now() + Duration::from_secs(DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS);
-                                        "Resuming with cached mesh".to_string()
+                                    if daemon_session_active(session_enabled, expected_peers) {
+                                        let runtime_listen_port = tunnel_runtime
+                                            .active_listen_port
+                                            .unwrap_or(app.node.listen_port);
+                                        refresh_public_signal_endpoint_with_port_mapping(
+                                            &app,
+                                            &network_snapshot,
+                                            runtime_listen_port,
+                                            &mut port_mapping_runtime,
+                                            &mut public_signal_endpoint,
+                                        )
+                                        .await;
+                                        session_status = if restored_peer_cache
+                                            && app.auto_disconnect_relays_when_mesh_ready
+                                        {
+                                            reconnect_due = Instant::now()
+                                                + Duration::from_secs(
+                                                    DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS,
+                                                );
+                                            "Resuming with cached mesh".to_string()
+                                        } else {
+                                            "Resuming".to_string()
+                                        };
                                     } else {
-                                        "Resuming".to_string()
-                                    };
+                                        port_mapping_runtime.stop().await;
+                                        public_signal_endpoint = None;
+                                        session_status = WAITING_FOR_PARTICIPANTS_STATUS.to_string();
+                                    }
                                 }
                             }
                         }
@@ -4581,113 +4631,115 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             ) {
                                 Ok((reloaded_app, _)) => {
                                     let reloaded_participants = reloaded_app.participant_pubkeys_hex();
-                                    if reloaded_participants.is_empty() {
-                                        session_status = "Config reload rejected: no participants configured".to_string();
-                                    } else {
-                                        app = reloaded_app;
-                                        configured_participants = reloaded_participants;
-                                        expected_peers = expected_peer_count(&app);
-                                        own_pubkey = app.own_nostr_pubkey_hex().ok();
-                                        relays = resolve_relays(&args.relay, &app);
+                                    app = reloaded_app;
+                                    configured_participants = reloaded_participants;
+                                    expected_peers = expected_peer_count(&app);
+                                    own_pubkey = app.own_nostr_pubkey_hex().ok();
+                                    relays = resolve_relays(&args.relay, &app);
 
-                                        let configured_set = configured_participants
-                                            .iter()
-                                            .cloned()
-                                            .collect::<HashSet<_>>();
-                                        presence.retain_participants(&configured_set);
-                                        path_book.retain_participants(&configured_set);
-                                        outbound_announces.retain_participants(&configured_set);
-                                        outbound_announces.clear();
-                                        last_nat_punch_attempt = None;
-                                        client.disconnect().await;
-                                        match NostrSignalingClient::from_secret_key(
-                                            network_id.clone(),
-                                            &app.nostr.secret_key,
-                                            configured_participants.clone(),
-                                        ) {
-                                            Ok(new_client) => {
-                                                client = new_client;
-                                                if session_enabled {
-                                                    match client.connect(&relays).await {
-                                                        Ok(()) => {
-                                                            relay_connected = true;
-                                                            reconnect_attempt = 0;
-                                                            reconnect_due = Instant::now();
-                                                            session_status = "Config reloaded".to_string();
-                                                            if let Err(error) = publish_private_announce_to_active_peers(
-                                                                &client,
-                                                                &app,
-                                                                own_pubkey.as_deref(),
-                                                                &presence,
-                                                                &tunnel_runtime,
-                                                                public_signal_endpoint.as_ref(),
-                                                                &mut outbound_announces,
-                                                            ).await {
-                                                                session_status = format!(
-                                                                    "Config reloaded; private announce failed ({})",
-                                                                    error
-                                                                );
-                                                            }
-                                                            if let Err(error) = client.publish(SignalPayload::Hello).await {
-                                                                session_status = format!(
-                                                                    "Config reloaded; hello publish failed ({})",
-                                                                    error
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(error) => {
-                                                            relay_connected = false;
-                                                            reconnect_attempt = reconnect_attempt.saturating_add(1);
-                                                            let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
-                                                            reconnect_due = Instant::now() + delay;
+                                    let configured_set = configured_participants
+                                        .iter()
+                                        .cloned()
+                                        .collect::<HashSet<_>>();
+                                    presence.retain_participants(&configured_set);
+                                    path_book.retain_participants(&configured_set);
+                                    outbound_announces.retain_participants(&configured_set);
+                                    outbound_announces.clear();
+                                    last_nat_punch_attempt = None;
+                                    client.disconnect().await;
+                                    match NostrSignalingClient::from_secret_key(
+                                        network_id.clone(),
+                                        &app.nostr.secret_key,
+                                        configured_participants.clone(),
+                                    ) {
+                                        Ok(new_client) => {
+                                            client = new_client;
+                                            if daemon_session_active(session_enabled, expected_peers) {
+                                                match client.connect(&relays).await {
+                                                    Ok(()) => {
+                                                        relay_connected = true;
+                                                        reconnect_attempt = 0;
+                                                        reconnect_due = Instant::now();
+                                                        session_status = "Config reloaded".to_string();
+                                                        if let Err(error) = publish_private_announce_to_active_peers(
+                                                            &client,
+                                                            &app,
+                                                            own_pubkey.as_deref(),
+                                                            &presence,
+                                                            &tunnel_runtime,
+                                                            public_signal_endpoint.as_ref(),
+                                                            &mut outbound_announces,
+                                                        ).await {
                                                             session_status = format!(
-                                                                "Config reloaded; relay reconnect failed (retry in {}s: {})",
-                                                                delay.as_secs(),
+                                                                "Config reloaded; private announce failed ({})",
+                                                                error
+                                                            );
+                                                        }
+                                                        if let Err(error) = client.publish(SignalPayload::Hello).await {
+                                                            session_status = format!(
+                                                                "Config reloaded; hello publish failed ({})",
                                                                 error
                                                             );
                                                         }
                                                     }
-                                                } else {
-                                                    relay_connected = false;
-                                                    reconnect_attempt = 0;
-                                                    reconnect_due = Instant::now();
-                                                    session_status = "Config reloaded (paused)".to_string();
+                                                    Err(error) => {
+                                                        relay_connected = false;
+                                                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                                                        let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
+                                                        reconnect_due = Instant::now() + delay;
+                                                        session_status = format!(
+                                                            "Config reloaded; relay reconnect failed (retry in {}s: {})",
+                                                            delay.as_secs(),
+                                                            error
+                                                        );
+                                                    }
                                                 }
-                                            }
-                                            Err(error) => {
-                                                session_status = format!(
-                                                    "Config reload failed (signal client init): {}",
-                                                    error
-                                                );
+                                            } else {
+                                                relay_connected = false;
+                                                reconnect_attempt = 0;
+                                                reconnect_due = Instant::now();
+                                                port_mapping_runtime.stop().await;
+                                                public_signal_endpoint = None;
+                                                session_status = if session_enabled {
+                                                    WAITING_FOR_PARTICIPANTS_STATUS.to_string()
+                                                } else {
+                                                    "Config reloaded (paused)".to_string()
+                                                };
                                             }
                                         }
-
-                                        if let Err(error) = apply_presence_runtime_update(
-                                            &app,
-                                            own_pubkey.as_deref(),
-                                            &presence,
-                                            &mut path_book,
-                                            unix_timestamp(),
-                                            &mut tunnel_runtime,
-                                            magic_dns_runtime.as_ref(),
-                                        ) {
+                                        Err(error) => {
                                             session_status = format!(
-                                                "Config reloaded; tunnel update failed ({})",
+                                                "Config reload failed (signal client init): {}",
                                                 error
                                             );
-                                        } else {
-                                            let runtime_listen_port = tunnel_runtime
-                                                .active_listen_port
-                                                .unwrap_or(app.node.listen_port);
-                                            refresh_public_signal_endpoint_with_port_mapping(
-                                                &app,
-                                                &network_snapshot,
-                                                runtime_listen_port,
-                                                &mut port_mapping_runtime,
-                                                &mut public_signal_endpoint,
-                                            )
-                                            .await;
                                         }
+                                    }
+
+                                    if let Err(error) = apply_presence_runtime_update(
+                                        &app,
+                                        own_pubkey.as_deref(),
+                                        &presence,
+                                        &mut path_book,
+                                        unix_timestamp(),
+                                        &mut tunnel_runtime,
+                                        magic_dns_runtime.as_ref(),
+                                    ) {
+                                        session_status = format!(
+                                            "Config reloaded; tunnel update failed ({})",
+                                            error
+                                        );
+                                    } else if daemon_session_active(session_enabled, expected_peers) {
+                                        let runtime_listen_port = tunnel_runtime
+                                            .active_listen_port
+                                            .unwrap_or(app.node.listen_port);
+                                        refresh_public_signal_endpoint_with_port_mapping(
+                                            &app,
+                                            &network_snapshot,
+                                            runtime_listen_port,
+                                            &mut port_mapping_runtime,
+                                            &mut public_signal_endpoint,
+                                        )
+                                        .await;
                                     }
                                 }
                                 Err(error) => {
@@ -4697,7 +4749,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         }
                     }
                 }
-                if session_enabled {
+                if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
                     let removed = presence.prune_stale(
                         now,
@@ -4745,7 +4797,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &tunnel_runtime,
                     unix_timestamp(),
                 );
-                if session_enabled
+                if daemon_session_active(session_enabled, expected_peers)
                     && matches!(
                         relay_connection_action(
                             app.auto_disconnect_relays_when_mesh_ready,
@@ -4779,7 +4831,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     &state_file,
                     &build_daemon_runtime_state(
                         &app,
-                        session_enabled,
+                        daemon_session_active(session_enabled, expected_peers),
                         expected_peers,
                         &presence,
                         &tunnel_runtime,
@@ -4791,7 +4843,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 );
             }
             message = async {
-                if session_enabled && relay_connected {
+                if daemon_session_active(session_enabled, expected_peers) && relay_connected {
                     client.recv().await
                 } else {
                     std::future::pending::<Option<SignalEnvelope>>().await
@@ -4875,10 +4927,10 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     {
                         eprintln!("signal: targeted private announce failed: {error}");
                     }
-                    session_status = if session_enabled {
+                    session_status = if daemon_session_active(session_enabled, expected_peers) {
                         "Connected".to_string()
                     } else {
-                        "Paused".to_string()
+                        daemon_session_idle_status(session_enabled, expected_peers).to_string()
                     };
                 }
 
@@ -5387,12 +5439,14 @@ fn wait_for_daemon_session_active(
     let started = Instant::now();
     while started.elapsed() < timeout {
         if let Ok(status) = daemon_status(config_path) {
-            let current_active = status
-                .state
-                .as_ref()
+            let current_state = status.state.as_ref();
+            let current_active = current_state
                 .map(|state| state.session_active)
                 .unwrap_or(status.running);
-            if current_active == expected_active {
+            let resumed_waiting_for_participants = expected_active
+                && current_state
+                    .is_some_and(|state| state.session_status == WAITING_FOR_PARTICIPANTS_STATUS);
+            if current_active == expected_active || resumed_waiting_for_participants {
                 return Ok(());
             }
         }
@@ -6053,12 +6107,6 @@ fn service_install(args: ServiceInstallArgs) -> Result<()> {
     config.ensure_defaults();
     maybe_autoconfigure_node(&mut config);
     config.save(&config_path)?;
-
-    if config.all_participant_pubkeys_hex().is_empty() {
-        return Err(anyhow!(
-            "configure at least one participant before installing the system service"
-        ));
-    }
 
     let executable = std::env::current_exe().context("failed to resolve current executable")?;
     let executable = fs::canonicalize(&executable)
@@ -8173,20 +8221,20 @@ mod tests {
         announcement_fingerprint, build_peer_announcement, build_runtime_magic_dns_records,
         can_reuse_active_listen_port, connected_peer_count_for_runtime, daemon_control_file_path,
         daemon_peer_cache_file_path, daemon_pids_from_ps_output, daemon_reconnect_backoff_delay,
-        default_cli_install_path, endpoint_with_listen_port, install_cli,
-        is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
-        linux_default_route_device_from_output, linux_exit_node_default_route_families,
-        linux_exit_node_firewall_binary, linux_exit_node_forward_in_rule,
-        linux_exit_node_forward_out_rule, linux_exit_node_ipv4_masquerade_rule,
-        linux_route_get_spec_from_output, linux_service_status_from_show_output,
-        local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
-        peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
-        pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
-        persisted_peer_cache_timeout_secs, planned_tunnel_peers, public_endpoint_for_listen_port,
-        publish_error_requires_reconnect, read_daemon_peer_cache, record_successful_runtime_paths,
-        relay_connection_action, request_daemon_reload, request_daemon_stop,
-        restore_daemon_peer_cache, route_targets_for_tunnel_peers,
+        daemon_session_active, daemon_session_idle_status, default_cli_install_path,
+        endpoint_with_listen_port, install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        kill_error_requires_control_fallback, linux_default_route_device_from_output,
+        linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
+        linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
+        linux_exit_node_ipv4_masquerade_rule, linux_route_get_spec_from_output,
+        linux_service_status_from_show_output, local_interface_address_for_tunnel,
+        macos_service_disabled_from_print_disabled_output, nat_punch_targets, parse_exit_node_arg,
+        parse_nonzero_pid, peer_has_recent_handshake, peer_path_cache_timeout_secs,
+        peer_runtime_lookup, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
+        persisted_path_cache_timeout_secs, persisted_peer_cache_timeout_secs, planned_tunnel_peers,
+        public_endpoint_for_listen_port, publish_error_requires_reconnect, read_daemon_peer_cache,
+        record_successful_runtime_paths, relay_connection_action, request_daemon_reload,
+        request_daemon_stop, restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
         take_daemon_control_request, uninstall_cli, utun_interface_candidates,
         windows_service_status_from_query_output, write_daemon_peer_cache,
@@ -8328,6 +8376,23 @@ mod tests {
             output,
             "missing.service"
         ));
+    }
+
+    #[test]
+    fn daemon_session_requires_remote_participants_to_be_active() {
+        assert!(!daemon_session_active(true, 0));
+        assert!(daemon_session_active(true, 1));
+        assert!(!daemon_session_active(false, 1));
+    }
+
+    #[test]
+    fn daemon_session_idle_status_distinguishes_waiting_from_paused() {
+        assert_eq!(
+            daemon_session_idle_status(true, 0),
+            super::WAITING_FOR_PARTICIPANTS_STATUS
+        );
+        assert_eq!(daemon_session_idle_status(false, 0), "Paused");
+        assert_eq!(daemon_session_idle_status(true, 2), "Paused");
     }
 
     #[test]
@@ -9403,6 +9468,7 @@ mod tests {
             Some("10.44.0.114".to_string())
         );
     }
+
 
     #[test]
     fn daemon_pid_scan_matches_processes_for_config() {
