@@ -37,6 +37,7 @@ const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
 const TRAY_IDENTITY_MENU_ID: &str = "tray_identity";
 const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
+const TRAY_RUN_EXIT_NODE_MENU_ID: &str = "tray_run_exit_node";
 const TRAY_EXIT_NODE_NONE_MENU_ID: &str = "tray_exit_node_none";
 const TRAY_EXIT_NODE_MENU_ID_PREFIX: &str = "tray_exit_node::";
 const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
@@ -327,6 +328,7 @@ struct TrayRuntimeState {
     status_text: String,
     identity_text: String,
     this_device_text: String,
+    advertise_exit_node: bool,
     network_groups: Vec<TrayNetworkGroup>,
     exit_nodes: Vec<TrayExitNodeEntry>,
 }
@@ -340,6 +342,7 @@ impl Default for TrayRuntimeState {
             status_text: "Disconnected".to_string(),
             identity_text: "Identity: unavailable".to_string(),
             this_device_text: "This Device: unavailable".to_string(),
+            advertise_exit_node: false,
             network_groups: Vec::new(),
             exit_nodes: Vec::new(),
         }
@@ -2129,6 +2132,7 @@ impl NvpnBackend {
                 self.config.node_name,
                 display_tunnel_ip(&self.config.node.tunnel_ip)
             ),
+            advertise_exit_node: self.config.node.advertise_exit_node,
             network_groups: tray_network_groups(&networks),
             exit_nodes: tray_exit_node_entries(&networks, &self.config.exit_node),
         }
@@ -2928,12 +2932,21 @@ fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
         }
     }
 
-    let mut exit_node_items = vec![TrayMenuItemSpec::Check {
-        id: TRAY_EXIT_NODE_NONE_MENU_ID.to_string(),
-        text: "None".to_string(),
-        enabled: true,
-        checked: !runtime_state.exit_nodes.iter().any(|entry| entry.selected),
-    }];
+    let mut exit_node_items = vec![
+        TrayMenuItemSpec::Check {
+            id: TRAY_EXIT_NODE_NONE_MENU_ID.to_string(),
+            text: "None".to_string(),
+            enabled: true,
+            checked: !runtime_state.advertise_exit_node
+                && !runtime_state.exit_nodes.iter().any(|entry| entry.selected),
+        },
+        TrayMenuItemSpec::Check {
+            id: TRAY_RUN_EXIT_NODE_MENU_ID.to_string(),
+            text: "Run Exit Node".to_string(),
+            enabled: true,
+            checked: runtime_state.advertise_exit_node,
+        },
+    ];
     exit_node_items.push(TrayMenuItemSpec::Separator);
     if runtime_state.exit_nodes.is_empty() {
         exit_node_items.push(TrayMenuItemSpec::Text {
@@ -3520,6 +3533,20 @@ pub fn run() {
                             });
                             refresh_tray_menu(app);
                         }
+                        TRAY_RUN_EXIT_NODE_MENU_ID => {
+                            let runtime_state = current_tray_runtime_state(app);
+                            run_tray_backend_action(app, |backend| {
+                                backend
+                                    .update_settings(SettingsPatch {
+                                        advertise_exit_node: Some(
+                                            !runtime_state.advertise_exit_node,
+                                        ),
+                                        ..Default::default()
+                                    })
+                                    .context("failed to toggle run exit node setting")
+                            });
+                            refresh_tray_menu(app);
+                        }
                         TRAY_EXIT_NODE_NONE_MENU_ID => {
                             run_tray_backend_action(app, |backend| {
                                 backend
@@ -3625,15 +3652,16 @@ pub fn run() {
 mod tests {
     use super::{
         ConfiguredPeerStatus, GuiLaunchDisposition, NetworkView, ParticipantView,
-        PeerPresenceStatus, TrayMenuItemSpec, TrayRuntimeState, cli_binary_installed_at,
-        expected_peer_count, extract_json_document, gui_launch_disposition,
-        gui_requires_service_enable, gui_requires_service_install, is_already_running_message,
-        is_mesh_complete, is_not_running_message, parse_advertised_routes_input,
-        parse_exit_node_input, parse_running_gui_instances, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label, should_start_gui_daemon_on_launch,
-        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
-        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
+        PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID,
+        TrayMenuItemSpec, TrayRuntimeState, cli_binary_installed_at, expected_peer_count,
+        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, is_already_running_message, is_mesh_complete,
+        is_not_running_message, parse_advertised_routes_input, parse_exit_node_input,
+        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
+        started_from_autostart_args, to_npub, tray_exit_node_entries, tray_menu_spec,
+        tray_network_groups, tray_status_text, validate_nvpn_binary, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -3929,6 +3957,7 @@ mod tests {
             status_text: tray_status_text(true, false, false, "Connected"),
             identity_text: "Identity: npub1alice...xyz".to_string(),
             this_device_text: "This Device: sirius (10.44.0.10)".to_string(),
+            advertise_exit_node: false,
             network_groups: tray_network_groups(&[NetworkView {
                 id: "home".to_string(),
                 name: "Home".to_string(),
@@ -3964,10 +3993,19 @@ mod tests {
             item,
             TrayMenuItemSpec::Submenu { text, .. } if text == "Network Devices"
         )));
-        assert!(spec.iter().any(|item| matches!(
-            item,
-            TrayMenuItemSpec::Submenu { text, .. } if text == "Exit Nodes"
-        )));
+        assert!(spec.iter().any(|item| match item {
+            TrayMenuItemSpec::Submenu { text, items, .. } if text == "Exit Nodes" =>
+                items.iter().any(|entry| matches!(
+                    entry,
+                    TrayMenuItemSpec::Check {
+                        id,
+                        text,
+                        checked: false,
+                        ..
+                    } if id == TRAY_RUN_EXIT_NODE_MENU_ID && text == "Run Exit Node"
+                )),
+            _ => false,
+        }));
         assert!(spec.iter().any(|item| matches!(
             item,
             TrayMenuItemSpec::Text {
@@ -3984,6 +4022,40 @@ mod tests {
                 ..
             }) if text == "Quit"
         ));
+    }
+
+    #[test]
+    fn tray_menu_spec_marks_local_exit_node_toggle_checked_when_enabled() {
+        let spec = tray_menu_spec(&TrayRuntimeState {
+            advertise_exit_node: true,
+            ..TrayRuntimeState::default()
+        });
+
+        assert!(spec.iter().any(|item| match item {
+            TrayMenuItemSpec::Submenu { text, items, .. } if text == "Exit Nodes" =>
+                items.iter().any(|entry| matches!(
+                    entry,
+                    TrayMenuItemSpec::Check {
+                        id,
+                        text,
+                        checked: true,
+                        ..
+                    } if id == TRAY_RUN_EXIT_NODE_MENU_ID && text == "Run Exit Node"
+                )),
+            _ => false,
+        }));
+        assert!(spec.iter().any(|item| match item {
+            TrayMenuItemSpec::Submenu { text, items, .. } if text == "Exit Nodes" =>
+                items.iter().any(|entry| matches!(
+                    entry,
+                    TrayMenuItemSpec::Check {
+                        id,
+                        checked: false,
+                        ..
+                    } if id == TRAY_EXIT_NODE_NONE_MENU_ID
+                )),
+            _ => false,
+        }));
     }
 
     #[test]
