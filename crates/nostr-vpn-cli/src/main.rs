@@ -1995,6 +1995,10 @@ impl CliTunnelRuntime {
         #[cfg(target_os = "linux")]
         self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
         #[cfg(target_os = "linux")]
+        if let Err(error) = flush_linux_route_cache() {
+            eprintln!("tunnel: failed to flush linux route cache: {error}");
+        }
+        #[cfg(target_os = "linux")]
         self.reconcile_linux_exit_node_forwarding(app);
 
         let applied_fingerprint = tunnel_fingerprint(
@@ -2026,6 +2030,9 @@ impl CliTunnelRuntime {
             self.reconcile_linux_endpoint_bypass_routes(&[]);
             self.reconcile_linux_exit_node_forwarding_cleanup();
             self.restore_linux_original_default_route();
+            if let Err(error) = flush_linux_route_cache() {
+                eprintln!("tunnel: failed to flush linux route cache: {error}");
+            }
         }
         self.handle = None;
         self.uapi_socket_path = None;
@@ -7656,6 +7663,17 @@ fn restore_linux_default_route(route: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn flush_linux_route_cache() -> Result<()> {
+    run_checked(
+        ProcessCommand::new("ip")
+            .arg("-4")
+            .arg("route")
+            .arg("flush")
+            .arg("cache"),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn relay_bypass_ipv4_hosts(app: &AppConfig) -> Vec<Ipv4Addr> {
     let mut hosts = app
         .nostr
@@ -7845,10 +7863,13 @@ fn linux_ip_forward_path(family: LinuxExitNodeIpFamily) -> &'static str {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 fn linux_exit_node_source_cidr(tunnel_ip: &str) -> Option<String> {
-    let mut octets = strip_cidr(tunnel_ip).parse::<Ipv4Addr>().ok()?.octets();
-    octets[3] = 0;
+    let octets = strip_cidr(tunnel_ip).parse::<Ipv4Addr>().ok()?.octets();
+    if octets[0] == 10 && octets[1] == 44 {
+        return Some("10.44.0.0/16".to_string());
+    }
+
     Some(format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]))
 }
 
@@ -8028,6 +8049,7 @@ fn apply_local_interface_network(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
+        let ipv4_route_source = linux_ipv4_route_source(address);
         run_checked(
             ProcessCommand::new("ip")
                 .arg("address")
@@ -8047,14 +8069,34 @@ fn apply_local_interface_network(
                 .arg(iface),
         )?;
         for target in route_targets {
-            run_checked(
-                ProcessCommand::new("ip")
+            if target == "0.0.0.0/0" {
+                let _ = ProcessCommand::new("ip")
+                    .arg("-4")
                     .arg("route")
-                    .arg("replace")
-                    .arg(target)
-                    .arg("dev")
-                    .arg(iface),
-            )?;
+                    .arg("del")
+                    .arg("default")
+                    .status();
+            } else if target == "::/0" {
+                let _ = ProcessCommand::new("ip")
+                    .arg("-6")
+                    .arg("route")
+                    .arg("del")
+                    .arg("default")
+                    .status();
+            }
+            let mut command = ProcessCommand::new("ip");
+            command
+                .arg("route")
+                .arg("replace")
+                .arg(target)
+                .arg("dev")
+                .arg(iface);
+            if linux_route_target_is_ipv4(target)
+                && let Some(source) = ipv4_route_source.as_deref()
+            {
+                command.arg("src").arg(source);
+            }
+            run_checked(&mut command)?;
         }
         return Ok(());
     }
@@ -8082,6 +8124,19 @@ fn apply_local_interface_network(
     Err(anyhow!(
         "interface setup is not implemented for this platform"
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_ipv4_route_source(address: &str) -> Option<String> {
+    strip_cidr(address)
+        .parse::<Ipv4Addr>()
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_route_target_is_ipv4(target: &str) -> bool {
+    strip_cidr(target).parse::<Ipv4Addr>().is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -8279,7 +8334,8 @@ mod tests {
         kill_error_requires_control_fallback, linux_default_route_device_from_output,
         linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
         linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
-        linux_exit_node_ipv4_masquerade_rule, linux_route_get_spec_from_output,
+        linux_exit_node_ipv4_masquerade_rule, linux_exit_node_source_cidr, linux_ipv4_route_source,
+        linux_route_get_spec_from_output, linux_route_target_is_ipv4,
         linux_service_status_from_show_output, load_config_with_overrides,
         local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
         nat_punch_targets, parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
@@ -8939,6 +8995,22 @@ mod tests {
     }
 
     #[test]
+    fn linux_ipv4_route_source_uses_tunnel_ipv4_address() {
+        assert_eq!(
+            linux_ipv4_route_source("10.44.93.37/32"),
+            Some("10.44.93.37".to_string())
+        );
+        assert_eq!(linux_ipv4_route_source("fd00::1/128"), None);
+    }
+
+    #[test]
+    fn linux_route_target_is_ipv4_detects_ipv4_and_ipv6_targets() {
+        assert!(linux_route_target_is_ipv4("0.0.0.0/0"));
+        assert!(linux_route_target_is_ipv4("10.44.93.37/32"));
+        assert!(!linux_route_target_is_ipv4("::/0"));
+    }
+
+    #[test]
     fn linux_exit_node_default_route_families_detect_ipv4_and_ipv6_defaults() {
         let ipv6_only = linux_exit_node_default_route_families(&["::/0".to_string()]);
         assert!(!ipv6_only.ipv4);
@@ -9010,6 +9082,22 @@ mod tests {
                 "-j".to_string(),
                 "ACCEPT".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn linux_exit_node_source_cidr_uses_full_auto_mesh_range() {
+        assert_eq!(
+            linux_exit_node_source_cidr("10.44.183.163/32"),
+            Some("10.44.0.0/16".to_string())
+        );
+    }
+
+    #[test]
+    fn linux_exit_node_source_cidr_preserves_custom_non_mesh_prefixes() {
+        assert_eq!(
+            linux_exit_node_source_cidr("10.55.7.9/32"),
+            Some("10.55.7.0/24".to_string())
         );
     }
 

@@ -51,11 +51,11 @@ compact_json() {
 }
 
 peer_tunnel_ip_from_status() {
-  grep -o '"tunnel_ip":"10\.44\.0\.[0-9]\+/32"' | tail -n1 | cut -d '"' -f4 | cut -d/ -f1
+  grep -o '"tunnel_ip":"10\.44\.[0-9]\+\.[0-9]\+/32"' | tail -n1 | cut -d '"' -f4 | cut -d/ -f1 || true
 }
 
 peer_announced_endpoint_from_status() {
-  grep -o '"endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4
+  grep -o '"endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4 || true
 }
 
 cleanup

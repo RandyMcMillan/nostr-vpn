@@ -8,6 +8,7 @@ RELAY_URL="ws://10.254.241.2:8080"
 REFLECTOR_ADDR="10.254.241.3:3478"
 CONFIG_PATH="/root/.config/nvpn/config.toml"
 EXIT_PUBLIC_IP="10.254.241.10"
+PUBLIC_INTERNET_TARGET="${NVPN_EXIT_NODE_E2E_PUBLIC_IP:-}"
 
 cleanup() {
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
@@ -52,15 +53,11 @@ compact_json() {
 }
 
 peer_tunnel_ip_from_status() {
-  grep -o '"tunnel_ip":"10\.44\.0\.[0-9]\+/32"' | tail -n1 | cut -d '"' -f4 | cut -d/ -f1
+  grep -o '"tunnel_ip":"10\.44\.[0-9]\+\.[0-9]\+/32"' | tail -n1 | cut -d '"' -f4 | cut -d/ -f1 || true
 }
 
 peer_announced_endpoint_from_status() {
-  grep -o '"endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4
-}
-
-json_public_endpoint() {
-  grep -o '"public_endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4
+  grep -o '"endpoint":"[^"]*"' | tail -n1 | cut -d '"' -f4 || true
 }
 
 wait_for_service() {
@@ -164,8 +161,11 @@ for _ in $(seq 1 80); do
     && grep -q '"status_source":"daemon"' <<<"$BOB_COMPACT" \
     && grep -q '"running":true' <<<"$ALICE_COMPACT" \
     && grep -q '"running":true' <<<"$BOB_COMPACT" \
+    && grep -q '"peer_count":1' <<<"$ALICE_COMPACT" \
+    && grep -q '"peer_count":1' <<<"$BOB_COMPACT" \
+    && grep -q '"mesh_ready":true' <<<"$ALICE_COMPACT" \
+    && grep -q '"mesh_ready":true' <<<"$BOB_COMPACT" \
     && grep -q '"advertised_routes":\["0.0.0.0/0","::/0"\]' <<<"$BOB_COMPACT" \
-    && grep -q '"reachable":true' <<<"$BOB_COMPACT" \
     && [[ "$ALICE_ANNOUNCED_ENDPOINT" == "10.254.241.11:51820" ]] \
     && [[ "$BOB_ANNOUNCED_ENDPOINT" == "$EXIT_PUBLIC_IP:51820" ]] \
     && [[ -n "$ALICE_TUNNEL_IP" ]] \
@@ -184,8 +184,11 @@ grep -q '"status_source":"daemon"' <<<"$ALICE_COMPACT"
 grep -q '"status_source":"daemon"' <<<"$BOB_COMPACT"
 grep -q '"running":true' <<<"$ALICE_COMPACT"
 grep -q '"running":true' <<<"$BOB_COMPACT"
+grep -q '"peer_count":1' <<<"$ALICE_COMPACT"
+grep -q '"peer_count":1' <<<"$BOB_COMPACT"
+grep -q '"mesh_ready":true' <<<"$ALICE_COMPACT"
+grep -q '"mesh_ready":true' <<<"$BOB_COMPACT"
 grep -q '"advertised_routes":\["0.0.0.0/0","::/0"\]' <<<"$BOB_COMPACT"
-grep -q '"reachable":true' <<<"$BOB_COMPACT"
 
 BOB_TUNNEL_IP="$(printf '%s' "$ALICE_COMPACT" | peer_tunnel_ip_from_status)"
 ALICE_TUNNEL_IP="$(printf '%s' "$BOB_COMPACT" | peer_tunnel_ip_from_status)"
@@ -209,19 +212,44 @@ if ! grep -q 'dev utun100' <<<"$REFLECTOR_ROUTE"; then
   exit 1
 fi
 
-NAT_DISCOVER="$("${COMPOSE[@]}" exec -T node-b nvpn nat-discover --reflector "$REFLECTOR_ADDR" --listen-port 53000 --json | tr -d '\r')"
-PUBLIC_ENDPOINT="$(printf '%s' "$NAT_DISCOVER" | compact_json | json_public_endpoint)"
-
-if [[ "$PUBLIC_ENDPOINT" != "$EXIT_PUBLIC_IP:"* ]]; then
-  echo "exit-node docker e2e failed: nat discovery did not egress through exit node ('$PUBLIC_ENDPOINT')" >&2
+if ! ping_until_success node-b 10.254.241.3 /tmp/nvpn-exit-node-reflector-ping.log; then
+  echo "exit-node docker e2e failed: client could not reach reflector through the selected exit node" >&2
+  if [[ -f /tmp/nvpn-exit-node-reflector-ping.log ]]; then
+    cat /tmp/nvpn-exit-node-reflector-ping.log
+  fi
   exit 1
+fi
+
+PUBLIC_ROUTE=""
+if [[ -n "$PUBLIC_INTERNET_TARGET" ]]; then
+  PUBLIC_ROUTE="$("${COMPOSE[@]}" exec -T node-b sh -lc "ip route get $PUBLIC_INTERNET_TARGET | tr -d '\r'")"
+
+  if ! grep -q 'dev utun100' <<<"$PUBLIC_ROUTE"; then
+    echo "exit-node docker e2e failed: public internet route did not switch to the tunnel" >&2
+    echo "$PUBLIC_ROUTE"
+    exit 1
+  fi
+
+  if ! ping_until_success node-b "$PUBLIC_INTERNET_TARGET" /tmp/nvpn-exit-node-public-ping.log; then
+    echo "exit-node docker e2e failed: unable to reach public internet target '$PUBLIC_INTERNET_TARGET' through exit node" >&2
+    if [[ -f /tmp/nvpn-exit-node-public-ping.log ]]; then
+      cat /tmp/nvpn-exit-node-public-ping.log
+    fi
+    exit 1
+  fi
 fi
 
 echo "--- Peer endpoint route ---"
 echo "$PEER_ROUTE"
 echo "--- Reflector route ---"
 echo "$REFLECTOR_ROUTE"
-echo "--- Node B NAT discover ---"
-echo "$NAT_DISCOVER"
+echo "--- Reflector ping ---"
+cat /tmp/nvpn-exit-node-reflector-ping.log
+if [[ -n "$PUBLIC_INTERNET_TARGET" ]]; then
+  echo "--- Public internet route ---"
+  echo "$PUBLIC_ROUTE"
+  echo "--- Public internet ping ---"
+  cat /tmp/nvpn-exit-node-public-ping.log
+fi
 
-echo "exit-node docker e2e passed: default-route traffic egressed through the selected exit node while the peer endpoint stayed outside the tunnel"
+echo "exit-node docker e2e passed: tunnel traffic reached the selected exit node, default-route traffic crossed the exit path to the reflector, and the peer endpoint stayed outside the tunnel"
