@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -342,6 +343,7 @@ struct TrayRuntimeState {
     service_setup_required: bool,
     service_enable_required: bool,
     status_text: String,
+    identity_npub: String,
     identity_text: String,
     this_device_text: String,
     advertise_exit_node: bool,
@@ -356,7 +358,8 @@ impl Default for TrayRuntimeState {
             service_setup_required: false,
             service_enable_required: false,
             status_text: "Disconnected".to_string(),
-            identity_text: "Identity: unavailable".to_string(),
+            identity_npub: String::new(),
+            identity_text: tray_identity_text(""),
             this_device_text: "This Device: unavailable".to_string(),
             advertise_exit_node: false,
             network_groups: Vec::new(),
@@ -2205,7 +2208,8 @@ impl NvpnBackend {
                 service_enable_required,
                 &self.session_status,
             ),
-            identity_text: format!("Identity: {}", short_text(&identity, 16, 8)),
+            identity_npub: identity.clone(),
+            identity_text: tray_identity_text(&identity),
             this_device_text: format!(
                 "This Device: {} ({})",
                 self.config.node_name,
@@ -3016,6 +3020,88 @@ fn tray_status_text(
     }
 }
 
+fn tray_identity_text(identity_npub: &str) -> String {
+    let identity_npub = identity_npub.trim();
+    if identity_npub.is_empty() {
+        "Copy npub unavailable".to_string()
+    } else {
+        format!("Copy {}", short_text(identity_npub, 16, 8))
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(anyhow!("npub unavailable"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        copy_text_with_command("pbcopy", &[], text)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let candidates: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        let mut last_error = None;
+        for (program, args) in candidates {
+            match copy_text_with_command(program, args, text) {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow!("no clipboard command available")))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        copy_text_with_command("cmd", &["/C", "clip"], text)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err(anyhow!("clipboard copy is unsupported on this platform"))
+    }
+}
+
+fn copy_text_with_command(program: &str, args: &[&str], text: &str) -> Result<()> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {program}"))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open stdin for {program}"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .with_context(|| format!("failed to send text to {program}"))?;
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for {program}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if stderr.is_empty() {
+            Err(anyhow!("{program} exited with status {}", output.status))
+        } else {
+            Err(anyhow!("{program} failed: {stderr}"))
+        }
+    }
+}
+
 fn tray_participant_display_name(participant: &ParticipantView) -> String {
     let alias = participant.magic_dns_alias.trim();
     if !alias.is_empty() {
@@ -3173,7 +3259,7 @@ fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
         TrayMenuItemSpec::Text {
             id: Some(TRAY_IDENTITY_MENU_ID.to_string()),
             text: runtime_state.identity_text.clone(),
-            enabled: true,
+            enabled: !runtime_state.identity_npub.trim().is_empty(),
         },
         TrayMenuItemSpec::Text {
             id: None,
@@ -3717,8 +3803,16 @@ pub fn run() {
                 .on_menu_event(|app, event| {
                     let menu_id = event.id().as_ref();
                     match menu_id {
-                        TRAY_OPEN_MENU_ID | TRAY_IDENTITY_MENU_ID => {
+                        TRAY_OPEN_MENU_ID => {
                             let _ = show_main_window(app);
+                        }
+                        TRAY_IDENTITY_MENU_ID => {
+                            let runtime_state = current_tray_runtime_state(app);
+                            if let Err(error) = copy_text_to_clipboard(&runtime_state.identity_npub)
+                            {
+                                run_tray_backend_action(app, |_backend| Err(error));
+                                refresh_tray_menu(app);
+                            }
                         }
                         TRAY_VPN_TOGGLE_MENU_ID => {
                             let runtime_state = current_tray_runtime_state(app);
@@ -3887,8 +3981,9 @@ mod tests {
         peer_presence_state_label, peer_state_label,
         should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
-        validate_nvpn_binary, within_peer_online_grace, within_peer_presence_grace,
+        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
+        tray_status_text, validate_nvpn_binary, within_peer_online_grace,
+        within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::time::{Duration, SystemTime};
@@ -4247,13 +4342,24 @@ mod tests {
     }
 
     #[test]
+    fn tray_identity_text_formats_copy_action() {
+        assert_eq!(
+            tray_identity_text("npub1j4c4x0w2g6q3jz9q8ruy6xw0jfs6w8szk8dks3l8h0f5syv2sgzq9w8m7n"),
+            "Copy npub1j4c4x0w2g6q...zq9w8m7n"
+        );
+        assert_eq!(tray_identity_text(""), "Copy npub unavailable");
+    }
+
+    #[test]
     fn tray_menu_spec_puts_toggle_first_and_settings_last() {
         let spec = tray_menu_spec(&TrayRuntimeState {
             session_active: true,
             service_setup_required: false,
             service_enable_required: false,
             status_text: tray_status_text(true, false, false, "Connected"),
-            identity_text: "Identity: npub1alice...xyz".to_string(),
+            identity_npub: "npub1j4c4x0w2g6q3jz9q8ruy6xw0jfs6w8szk8dks3l8h0f5syv2sgzq9w8m7n"
+                .to_string(),
+            identity_text: "Copy npub1j4c4x0w2g6q...zq9w8m7n".to_string(),
             this_device_text: "This Device: sirius (10.44.0.10)".to_string(),
             advertise_exit_node: false,
             network_groups: tray_network_groups(&[NetworkView {
