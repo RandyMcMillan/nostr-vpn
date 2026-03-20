@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 #[cfg(target_os = "macos")]

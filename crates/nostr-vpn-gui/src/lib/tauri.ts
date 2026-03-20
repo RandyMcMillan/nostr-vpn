@@ -98,6 +98,13 @@ const computeMockEffectiveAdvertisedRoutes = () => {
 }
 
 const mockState: UiState = {
+  platform: 'desktop',
+  mobile: false,
+  vpnSessionControlSupported: true,
+  cliInstallSupported: true,
+  startupSettingsSupported: true,
+  trayBehaviorSupported: true,
+  runtimeStatusDetail: '',
   daemonRunning: false,
   sessionActive: false,
   relayConnected: false,

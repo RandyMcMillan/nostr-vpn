@@ -82,6 +82,13 @@ export interface PortMappingStatus {
 }
 
 export interface UiState {
+  platform: string
+  mobile: boolean
+  vpnSessionControlSupported: boolean
+  cliInstallSupported: boolean
+  startupSettingsSupported: boolean
+  trayBehaviorSupported: boolean
+  runtimeStatusDetail: string
   daemonRunning: boolean
   sessionActive: boolean
   relayConnected: boolean

@@ -1,6 +1,6 @@
 {
   "name": "nostr-vpn-gui",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "test:unit": "node --test src/lib/*.test.js",
     "prepare:sidecar:debug": "node ./scripts/prepare-sidecar.mjs --debug",
     "prepare:sidecar:release": "node ./scripts/prepare-sidecar.mjs --release",
+    "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "test:tauri-driver": "node e2e-tauri/smoke.mjs"
