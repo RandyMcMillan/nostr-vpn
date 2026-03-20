@@ -16,6 +16,22 @@ This repo is not just one binary. It currently ships:
 | `nvpn-reflector` | Minimal UDP reflector used for NAT discovery and hole-punch testing |
 | `nostr-vpn-core` | Shared library for config, signaling, NAT helpers, diagnostics, MagicDNS, and WireGuard helpers |
 
+## Downloads
+
+Most people on macOS want the desktop app:
+
+- [Download the latest macOS app (Apple Silicon)](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nostr-vpn-macos-arm64.zip)
+- [See the latest release notes and all assets](https://github.com/mmalmi/nostr-vpn/releases/latest)
+
+If you want the headless CLI instead:
+
+- [macOS Apple Silicon CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-aarch64-apple-darwin.tar.gz)
+- [macOS Intel CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-x86_64-apple-darwin.tar.gz)
+- [Linux x86_64 CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-x86_64-unknown-linux-musl.tar.gz)
+- [Linux ARM64 CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-aarch64-unknown-linux-musl.tar.gz)
+
+The CLI release installer and auto-detect command are intended for both macOS and Linux. GitHub Releases currently publish CLI tarballs for macOS Intel, macOS Apple Silicon, Linux x86_64, and Linux ARM64. The desktop GUI release is currently Apple Silicon macOS only.
+
 ## What the project does today
 
 - Generates both Nostr identity keys and WireGuard keys automatically
@@ -94,11 +110,13 @@ cargo build -p nostr-vpn-cli -p nostr-vpn-relay
 
 ## Install `nvpn`
 
-Quick install for servers, VPSes, and other headless macOS/Linux hosts:
+Quick install for released headless CLI builds on macOS/Linux:
 
 ```bash
 curl -fsSL https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | tr '[:upper:]' '[:lower:]' | sed 's/darwin/apple-darwin/' | sed 's/linux/unknown-linux-musl/').tar.gz | tar -xz && cd nvpn && ./install.sh
 ```
+
+That auto-detect command is valid on both macOS and Linux. The bundled installer now creates the target directory when needed and defaults to `/opt/homebrew/bin` on Apple Silicon macOS when that location is present or already in `PATH`; otherwise it uses `/usr/local/bin`.
 
 From source:
 
@@ -112,9 +130,9 @@ If you already have a packaged CLI release artifact, extract it and run:
 ./install.sh
 ```
 
-That installer places `nvpn` into `/usr/local/bin` by default.
+You can also pass a custom destination directory to the bundled installer, for example `./install.sh ~/.local/bin`.
 
-If you want the desktop app instead of the headless CLI flow, GitHub Releases currently publish the signed Apple Silicon macOS app as `nostr-vpn-macos-arm64.zip`.
+If you want the desktop app instead of the headless CLI flow, use the direct macOS download in the Downloads section above.
 
 ## CLI quickstart
 
