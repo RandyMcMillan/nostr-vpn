@@ -80,11 +80,19 @@
   let serviceInstallRecommended = false
   let serviceEnableRecommended = false
   let serviceSetupRequired = false
+  let vpnControlSupported = false
+  let cliInstallSupported = false
+  let startupSettingsSupported = false
+  let trayBehaviorSupported = false
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
   $: serviceEnableRecommended =
     !!state?.serviceEnablementSupported && !!state?.serviceInstalled && !!state?.serviceDisabled
   $: serviceSetupRequired = serviceInstallRecommended && !state?.daemonRunning
+  $: vpnControlSupported = !!state?.vpnSessionControlSupported
+  $: cliInstallSupported = !!state?.cliInstallSupported
+  $: startupSettingsSupported = !!state?.startupSettingsSupported
+  $: trayBehaviorSupported = !!state?.trayBehaviorSupported
   $: {
     const invite = state?.activeNetworkInvite ?? ''
     if (invite !== inviteQrSource) {
@@ -250,6 +258,9 @@
   const inactiveNetworks = (state: UiState) => state.networks.filter((network) => !network.enabled)
 
   const heroStateBadgeClass = (state: UiState) => {
+    if (!state.vpnSessionControlSupported) {
+      return 'muted'
+    }
     if (state.meshReady) {
       return 'ok'
     }
@@ -260,6 +271,9 @@
   }
 
   const heroSubtext = (state: UiState) => {
+    if (!state.vpnSessionControlSupported) {
+      return state.runtimeStatusDetail
+    }
     const network = activeNetwork(state)
     if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
       return 'Install the background service for reliable startup, reconnects, and admin-free VPN switching.'
@@ -277,6 +291,17 @@
     const remaining = Math.max(state.expectedPeerCount - state.connectedPeerCount, 0)
     return `${network.name} is waiting on ${remaining} more peer${remaining === 1 ? '' : 's'}.`
   }
+
+  const heroBadgeText = (state: UiState) =>
+    state.vpnSessionControlSupported
+      ? heroStateText(state, { serviceInstallRecommended, serviceEnableRecommended })
+      : 'Preview'
+
+  const heroDetailText = (state: UiState) =>
+    state.vpnSessionControlSupported ? heroStatusDetailText(state) : ''
+
+  const platformLabel = (platform: string) =>
+    platform.length > 0 ? `${platform[0].toUpperCase()}${platform.slice(1)}` : 'Unknown'
 
   const networkPeerSummary = (network: NetworkView) => {
     const saved = `${network.participants.length} device${network.participants.length === 1 ? '' : 's'} saved`
@@ -766,6 +791,11 @@
       return
     }
 
+    if (!state.startupSettingsSupported) {
+      autostartReady = true
+      return
+    }
+
     const runtimeEnabled = await isAutostartEnabled()
     if (runtimeEnabled !== state.launchOnStartup) {
       const ok = await setAutostartEnabled(state.launchOnStartup)
@@ -782,7 +812,7 @@
   }
 
   async function onToggleAutostart(enabled: boolean) {
-    if (!state) {
+    if (!state || !state.startupSettingsSupported) {
       return
     }
 
@@ -881,12 +911,12 @@
           <div class="row hero-title-row">
             <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
             <span class={`badge ${heroStateBadgeClass(state)}`}>
-              {heroStateText(state, { serviceInstallRecommended, serviceEnableRecommended })}
+              {heroBadgeText(state)}
             </span>
           </div>
           <div class="hero-subtitle">{heroSubtext(state)}</div>
         </div>
-        {#if !serviceSetupRequired}
+        {#if vpnControlSupported && !serviceSetupRequired}
           <button
             class={`session-switch ${state.sessionActive ? 'on' : 'off'}`}
             role="switch"
@@ -932,22 +962,28 @@
       </div>
 
       <div class="row status-row">
-        <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
-          Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
-        </span>
-        <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
-          VPN {state.sessionActive ? 'On' : 'Off'}
-        </span>
-        <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
-          Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
-        </span>
-        <span class="badge muted" data-testid="mesh-badge">
-          Mesh {state.connectedPeerCount}/{state.expectedPeerCount}
-        </span>
+        {#if vpnControlSupported}
+          <span class={`badge ${state.daemonRunning ? 'ok' : 'bad'}`}>
+            Daemon {state.daemonRunning ? 'Running' : 'Stopped'}
+          </span>
+          <span class={`badge ${state.sessionActive ? 'ok' : 'bad'}`}>
+            VPN {state.sessionActive ? 'On' : 'Off'}
+          </span>
+          <span class={`badge ${state.relayConnected ? 'ok' : 'muted'}`}>
+            Relays {state.relayConnected ? 'Connected' : 'Disconnected'}
+          </span>
+          <span class="badge muted" data-testid="mesh-badge">
+            Mesh {state.connectedPeerCount}/{state.expectedPeerCount}
+          </span>
+        {:else}
+          <span class="badge muted">Platform {platformLabel(state.platform)}</span>
+          <span class="badge muted">Config editing enabled</span>
+          <span class="badge muted">Tunnel control unavailable</span>
+        {/if}
       </div>
-      {#if heroStatusDetailText(state)}
+      {#if heroDetailText(state)}
         <div class="identity-status" data-testid="session-status-text">
-          {heroStatusDetailText(state)}
+          {heroDetailText(state)}
         </div>
       {/if}
     {:else}
@@ -1585,75 +1621,77 @@
       </div>
     </details>
 
-    <details class="panel collapsible-panel" open={state.health.length > 0}>
-      <summary class="collapsible-summary">
-        <div>
-          <div class="panel-kicker">Advanced</div>
-          <h2>Diagnostics</h2>
-        </div>
-        <div class="section-meta">{healthSummaryText(state)}</div>
-      </summary>
+    {#if state.vpnSessionControlSupported}
+      <details class="panel collapsible-panel" open={state.health.length > 0}>
+        <summary class="collapsible-summary">
+          <div>
+            <div class="panel-kicker">Advanced</div>
+            <h2>Diagnostics</h2>
+          </div>
+          <div class="section-meta">{healthSummaryText(state)}</div>
+        </summary>
 
-      <div class="collapsible-body diagnostics-panel">
-        <div class="row status-row diagnostics-badges">
-          <span class="badge muted">
-            IF {state.network.defaultInterface || 'unknown'}
-          </span>
-          <span
-            class={`badge ${
-              state.network.captivePortal === true
-                ? 'bad'
+        <div class="collapsible-body diagnostics-panel">
+          <div class="row status-row diagnostics-badges">
+            <span class="badge muted">
+              IF {state.network.defaultInterface || 'unknown'}
+            </span>
+            <span
+              class={`badge ${
+                state.network.captivePortal === true
+                  ? 'bad'
+                  : state.network.captivePortal === false
+                    ? 'ok'
+                    : 'muted'
+              }`}
+            >
+              {state.network.captivePortal === true
+                ? 'Captive portal'
                 : state.network.captivePortal === false
-                  ? 'ok'
-                  : 'muted'
-            }`}
-          >
-            {state.network.captivePortal === true
-              ? 'Captive portal'
-              : state.network.captivePortal === false
-                ? 'Open internet'
-                : 'Portal unknown'}
-          </span>
-          <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
-            Mapping {state.portMapping.activeProtocol || 'none'}
-          </span>
-        </div>
+                  ? 'Open internet'
+                  : 'Portal unknown'}
+            </span>
+            <span class={`badge ${state.portMapping.activeProtocol ? 'ok' : 'muted'}`}>
+              Mapping {state.portMapping.activeProtocol || 'none'}
+            </span>
+          </div>
 
-        <div class="diagnostics-copy">
-          <div class="config-path">
-            Local addresses:
-            {state.network.primaryIpv4 || 'no IPv4'}
-            {#if state.network.primaryIpv6}
-              | {state.network.primaryIpv6}
-            {/if}
+          <div class="diagnostics-copy">
+            <div class="config-path">
+              Local addresses:
+              {state.network.primaryIpv4 || 'no IPv4'}
+              {#if state.network.primaryIpv6}
+                | {state.network.primaryIpv6}
+              {/if}
+            </div>
+            <div class="config-path">
+              Gateway:
+              {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
+            </div>
+            <div class="config-path">
+              External endpoint:
+              {state.portMapping.externalEndpoint || 'stun / direct only'}
+            </div>
           </div>
-          <div class="config-path">
-            Gateway:
-            {state.network.gatewayIpv4 || state.network.gatewayIpv6 || 'unknown'}
-          </div>
-          <div class="config-path">
-            External endpoint:
-            {state.portMapping.externalEndpoint || 'stun / direct only'}
-          </div>
-        </div>
 
-        {#if state.health.length === 0}
-          <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
-        {:else}
-          <div class="stack rows">
-            {#each state.health as issue}
-              <div class="health-card" data-testid="health-issue">
-                <div class="row spread health-card-header">
-                  <div class="item-title">{issue.summary}</div>
-                  <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
+          {#if state.health.length === 0}
+            <div class="config-path" data-testid="health-empty">Daemon reports no active health warnings.</div>
+          {:else}
+            <div class="stack rows">
+              {#each state.health as issue}
+                <div class="health-card" data-testid="health-issue">
+                  <div class="row spread health-card-header">
+                    <div class="item-title">{issue.summary}</div>
+                    <span class={`badge ${healthBadgeClass(issue.severity)}`}>{issue.severity}</span>
+                  </div>
+                  <div class="item-sub">{issue.detail}</div>
                 </div>
-                <div class="item-sub">{issue.detail}</div>
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-    </details>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      </details>
+    {/if}
 
     {#if state.serviceSupported && !serviceInstallRecommended && !serviceEnableRecommended}
       <details class="panel collapsible-panel service-panel" data-testid="service-panel">
@@ -1770,41 +1808,43 @@
       </div>
     </details>
 
-    <details class="panel collapsible-panel">
-      <summary class="collapsible-summary">
-        <div>
-          <div class="panel-kicker">Connection</div>
-          <h2>Session & Relays</h2>
+    {#if state.vpnSessionControlSupported}
+      <details class="panel collapsible-panel">
+        <summary class="collapsible-summary">
+          <div>
+            <div class="panel-kicker">Connection</div>
+            <h2>Session & Relays</h2>
+          </div>
+          <div class="section-meta">Startup & relay behavior</div>
+        </summary>
+
+        <div class="collapsible-body">
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={state.autoDisconnectRelaysWhenMeshReady}
+              on:change={(event) =>
+                onUpdateSettings({
+                  autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
+                })}
+            />
+            <span>Auto-disconnect relays when mesh is ready</span>
+          </label>
+
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={state.autoconnect}
+              on:change={(event) =>
+                onUpdateSettings({
+                  autoconnect: (event.currentTarget as HTMLInputElement).checked,
+                })}
+            />
+            <span>Auto-connect session on app start</span>
+          </label>
         </div>
-        <div class="section-meta">Startup & relay behavior</div>
-      </summary>
-
-      <div class="collapsible-body">
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            checked={state.autoDisconnectRelaysWhenMeshReady}
-            on:change={(event) =>
-              onUpdateSettings({
-                autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
-              })}
-          />
-          <span>Auto-disconnect relays when mesh is ready</span>
-        </label>
-
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            checked={state.autoconnect}
-            on:change={(event) =>
-              onUpdateSettings({
-                autoconnect: (event.currentTarget as HTMLInputElement).checked,
-              })}
-          />
-          <span>Auto-connect session on app start</span>
-        </label>
-      </div>
-    </details>
+      </details>
+    {/if}
 
     <details class="panel collapsible-panel">
       <summary class="collapsible-summary">
@@ -1812,7 +1852,11 @@
           <div class="panel-kicker">System</div>
           <h2>Device & App</h2>
         </div>
-        <div class="section-meta">Node, DNS & startup</div>
+        <div class="section-meta">
+          {cliInstallSupported || startupSettingsSupported || trayBehaviorSupported
+            ? 'Node, DNS & startup'
+            : 'Node & DNS'}
+        </div>
       </summary>
 
       <div class="collapsible-body">
@@ -1822,50 +1866,56 @@
         <div class="row settings-action-row">
           <div class="config-path">Config: {state.configPath}</div>
         </div>
-        <div class="row spread settings-action-row">
-          <div class="config-path">Terminal CLI</div>
-          <div class="row cli-actions-row">
-            <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
-              {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
-            </button>
-            <button
-              class="btn ghost"
-              data-testid="uninstall-cli-btn"
-              on:click={onUninstallCli}
-              disabled={!state.cliInstalled}
-            >
-              Uninstall CLI
-            </button>
+        {#if cliInstallSupported}
+          <div class="row spread settings-action-row">
+            <div class="config-path">Terminal CLI</div>
+            <div class="row cli-actions-row">
+              <button class="btn" data-testid="install-cli-btn" on:click={onInstallCli}>
+                {state.cliInstalled ? 'Reinstall CLI' : 'Install CLI'}
+              </button>
+              <button
+                class="btn ghost"
+                data-testid="uninstall-cli-btn"
+                on:click={onUninstallCli}
+                disabled={!state.cliInstalled}
+              >
+                Uninstall CLI
+              </button>
+            </div>
           </div>
-        </div>
-        {#if cliActionStatus}
-          <div class="config-path">{cliActionStatus}</div>
+          {#if cliActionStatus}
+            <div class="config-path">{cliActionStatus}</div>
+          {/if}
         {/if}
         <div class="config-path" data-testid="magic-dns-status">DNS: {state.magicDnsStatus}</div>
 
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            data-testid="autostart-toggle"
-            checked={state.launchOnStartup}
-            disabled={!autostartReady || autostartUpdating}
-            on:change={(event) =>
-              onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
-          />
-          <span>Launch on system startup</span>
-        </label>
+        {#if startupSettingsSupported}
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              data-testid="autostart-toggle"
+              checked={state.launchOnStartup}
+              disabled={!autostartReady || autostartUpdating}
+              on:change={(event) =>
+                onToggleAutostart((event.currentTarget as HTMLInputElement).checked)}
+            />
+            <span>Launch on system startup</span>
+          </label>
+        {/if}
 
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            checked={state.closeToTrayOnClose}
-            on:change={(event) =>
-              onUpdateSettings({
-                closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
-              })}
-          />
-          <span>Keep running in menu bar when window is closed</span>
-        </label>
+        {#if trayBehaviorSupported}
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={state.closeToTrayOnClose}
+              on:change={(event) =>
+                onUpdateSettings({
+                  closeToTrayOnClose: (event.currentTarget as HTMLInputElement).checked,
+                })}
+            />
+            <span>Keep running in menu bar when window is closed</span>
+          </label>
+        {/if}
 
         <div class="field-grid">
           <label>

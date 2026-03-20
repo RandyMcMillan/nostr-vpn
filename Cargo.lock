@@ -3358,6 +3358,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webrtc-stun",
+ "x25519-dalek",
 ]
 
 [[package]]

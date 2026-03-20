@@ -1,10 +1,11 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use boringtun::noise::{Tunn, TunnResult};
-use boringtun::x25519::{PublicKey, StaticSecret};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyPair {
@@ -61,6 +62,7 @@ pub fn public_key_from_private_key(private_key: &StaticSecret) -> String {
     STANDARD.encode(PublicKey::from(private_key).as_bytes())
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn simulate_boringtun_handshake(
     initiator_private_key: &str,
     responder_private_key: &str,

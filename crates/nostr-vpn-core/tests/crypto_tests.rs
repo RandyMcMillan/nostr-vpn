@@ -1,7 +1,8 @@
 use nostr_vpn_core::crypto::{
     decode_private_key, decode_public_key, generate_keypair, public_key_from_private_key,
-    simulate_boringtun_handshake,
 };
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use nostr_vpn_core::crypto::simulate_boringtun_handshake;
 
 #[test]
 fn key_generation_round_trips_through_base64() {
@@ -13,6 +14,7 @@ fn key_generation_round_trips_through_base64() {
     decode_public_key(&keypair.public_key).expect("public key should decode");
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[test]
 fn boringtun_handshake_completes_between_two_generated_nodes() {
     let first = generate_keypair();

@@ -1,3 +1,5 @@
+#![cfg_attr(any(target_os = "android", target_os = "ios"), allow(dead_code))]
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -23,11 +25,15 @@ use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 use tauri::image::Image;
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::menu::{
     CheckMenuItemBuilder, Menu, MenuItemBuilder, PredefinedMenuItem, Submenu, SubmenuBuilder,
 };
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, State, WindowEvent};
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+use tauri::WindowEvent;
+use tauri::{Manager, State};
 use tokio::runtime::Runtime;
 
 const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
@@ -234,6 +240,13 @@ struct LanPeerView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UiState {
+    platform: String,
+    mobile: bool,
+    vpn_session_control_supported: bool,
+    cli_install_supported: bool,
+    startup_settings_supported: bool,
+    tray_behavior_supported: bool,
+    runtime_status_detail: String,
     daemon_running: bool,
     session_active: bool,
     relay_connected: bool,
@@ -372,6 +385,73 @@ impl Default for TrayRuntimeState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum RuntimePlatform {
+    Desktop,
+    Android,
+    Ios,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimeCapabilities {
+    platform: &'static str,
+    mobile: bool,
+    vpn_session_control_supported: bool,
+    cli_install_supported: bool,
+    startup_settings_supported: bool,
+    tray_behavior_supported: bool,
+    runtime_status_detail: &'static str,
+}
+
+const fn current_runtime_platform() -> RuntimePlatform {
+    if cfg!(target_os = "android") {
+        RuntimePlatform::Android
+    } else if cfg!(target_os = "ios") {
+        RuntimePlatform::Ios
+    } else {
+        RuntimePlatform::Desktop
+    }
+}
+
+const fn runtime_capabilities_for_platform(platform: RuntimePlatform) -> RuntimeCapabilities {
+    match platform {
+        RuntimePlatform::Desktop => RuntimeCapabilities {
+            platform: "desktop",
+            mobile: false,
+            vpn_session_control_supported: true,
+            cli_install_supported: true,
+            startup_settings_supported: true,
+            tray_behavior_supported: true,
+            runtime_status_detail: "",
+        },
+        RuntimePlatform::Android => RuntimeCapabilities {
+            platform: "android",
+            mobile: true,
+            vpn_session_control_supported: false,
+            cli_install_supported: false,
+            startup_settings_supported: false,
+            tray_behavior_supported: false,
+            runtime_status_detail:
+                "Android VPN service integration is not wired up yet. Network editing works, but tunnel control is disabled.",
+        },
+        RuntimePlatform::Ios => RuntimeCapabilities {
+            platform: "ios",
+            mobile: true,
+            vpn_session_control_supported: false,
+            cli_install_supported: false,
+            startup_settings_supported: false,
+            tray_behavior_supported: false,
+            runtime_status_detail:
+                "Mobile VPN service integration is not wired up yet. Network editing works, but tunnel control is disabled.",
+        },
+    }
+}
+
+const fn current_runtime_capabilities() -> RuntimeCapabilities {
+    runtime_capabilities_for_platform(current_runtime_platform())
+}
+
 struct NvpnBackend {
     runtime: Runtime,
     config_path: PathBuf,
@@ -402,9 +482,8 @@ struct NvpnBackend {
 }
 
 impl NvpnBackend {
-    fn new(launched_from_autostart: bool) -> Result<Self> {
+    fn new(config_path: PathBuf, launched_from_autostart: bool) -> Result<Self> {
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
-        let config_path = default_config_path();
 
         let mut config = if config_path.exists() {
             AppConfig::load(&config_path).context("failed to load config")?
@@ -506,6 +585,11 @@ impl NvpnBackend {
     }
 
     fn connect_session(&mut self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            self.session_status = runtime.runtime_status_detail.to_string();
+            return Err(anyhow!(self.session_status.clone()));
+        }
         self.persist_config()?;
         self.sync_daemon_state();
         if self.daemon_running {
@@ -524,6 +608,11 @@ impl NvpnBackend {
     }
 
     fn disconnect_session(&mut self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            self.session_status = runtime.runtime_status_detail.to_string();
+            return Err(anyhow!(self.session_status.clone()));
+        }
         if self.daemon_running {
             self.pause_daemon_process()?;
         }
@@ -1016,6 +1105,10 @@ impl NvpnBackend {
     }
 
     fn install_cli_binary(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.cli_install_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = ["install-cli", "--force"];
         let output = self.run_nvpn_command(args)?;
 
@@ -1041,6 +1134,10 @@ impl NvpnBackend {
     }
 
     fn uninstall_cli_binary(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.cli_install_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = ["uninstall-cli"];
         let output = self.run_nvpn_command(args)?;
 
@@ -1066,6 +1163,10 @@ impl NvpnBackend {
     }
 
     fn install_system_service(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = [
             "service",
             "install",
@@ -1099,6 +1200,10 @@ impl NvpnBackend {
     }
 
     fn uninstall_system_service(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = [
             "service",
             "uninstall",
@@ -1131,6 +1236,10 @@ impl NvpnBackend {
     }
 
     fn enable_system_service(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = [
             "service",
             "enable",
@@ -1163,6 +1272,10 @@ impl NvpnBackend {
     }
 
     fn disable_system_service(&self) -> Result<()> {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            return Err(anyhow!(runtime.runtime_status_detail));
+        }
         let args = [
             "service",
             "disable",
@@ -1383,6 +1496,40 @@ impl NvpnBackend {
         self.ensure_peer_status_entries();
         self.sync_service_state();
 
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            self.daemon_state = None;
+            self.daemon_running = false;
+            self.session_active = false;
+            self.relay_connected = false;
+            self.session_status = runtime.runtime_status_detail.to_string();
+            self.magic_dns_status =
+                "DNS unavailable until mobile VPN service integration is wired up".to_string();
+
+            for relay in &self.config.nostr.relays {
+                self.relay_status.insert(
+                    relay.clone(),
+                    RelayStatus {
+                        state: "unknown".to_string(),
+                        status_text: "not checked".to_string(),
+                    },
+                );
+            }
+
+            for participant in self.config.all_participant_pubkeys_hex() {
+                let status = self.peer_status.entry(participant).or_default();
+                status.reachable = None;
+                status.last_handshake_at = None;
+                status.endpoint = None;
+                status.error = Some("vpn unavailable on this platform".to_string());
+                status.checked_at = Some(SystemTime::now());
+                status.last_signal_seen_at = None;
+                status.advertised_routes = Vec::new();
+                status.offers_exit_node = false;
+            }
+            return;
+        }
+
         let status = match self.fetch_cli_status() {
             Ok(status) => status,
             Err(error) => {
@@ -1469,6 +1616,17 @@ impl NvpnBackend {
     }
 
     fn sync_service_state(&mut self) {
+        let runtime = current_runtime_capabilities();
+        if !runtime.vpn_session_control_supported {
+            self.service_supported = false;
+            self.service_enablement_supported = false;
+            self.service_installed = false;
+            self.service_disabled = false;
+            self.service_running = false;
+            self.service_status_detail = "Background service unsupported on this platform".to_string();
+            return;
+        }
+
         match self.fetch_cli_service_status() {
             Ok(status) => {
                 self.service_supported = status.supported;
@@ -2076,6 +2234,7 @@ impl NvpnBackend {
     }
 
     fn ui_state(&self) -> UiState {
+        let runtime_capabilities = current_runtime_capabilities();
         let own_pubkey_hex = self.config.own_nostr_pubkey_hex().unwrap_or_default();
         let own_npub = to_npub(&own_pubkey_hex);
 
@@ -2129,10 +2288,17 @@ impl NvpnBackend {
             .unwrap_or_default();
 
         UiState {
+            platform: runtime_capabilities.platform.to_string(),
+            mobile: runtime_capabilities.mobile,
+            vpn_session_control_supported: runtime_capabilities.vpn_session_control_supported,
+            cli_install_supported: runtime_capabilities.cli_install_supported,
+            startup_settings_supported: runtime_capabilities.startup_settings_supported,
+            tray_behavior_supported: runtime_capabilities.tray_behavior_supported,
+            runtime_status_detail: runtime_capabilities.runtime_status_detail.to_string(),
             daemon_running: self.daemon_running,
             session_active: self.session_active,
             relay_connected: self.relay_connected,
-            cli_installed: cli_binary_installed(),
+            cli_installed: runtime_capabilities.cli_install_supported && cli_binary_installed(),
             service_supported: self.service_supported,
             service_enablement_supported: self.service_enablement_supported,
             service_installed: self.service_installed,
@@ -2735,14 +2901,41 @@ fn peer_presence_state_label(state: PeerPresenceStatus) -> &'static str {
     }
 }
 
-fn default_config_path() -> PathBuf {
-    if let Some(mut path) = dirs::config_dir() {
-        path.push("nvpn");
-        path.push("config.toml");
-        return path;
+fn config_path_from_roots(
+    app_config_dir: Option<&std::path::Path>,
+    dirs_config_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    if let Some(app_config_dir) = app_config_dir {
+        return app_config_dir.join("config.toml");
+    }
+
+    if let Some(dirs_config_dir) = dirs_config_dir {
+        return dirs_config_dir.join("nvpn").join("config.toml");
     }
 
     PathBuf::from("nvpn.toml")
+}
+
+fn default_config_path() -> PathBuf {
+    let config_dir = dirs::config_dir();
+    config_path_from_roots(None, config_dir.as_deref())
+}
+
+fn resolve_backend_config_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf> {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let app_config_dir = app
+            .path()
+            .app_config_dir()
+            .context("failed to resolve mobile app config directory")?;
+        return Ok(config_path_from_roots(Some(app_config_dir.as_path()), None));
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let _ = app;
+        Ok(default_config_path())
+    }
 }
 
 fn unix_timestamp() -> u64 {
@@ -2953,7 +3146,7 @@ fn gui_launch_disposition(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn resolve_gui_launch_conflicts(launched_from_autostart: bool) -> Result<GuiLaunchDisposition> {
     let output = ProcessCommand::new("ps")
         .args(["-axo", "pid=,command="])
@@ -2967,14 +3160,14 @@ fn resolve_gui_launch_conflicts(launched_from_autostart: bool) -> Result<GuiLaun
     ))
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn resolve_gui_launch_conflicts(_launched_from_autostart: bool) -> Result<GuiLaunchDisposition> {
     Ok(GuiLaunchDisposition::Continue {
         terminate_pids: Vec::new(),
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn terminate_gui_instances(pids: &[u32]) {
     if pids.is_empty() {
         return;
@@ -2988,9 +3181,10 @@ fn terminate_gui_instances(pids: &[u32]) {
     std::thread::sleep(Duration::from_millis(300));
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn terminate_gui_instances(_pids: &[u32]) {}
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn hide_main_window_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -3000,6 +3194,10 @@ fn hide_main_window_to_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let _ = window.hide();
 }
 
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn hide_main_window_to_tray<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
+
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
@@ -3008,6 +3206,11 @@ fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Resu
     let _ = window.unminimize();
     window.show()?;
     window.set_focus()?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn show_main_window<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
@@ -3322,6 +3525,7 @@ fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
     ]
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> TrayRuntimeState {
     let Some(state) = app.try_state::<AppState>() else {
         return TrayRuntimeState::default();
@@ -3332,6 +3536,7 @@ fn current_tray_runtime_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> T
     backend.tray_runtime_state()
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn append_tray_spec_to_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     menu: &Menu<R>,
@@ -3377,6 +3582,7 @@ fn append_tray_spec_to_menu<R: tauri::Runtime>(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn append_tray_spec_to_submenu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     submenu: &Submenu<R>,
@@ -3422,6 +3628,7 @@ fn append_tray_spec_to_submenu<R: tauri::Runtime>(
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn build_tray_submenu_from_spec<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     text: &str,
@@ -3435,6 +3642,7 @@ fn build_tray_submenu_from_spec<R: tauri::Runtime>(
     Ok(submenu)
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn build_tray_menu<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     runtime_state: &TrayRuntimeState,
@@ -3446,6 +3654,7 @@ fn build_tray_menu<R: tauri::Runtime>(
     Ok(menu)
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Some(tray) = app.tray_by_id(TRAY_ICON_ID) else {
         return;
@@ -3472,6 +3681,9 @@ fn refresh_tray_menu<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         *last_tray_runtime_state = runtime_state;
     }
 }
+
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn refresh_tray_menu<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) {}
 
 fn run_tray_backend_action<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -3780,11 +3992,6 @@ pub fn run() {
         .try_init();
 
     let launched_from_autostart = started_from_autostart();
-    let backend =
-        NvpnBackend::new(launched_from_autostart).expect("failed to initialize GUI backend state");
-    let launch_on_startup_default = backend.config.launch_on_startup;
-    let initial_tray_state = backend.tray_runtime_state();
-    let setup_tray_state = initial_tray_state.clone();
     match resolve_gui_launch_conflicts(launched_from_autostart) {
         Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
             terminate_gui_instances(&terminate_pids);
@@ -3794,17 +4001,37 @@ pub fn run() {
             eprintln!("gui: failed to resolve GUI launch conflicts: {error}");
         }
     }
-    let mut builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-    {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        |app, args, _cwd| {
             if should_surface_existing_instance_args(args.iter()) {
                 let _ = show_main_window(app);
             }
-        }));
-    }
+        },
+    ));
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+    let builder = tauri::Builder::default();
     let app = builder
         .setup(move |app| {
+            #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+            let _ = app;
+
+            let config_path = resolve_backend_config_path(app.handle())
+                .context("failed to resolve GUI config path")?;
+            let backend = NvpnBackend::new(config_path, launched_from_autostart)
+                .context("failed to initialize GUI backend state")?;
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            let launch_on_startup_default = backend.config.launch_on_startup;
+            let initial_tray_state = backend.tray_runtime_state();
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            let setup_tray_state = initial_tray_state.clone();
+            if !app.manage(AppState {
+                backend: Mutex::new(backend),
+                last_tray_runtime_state: Mutex::new(initial_tray_state),
+            }) {
+                return Err(anyhow!("application state already initialized").into());
+            }
+
             #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             app.handle().plugin(tauri_plugin_autostart::init(
                 tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -3827,140 +4054,139 @@ pub fn run() {
                 }
             }
 
-            let tray_menu = build_tray_menu(app.handle(), &setup_tray_state)?;
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+            {
+                let tray_menu = build_tray_menu(app.handle(), &setup_tray_state)?;
 
-            let tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
-                .tooltip("Nostr VPN")
-                .menu(&tray_menu)
-                .on_menu_event(|app, event| {
-                    let menu_id = event.id().as_ref();
-                    match menu_id {
-                        TRAY_OPEN_MENU_ID => {
-                            let _ = show_main_window(app);
-                        }
-                        TRAY_IDENTITY_MENU_ID => {
-                            let runtime_state = current_tray_runtime_state(app);
-                            if let Err(error) = copy_text_to_clipboard(&runtime_state.identity_npub)
-                            {
-                                run_tray_backend_action(app, |_backend| Err(error));
+                let tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
+                    .tooltip("Nostr VPN")
+                    .menu(&tray_menu)
+                    .on_menu_event(|app, event| {
+                        let menu_id = event.id().as_ref();
+                        match menu_id {
+                            TRAY_OPEN_MENU_ID => {
+                                let _ = show_main_window(app);
+                            }
+                            TRAY_IDENTITY_MENU_ID => {
+                                let runtime_state = current_tray_runtime_state(app);
+                                if let Err(error) = copy_text_to_clipboard(&runtime_state.identity_npub)
+                                {
+                                    run_tray_backend_action(app, |_backend| Err(error));
+                                    refresh_tray_menu(app);
+                                }
+                            }
+                            TRAY_VPN_TOGGLE_MENU_ID => {
+                                let runtime_state = current_tray_runtime_state(app);
+                                run_tray_backend_action(app, |backend| {
+                                    if runtime_state.session_active {
+                                        backend
+                                            .disconnect_session()
+                                            .context("failed to pause VPN session")?;
+                                    } else if runtime_state.service_setup_required {
+                                        backend
+                                            .install_system_service()
+                                            .context("failed to install background service")?;
+                                        backend.tick();
+                                        if !backend.session_active {
+                                            backend
+                                                .connect_session()
+                                                .context("failed to resume VPN session")?;
+                                        }
+                                    } else if runtime_state.service_enable_required {
+                                        backend
+                                            .enable_system_service()
+                                            .context("failed to enable background service")?;
+                                        backend.tick();
+                                        if !backend.session_active {
+                                            backend
+                                                .connect_session()
+                                                .context("failed to resume VPN session")?;
+                                        }
+                                    } else {
+                                        backend
+                                            .connect_session()
+                                            .context("failed to resume VPN session")?;
+                                    }
+                                    Ok(())
+                                });
                                 refresh_tray_menu(app);
                             }
-                        }
-                        TRAY_VPN_TOGGLE_MENU_ID => {
-                            let runtime_state = current_tray_runtime_state(app);
-                            run_tray_backend_action(app, |backend| {
-                                if runtime_state.session_active {
+                            TRAY_RUN_EXIT_NODE_MENU_ID => {
+                                let runtime_state = current_tray_runtime_state(app);
+                                run_tray_backend_action(app, |backend| {
                                     backend
-                                        .disconnect_session()
-                                        .context("failed to pause VPN session")?;
-                                } else if runtime_state.service_setup_required {
+                                        .update_settings(SettingsPatch {
+                                            advertise_exit_node: Some(
+                                                !runtime_state.advertise_exit_node,
+                                            ),
+                                            ..Default::default()
+                                        })
+                                        .context("failed to toggle run exit node setting")
+                                });
+                                refresh_tray_menu(app);
+                            }
+                            TRAY_EXIT_NODE_NONE_MENU_ID => {
+                                run_tray_backend_action(app, |backend| {
                                     backend
-                                        .install_system_service()
-                                        .context("failed to install background service")?;
-                                    backend.tick();
-                                    if !backend.session_active {
-                                        backend
-                                            .connect_session()
-                                            .context("failed to resume VPN session")?;
-                                    }
-                                } else if runtime_state.service_enable_required {
+                                        .update_settings(SettingsPatch {
+                                            exit_node: Some(String::new()),
+                                            ..Default::default()
+                                        })
+                                        .context("failed to clear exit node")
+                                });
+                                refresh_tray_menu(app);
+                            }
+                            TRAY_QUIT_UI_MENU_ID => {
+                                app.exit(0);
+                            }
+                            _ if menu_id.starts_with(TRAY_EXIT_NODE_MENU_ID_PREFIX) => {
+                                let selected = menu_id
+                                    .strip_prefix(TRAY_EXIT_NODE_MENU_ID_PREFIX)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                run_tray_backend_action(app, |backend| {
                                     backend
-                                        .enable_system_service()
-                                        .context("failed to enable background service")?;
-                                    backend.tick();
-                                    if !backend.session_active {
-                                        backend
-                                            .connect_session()
-                                            .context("failed to resume VPN session")?;
-                                    }
-                                } else {
-                                    backend
-                                        .connect_session()
-                                        .context("failed to resume VPN session")?;
-                                }
-                                Ok(())
-                            });
-                            refresh_tray_menu(app);
+                                        .update_settings(SettingsPatch {
+                                            exit_node: Some(selected),
+                                            ..Default::default()
+                                        })
+                                        .context("failed to set exit node")
+                                });
+                                refresh_tray_menu(app);
+                            }
+                            _ => {}
                         }
-                        TRAY_RUN_EXIT_NODE_MENU_ID => {
-                            let runtime_state = current_tray_runtime_state(app);
-                            run_tray_backend_action(app, |backend| {
-                                backend
-                                    .update_settings(SettingsPatch {
-                                        advertise_exit_node: Some(
-                                            !runtime_state.advertise_exit_node,
-                                        ),
-                                        ..Default::default()
-                                    })
-                                    .context("failed to toggle run exit node setting")
-                            });
-                            refresh_tray_menu(app);
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button,
+                            button_state,
+                            ..
+                        } = event
+                            && button == MouseButton::Left
+                            && button_state == MouseButtonState::Up
+                        {
+                            let _ = show_main_window(tray.app_handle());
                         }
-                        TRAY_EXIT_NODE_NONE_MENU_ID => {
-                            run_tray_backend_action(app, |backend| {
-                                backend
-                                    .update_settings(SettingsPatch {
-                                        exit_node: Some(String::new()),
-                                        ..Default::default()
-                                    })
-                                    .context("failed to clear exit node")
-                            });
-                            refresh_tray_menu(app);
-                        }
-                        TRAY_QUIT_UI_MENU_ID => {
-                            app.exit(0);
-                        }
-                        _ if menu_id.starts_with(TRAY_EXIT_NODE_MENU_ID_PREFIX) => {
-                            let selected = menu_id
-                                .strip_prefix(TRAY_EXIT_NODE_MENU_ID_PREFIX)
-                                .unwrap_or_default()
-                                .to_string();
-                            run_tray_backend_action(app, |backend| {
-                                backend
-                                    .update_settings(SettingsPatch {
-                                        exit_node: Some(selected),
-                                        ..Default::default()
-                                    })
-                                    .context("failed to set exit node")
-                            });
-                            refresh_tray_menu(app);
-                        }
-                        _ => {}
-                    }
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button,
-                        button_state,
-                        ..
-                    } = event
-                        && button == MouseButton::Left
-                        && button_state == MouseButtonState::Up
-                    {
-                        let _ = show_main_window(tray.app_handle());
-                    }
-                });
+                    });
 
-            #[cfg(target_os = "macos")]
-            let tray_builder =
-                if let Ok(icon) = Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
-                    tray_builder.icon(icon).icon_as_template(true)
-                } else {
-                    eprintln!("tray: failed to load bundled template icon");
-                    tray_builder
-                };
+                #[cfg(target_os = "macos")]
+                let tray_builder =
+                    if let Ok(icon) = Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
+                        tray_builder.icon(icon).icon_as_template(true)
+                    } else {
+                        eprintln!("tray: failed to load bundled template icon");
+                        tray_builder
+                    };
 
-            tray_builder.build(app)?;
+                tray_builder.build(app)?;
 
-            if launched_from_autostart {
-                hide_main_window_to_tray(app.handle());
+                if launched_from_autostart {
+                    hide_main_window_to_tray(app.handle());
+                }
             }
 
             Ok(())
-        })
-        .manage(AppState {
-            backend: Mutex::new(backend),
-            last_tray_runtime_state: Mutex::new(initial_tray_state),
         })
         .invoke_handler(tauri::generate_handler![
             tick,
@@ -3986,6 +4212,10 @@ pub fn run() {
             update_settings,
         ])
         .on_window_event(|window, event| {
+            #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+            let _ = (window, event);
+
+            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
             if let WindowEvent::CloseRequested { api, .. } = event
                 && should_close_to_tray(window.app_handle())
             {
@@ -4007,16 +4237,16 @@ mod tests {
         PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID,
         TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
         apply_network_invite_to_active_network, cli_binary_installed_at, expected_peer_count,
-        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        extract_json_document, config_path_from_roots, gui_launch_disposition, gui_requires_service_enable,
         gui_requires_service_install, is_already_running_message, is_mesh_complete,
         is_not_running_message, network_device_count, network_online_device_count,
         parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
         parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, should_defer_gui_daemon_start_to_service_on_autostart,
+        peer_state_label, runtime_capabilities_for_platform, should_defer_gui_daemon_start_to_service_on_autostart,
         should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
         started_from_autostart_args, to_npub, tray_exit_node_entries, tray_identity_text,
         tray_menu_spec, tray_network_groups, tray_status_text, validate_nvpn_binary,
-        within_peer_online_grace, within_peer_presence_grace,
+        within_peer_online_grace, within_peer_presence_grace, RuntimePlatform,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -4879,5 +5109,55 @@ mod tests {
 
         let _ = std::fs::remove_file(file_path);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn android_runtime_capabilities_disable_desktop_management_features() {
+        let capabilities = runtime_capabilities_for_platform(RuntimePlatform::Android);
+
+        assert_eq!(capabilities.platform, "android");
+        assert!(capabilities.mobile);
+        assert!(!capabilities.vpn_session_control_supported);
+        assert!(!capabilities.cli_install_supported);
+        assert!(!capabilities.startup_settings_supported);
+        assert!(!capabilities.tray_behavior_supported);
+        assert!(
+            capabilities
+                .runtime_status_detail
+                .contains("Android VPN service integration")
+        );
+    }
+
+    #[test]
+    fn desktop_runtime_capabilities_keep_existing_management_features() {
+        let capabilities = runtime_capabilities_for_platform(RuntimePlatform::Desktop);
+
+        assert_eq!(capabilities.platform, "desktop");
+        assert!(!capabilities.mobile);
+        assert!(capabilities.vpn_session_control_supported);
+        assert!(capabilities.cli_install_supported);
+        assert!(capabilities.startup_settings_supported);
+        assert!(capabilities.tray_behavior_supported);
+        assert_eq!(capabilities.runtime_status_detail, "");
+    }
+
+    #[test]
+    fn config_path_from_roots_prefers_mobile_app_config_dir() {
+        let path = config_path_from_roots(
+            Some(std::path::Path::new("/data/user/0/to.iris.nvpn/files")),
+            Some(std::path::Path::new("/home/test/.config")),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("/data/user/0/to.iris.nvpn/files/config.toml")
+        );
+    }
+
+    #[test]
+    fn config_path_from_roots_uses_dirs_config_dir_when_mobile_dir_missing() {
+        let path = config_path_from_roots(None, Some(std::path::Path::new("/home/test/.config")));
+
+        assert_eq!(path, PathBuf::from("/home/test/.config/nvpn/config.toml"));
     }
 }
