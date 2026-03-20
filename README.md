@@ -209,6 +209,10 @@ Low-level helper commands are also available when you want to work below the dae
 
 The GUI lives in [`crates/nostr-vpn-gui`](crates/nostr-vpn-gui) and is a Tauri app backed by the same config and daemon used by `nvpn`.
 
+<p align="center">
+  <img src="docs/images/desktop-gui-overview.png" alt="Nostr VPN desktop app showing a connected network, device identity, status badges, and join controls." width="900">
+</p>
+
 Run it in development:
 
 ```bash
