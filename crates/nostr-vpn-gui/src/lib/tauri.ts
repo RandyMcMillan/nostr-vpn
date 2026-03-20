@@ -66,15 +66,21 @@ const decodeInvitePayload = (invite: string): MockNetworkInvite => {
   return JSON.parse(new TextDecoder().decode(bytes)) as MockNetworkInvite
 }
 
-const countExpected = (network: NetworkView) =>
+const countExpectedPeers = (network: NetworkView) =>
   network.enabled
     ? network.participants.filter((participant) => participant.state !== 'local').length
     : 0
 
-const countOnline = (network: NetworkView) =>
+const countOnlinePeers = (network: NetworkView) =>
   network.enabled
     ? network.participants.filter((participant) => participant.state === 'online').length
     : 0
+
+const countExpectedDevices = (network: NetworkView) =>
+  network.enabled ? countExpectedPeers(network) + 1 : 0
+
+const countOnlineDevices = (network: NetworkView, sessionActive: boolean) =>
+  network.enabled ? countOnlinePeers(network) + Number(sessionActive) : 0
 
 const computeMockEffectiveAdvertisedRoutes = () => {
   const effective = [...mockState.advertisedRoutes]
@@ -208,15 +214,15 @@ const updateMockRelaySummary = () => {
 const recomputeMockConnectivity = () => {
   mockState.networks = mockState.networks.map((network) => ({
     ...network,
-    onlineCount: countOnline(network),
-    expectedCount: countExpected(network),
+    onlineCount: countOnlineDevices(network, mockState.sessionActive),
+    expectedCount: countExpectedDevices(network),
   }))
 
   const activeNetwork = mockActiveNetwork()
   mockState.networkId = activeNetwork?.networkId || mockState.networkId
   mockState.activeNetworkInvite = buildMockActiveNetworkInvite()
-  mockState.connectedPeerCount = activeNetwork?.onlineCount || 0
-  mockState.expectedPeerCount = activeNetwork?.expectedCount || 0
+  mockState.connectedPeerCount = activeNetwork ? countOnlinePeers(activeNetwork) : 0
+  mockState.expectedPeerCount = activeNetwork ? countExpectedPeers(activeNetwork) : 0
   mockState.meshReady =
     mockState.expectedPeerCount > 0 &&
     mockState.connectedPeerCount >= mockState.expectedPeerCount

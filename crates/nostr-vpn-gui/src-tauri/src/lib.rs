@@ -33,7 +33,9 @@ use tokio::runtime::Runtime;
 const LAN_DISCOVERY_ADDR: [u8; 4] = [239, 255, 73, 73];
 const LAN_DISCOVERY_PORT: u16 = 38911;
 const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
-const PEER_ONLINE_GRACE_SECS: u64 = 20;
+// Keep the GUI's online/offline grace aligned with the daemon's WireGuard
+// session window so idle peers do not flap back to "awaiting handshake".
+const PEER_ONLINE_GRACE_SECS: u64 = 180;
 const PEER_PRESENCE_GRACE_SECS: u64 = 45;
 const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
@@ -1742,7 +1744,7 @@ impl NvpnBackend {
                 })
                 .collect::<Vec<_>>();
 
-            let expected_count = if network.enabled {
+            let remote_expected_count = if network.enabled {
                 participants
                     .iter()
                     .filter(|participant| Some(participant.as_str()) != own_pubkey_hex.as_deref())
@@ -1751,7 +1753,7 @@ impl NvpnBackend {
                 0
             };
 
-            let online_count = if network.enabled {
+            let remote_online_count = if network.enabled {
                 participants
                     .iter()
                     .filter(|participant| Some(participant.as_str()) != own_pubkey_hex.as_deref())
@@ -1765,6 +1767,13 @@ impl NvpnBackend {
             } else {
                 0
             };
+
+            let expected_count = network_device_count(remote_expected_count, network.enabled);
+            let online_count = network_online_device_count(
+                remote_online_count,
+                network.enabled,
+                self.session_active,
+            );
 
             rows.push(NetworkView {
                 id: network.id.clone(),
@@ -2678,6 +2687,26 @@ fn connected_configured_peer_count(
                 .unwrap_or(false)
         })
         .count()
+}
+
+fn network_device_count(remote_device_count: usize, enabled: bool) -> usize {
+    if enabled {
+        remote_device_count.saturating_add(1)
+    } else {
+        0
+    }
+}
+
+fn network_online_device_count(
+    remote_online_count: usize,
+    enabled: bool,
+    session_active: bool,
+) -> usize {
+    if enabled {
+        remote_online_count.saturating_add(usize::from(session_active))
+    } else {
+        0
+    }
 }
 
 fn is_mesh_complete(connected: usize, expected: usize) -> bool {
@@ -3970,23 +3999,115 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfiguredPeerStatus, GuiLaunchDisposition, NETWORK_INVITE_PREFIX, NetworkInvite,
-        NetworkView, ParticipantView, PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID,
-        TRAY_RUN_EXIT_NODE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
+        ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
+        NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
+        PeerPresenceStatus, TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID,
+        TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
         apply_network_invite_to_active_network, cli_binary_installed_at, expected_peer_count,
         extract_json_document, gui_launch_disposition, gui_requires_service_enable,
         gui_requires_service_install, is_already_running_message, is_mesh_complete,
-        is_not_running_message, parse_advertised_routes_input, parse_exit_node_input,
-        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label,
-        should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
-        should_surface_existing_instance_args, started_from_autostart_args, to_npub,
-        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
-        tray_status_text, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        is_not_running_message, network_device_count, network_online_device_count,
+        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
+        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, should_defer_gui_daemon_start_to_service_on_autostart,
+        should_start_gui_daemon_on_launch, should_surface_existing_instance_args,
+        started_from_autostart_args, to_npub, tray_exit_node_entries, tray_identity_text,
+        tray_menu_spec, tray_network_groups, tray_status_text, validate_nvpn_binary,
+        within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
+    use tokio::runtime::Runtime;
+
+    fn test_backend(participant: &str) -> NvpnBackend {
+        let mut config = AppConfig::generated();
+        config.networks[0].participants = vec![participant.to_string()];
+
+        NvpnBackend {
+            runtime: Runtime::new().expect("test runtime"),
+            config_path: PathBuf::from("/tmp/nvpn-gui-test.toml"),
+            config,
+            nvpn_bin: None,
+            session_status: "Disconnected".to_string(),
+            daemon_running: false,
+            session_active: false,
+            relay_connected: false,
+            service_supported: false,
+            service_enablement_supported: false,
+            service_installed: false,
+            service_disabled: false,
+            service_running: false,
+            service_status_detail: String::new(),
+            daemon_state: None,
+            relay_status: HashMap::new(),
+            peer_status: HashMap::new(),
+            lan_discovery_running: false,
+            lan_discovery_rx: None,
+            lan_discovery_stop: None,
+            lan_peers: HashMap::new(),
+            magic_dns_status: String::new(),
+        }
+    }
+
+    fn epoch_secs_ago(age_secs: u64) -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_secs()
+            .saturating_sub(age_secs)
+    }
+
+    fn daemon_peer(
+        participant: &str,
+        reachable: bool,
+        signal_age_secs: Option<u64>,
+        error: Option<&str>,
+        endpoint: &str,
+    ) -> DaemonPeerState {
+        DaemonPeerState {
+            participant_pubkey: participant.to_string(),
+            node_id: "peer-a".to_string(),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            endpoint: endpoint.to_string(),
+            public_key: "peer-public-key".to_string(),
+            advertised_routes: Vec::new(),
+            presence_timestamp: signal_age_secs.map(epoch_secs_ago).unwrap_or(0),
+            last_signal_seen_at: signal_age_secs.map(epoch_secs_ago),
+            reachable,
+            last_handshake_at: if reachable {
+                Some(epoch_secs_ago(5))
+            } else {
+                None
+            },
+            error: error.map(str::to_string),
+        }
+    }
+
+    fn daemon_state_with_peer(
+        peer: Option<DaemonPeerState>,
+        session_active: bool,
+    ) -> DaemonRuntimeState {
+        let connected_peer_count = usize::from(peer.as_ref().is_some_and(|value| value.reachable));
+        DaemonRuntimeState {
+            updated_at: epoch_secs_ago(0),
+            session_active,
+            relay_connected: false,
+            session_status: if session_active {
+                "Connecting to relays".to_string()
+            } else {
+                "Disconnected".to_string()
+            },
+            expected_peer_count: 1,
+            connected_peer_count,
+            mesh_ready: connected_peer_count > 0,
+            health: Vec::new(),
+            network: Default::default(),
+            port_mapping: Default::default(),
+            peers: peer.into_iter().collect(),
+        }
+    }
 
     #[test]
     fn expected_peer_count_excludes_own_participant_when_present() {
@@ -4008,6 +4129,21 @@ mod tests {
         assert!(!is_mesh_complete(0, 0));
         assert!(!is_mesh_complete(1, 2));
         assert!(is_mesh_complete(2, 2));
+    }
+
+    #[test]
+    fn enabled_network_device_count_includes_local_device() {
+        assert_eq!(network_device_count(0, true), 1);
+        assert_eq!(network_device_count(2, true), 3);
+        assert_eq!(network_device_count(2, false), 0);
+    }
+
+    #[test]
+    fn online_network_device_count_only_includes_local_when_session_is_active() {
+        assert_eq!(network_online_device_count(0, true, true), 1);
+        assert_eq!(network_online_device_count(1, true, true), 2);
+        assert_eq!(network_online_device_count(1, true, false), 1);
+        assert_eq!(network_online_device_count(1, false, true), 0);
     }
 
     #[test]
@@ -4057,14 +4193,18 @@ mod tests {
     }
 
     #[test]
-    fn peer_online_grace_keeps_recent_handshake_online() {
+    fn peer_online_grace_matches_wireguard_session_window() {
         let now = SystemTime::now();
         assert!(within_peer_online_grace(
             Some(now - Duration::from_secs(5)),
             now
         ));
+        assert!(within_peer_online_grace(
+            Some(now - Duration::from_secs(120)),
+            now
+        ));
         assert!(!within_peer_online_grace(
-            Some(now - Duration::from_secs(25)),
+            Some(now - Duration::from_secs(181)),
             now
         ));
         assert!(!within_peer_online_grace(None, now));
@@ -4094,6 +4234,118 @@ mod tests {
         assert_eq!(
             peer_presence_state_label(PeerPresenceStatus::Absent),
             "absent"
+        );
+    }
+
+    #[test]
+    fn refresh_peer_runtime_status_marks_missing_signal_as_offline() {
+        let participant = "11".repeat(32);
+        let mut backend = test_backend(&participant);
+        backend.session_active = true;
+        backend.daemon_state = Some(daemon_state_with_peer(None, true));
+
+        backend.refresh_peer_runtime_status();
+
+        assert_eq!(
+            backend.peer_state_for(&participant, None),
+            ConfiguredPeerStatus::Offline
+        );
+        assert_eq!(
+            backend
+                .peer_status
+                .get(&participant)
+                .and_then(|status| status.error.as_deref()),
+            Some("no signal yet")
+        );
+    }
+
+    #[test]
+    fn refresh_peer_runtime_status_marks_fresh_signal_without_handshake_as_pending() {
+        let participant = "22".repeat(32);
+        let mut backend = test_backend(&participant);
+        backend.session_active = true;
+        backend.daemon_state = Some(daemon_state_with_peer(
+            Some(daemon_peer(
+                &participant,
+                false,
+                Some(5),
+                Some("awaiting handshake"),
+                "203.0.113.20:51820",
+            )),
+            true,
+        ));
+
+        backend.refresh_peer_runtime_status();
+
+        assert_eq!(
+            backend.peer_state_for(&participant, None),
+            ConfiguredPeerStatus::Present
+        );
+        assert_eq!(
+            backend.peer_presence_state_for(&participant, None),
+            PeerPresenceStatus::Present
+        );
+        assert!(
+            backend
+                .peer_status_line(&participant, ConfiguredPeerStatus::Present)
+                .contains("awaiting WireGuard handshake via")
+        );
+    }
+
+    #[test]
+    fn refresh_peer_runtime_status_marks_stale_signal_as_offline() {
+        let participant = "33".repeat(32);
+        let mut backend = test_backend(&participant);
+        backend.session_active = true;
+        backend.daemon_state = Some(daemon_state_with_peer(
+            Some(daemon_peer(
+                &participant,
+                false,
+                Some(90),
+                Some("signal stale"),
+                "203.0.113.20:51820",
+            )),
+            true,
+        ));
+
+        backend.refresh_peer_runtime_status();
+
+        assert_eq!(
+            backend.peer_state_for(&participant, None),
+            ConfiguredPeerStatus::Offline
+        );
+        assert_eq!(
+            backend.peer_presence_state_for(&participant, None),
+            PeerPresenceStatus::Absent
+        );
+        assert!(
+            backend
+                .peer_status_line(&participant, ConfiguredPeerStatus::Offline)
+                .contains("signal stale")
+        );
+    }
+
+    #[test]
+    fn tray_status_text_distinguishes_connected_service_and_disconnected_states() {
+        assert_eq!(
+            tray_status_text(true, false, false, "Connecting to relays"),
+            "Connected"
+        );
+        assert_eq!(
+            tray_status_text(false, true, false, "Disconnected"),
+            "Install background service"
+        );
+        assert_eq!(
+            tray_status_text(false, false, true, "Disconnected"),
+            "Enable background service"
+        );
+        assert_eq!(
+            tray_status_text(false, false, false, "Disconnected"),
+            "Disconnected"
+        );
+        assert_eq!(
+            tray_status_text(false, false, false, "Private announce failed"),
+            "Private announce failed"
         );
     }
 

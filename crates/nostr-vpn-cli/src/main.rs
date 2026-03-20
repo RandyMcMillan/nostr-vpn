@@ -64,7 +64,10 @@ const PEER_SIGNAL_TIMEOUT_MULTIPLIER: u64 = 3;
 const MIN_PEER_PATH_CACHE_TIMEOUT_SECS: u64 = 60;
 const PEER_PATH_CACHE_TIMEOUT_MULTIPLIER: u64 = 3;
 const PEER_PATH_RETRY_AFTER_SECS: u64 = 5;
-const PEER_ONLINE_GRACE_SECS: u64 = 20;
+// boringtun reports time since the last completed WireGuard handshake. Idle
+// sessions can stay healthy for roughly the reject-after window (~180s), so a
+// 20s cutoff misclassifies healthy peers as disconnected.
+const PEER_ONLINE_GRACE_SECS: u64 = 180;
 const DIRECT_MESH_BOOTSTRAP_RELAY_DELAY_SECS: u64 = 5;
 const MIN_PERSISTED_PEER_CACHE_TIMEOUT_SECS: u64 = 600;
 const PERSISTED_PEER_CACHE_TIMEOUT_MULTIPLIER: u64 = 30;
@@ -2801,6 +2804,47 @@ fn peer_has_recent_handshake(runtime_peer: &WireGuardPeerStatus) -> bool {
         .is_some_and(|age| age <= Duration::from_secs(PEER_ONLINE_GRACE_SECS))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonPeerTransportState {
+    reachable: bool,
+    last_handshake_at: Option<u64>,
+    error: Option<String>,
+}
+
+fn daemon_peer_transport_state(
+    announcement: Option<&PeerAnnouncement>,
+    signal_active: bool,
+    runtime_peer: Option<&WireGuardPeerStatus>,
+    now: u64,
+) -> DaemonPeerTransportState {
+    let Some(announcement) = announcement else {
+        return DaemonPeerTransportState {
+            reachable: false,
+            last_handshake_at: None,
+            error: Some("no signal yet".to_string()),
+        };
+    };
+
+    let reachable = runtime_peer.is_some_and(peer_has_recent_handshake);
+    let error = if key_b64_to_hex(&announcement.public_key).is_err() {
+        Some("invalid peer key".to_string())
+    } else if !signal_active && !reachable {
+        Some("signal stale".to_string())
+    } else if runtime_peer.is_none() {
+        Some("peer not in tunnel runtime".to_string())
+    } else if !reachable {
+        Some("awaiting handshake".to_string())
+    } else {
+        None
+    };
+
+    DaemonPeerTransportState {
+        reachable,
+        last_handshake_at: runtime_peer.and_then(|peer| peer.last_handshake_at(now)),
+        error,
+    }
+}
+
 fn connected_peer_count_for_runtime(
     app: &AppConfig,
     own_pubkey: Option<&str>,
@@ -5083,6 +5127,7 @@ fn build_daemon_runtime_state(
         }
 
         let Some(announcement) = presence.announcement_for(participant) else {
+            let transport = daemon_peer_transport_state(None, false, None, now);
             peers.push(DaemonPeerState {
                 participant_pubkey: participant.clone(),
                 node_id: String::new(),
@@ -5092,28 +5137,17 @@ fn build_daemon_runtime_state(
                 advertised_routes: Vec::new(),
                 presence_timestamp: 0,
                 last_signal_seen_at: None,
-                reachable: false,
-                last_handshake_at: None,
-                error: Some("no signal yet".to_string()),
+                reachable: transport.reachable,
+                last_handshake_at: transport.last_handshake_at,
+                error: transport.error,
             });
             continue;
         };
 
         let signal_active = presence.active().contains_key(participant);
-        let peer_pubkey_hex = key_b64_to_hex(&announcement.public_key).ok();
         let runtime_peer = peer_runtime_lookup(announcement, runtime_peers.as_ref());
-        let reachable = runtime_peer.is_some_and(peer_has_recent_handshake);
-        let error = if peer_pubkey_hex.is_none() {
-            Some("invalid peer key".to_string())
-        } else if !signal_active && !reachable {
-            Some("signal stale".to_string())
-        } else if runtime_peer.is_none() {
-            Some("peer not in tunnel runtime".to_string())
-        } else if !reachable {
-            Some("awaiting handshake".to_string())
-        } else {
-            None
-        };
+        let transport =
+            daemon_peer_transport_state(Some(announcement), signal_active, runtime_peer, now);
 
         peers.push(DaemonPeerState {
             participant_pubkey: participant.clone(),
@@ -5124,9 +5158,9 @@ fn build_daemon_runtime_state(
             advertised_routes: announcement.advertised_routes.clone(),
             presence_timestamp: announcement.timestamp,
             last_signal_seen_at: presence.last_seen_at(participant),
-            reachable,
-            last_handshake_at: runtime_peer.and_then(|peer| peer.last_handshake_at(now)),
-            error,
+            reachable: transport.reachable,
+            last_handshake_at: transport.last_handshake_at,
+            error: transport.error,
         });
     }
 
@@ -8328,9 +8362,9 @@ mod tests {
         announcement_fingerprint, apply_participants_override, build_daemon_reload_config,
         build_peer_announcement, build_runtime_magic_dns_records, can_reuse_active_listen_port,
         connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
-        daemon_pids_from_ps_output, daemon_reconnect_backoff_delay, daemon_session_active,
-        daemon_session_idle_status, default_cli_install_path, endpoint_with_listen_port,
-        install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
+        daemon_peer_transport_state, daemon_pids_from_ps_output, daemon_reconnect_backoff_delay,
+        daemon_session_active, daemon_session_idle_status, default_cli_install_path,
+        endpoint_with_listen_port, install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
         kill_error_requires_control_fallback, linux_default_route_device_from_output,
         linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
         linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
@@ -8361,6 +8395,19 @@ mod tests {
     use nostr_vpn_core::paths::PeerPathBook;
     use nostr_vpn_core::presence::PeerPresenceBook;
     use nostr_vpn_core::signaling::SignalPayload;
+
+    fn sample_peer_announcement(public_key: String) -> PeerAnnouncement {
+        PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key,
+            endpoint: "203.0.113.20:51820".to_string(),
+            local_endpoint: Some("192.168.1.20:51820".to_string()),
+            public_endpoint: Some("203.0.113.20:51820".to_string()),
+            tunnel_ip: "10.44.0.2/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 1,
+        }
+    }
 
     #[test]
     fn clap_binary_name_is_nvpn() {
@@ -8631,14 +8678,87 @@ mod tests {
     }
 
     #[test]
+    fn idle_handshake_within_wireguard_session_window_counts_mesh_as_ready() {
+        let runtime_peer = WireGuardPeerStatus {
+            endpoint: Some("203.0.113.20:51820".to_string()),
+            last_handshake_sec: Some(120),
+            last_handshake_nsec: Some(0),
+        };
+
+        assert!(peer_has_recent_handshake(&runtime_peer));
+    }
+
+    #[test]
     fn stale_handshake_does_not_count_mesh_as_ready() {
         let runtime_peer = WireGuardPeerStatus {
             endpoint: Some("203.0.113.20:51820".to_string()),
-            last_handshake_sec: Some(30),
+            last_handshake_sec: Some(181),
             last_handshake_nsec: Some(0),
         };
 
         assert!(!peer_has_recent_handshake(&runtime_peer));
+    }
+
+    #[test]
+    fn daemon_peer_transport_state_reports_missing_signal() {
+        let state = daemon_peer_transport_state(None, false, None, 1_700_000_000);
+
+        assert!(!state.reachable);
+        assert_eq!(state.last_handshake_at, None);
+        assert_eq!(state.error.as_deref(), Some("no signal yet"));
+    }
+
+    #[test]
+    fn daemon_peer_transport_state_reports_invalid_peer_key() {
+        let announcement = sample_peer_announcement("not-a-wireguard-key".to_string());
+
+        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
+
+        assert!(!state.reachable);
+        assert_eq!(state.error.as_deref(), Some("invalid peer key"));
+    }
+
+    #[test]
+    fn daemon_peer_transport_state_reports_signal_stale_before_runtime_error() {
+        let keys = generate_keypair();
+        let announcement = sample_peer_announcement(keys.public_key);
+
+        let state = daemon_peer_transport_state(Some(&announcement), false, None, 1_700_000_000);
+
+        assert!(!state.reachable);
+        assert_eq!(state.error.as_deref(), Some("signal stale"));
+    }
+
+    #[test]
+    fn daemon_peer_transport_state_reports_missing_runtime_peer_for_fresh_signal() {
+        let keys = generate_keypair();
+        let announcement = sample_peer_announcement(keys.public_key);
+
+        let state = daemon_peer_transport_state(Some(&announcement), true, None, 1_700_000_000);
+
+        assert!(!state.reachable);
+        assert_eq!(state.error.as_deref(), Some("peer not in tunnel runtime"));
+    }
+
+    #[test]
+    fn daemon_peer_transport_state_reports_awaiting_handshake_when_runtime_peer_is_idle() {
+        let keys = generate_keypair();
+        let announcement = sample_peer_announcement(keys.public_key);
+        let runtime_peer = WireGuardPeerStatus {
+            endpoint: Some("203.0.113.20:51820".to_string()),
+            ..WireGuardPeerStatus::default()
+        };
+
+        let state = daemon_peer_transport_state(
+            Some(&announcement),
+            true,
+            Some(&runtime_peer),
+            1_700_000_000,
+        );
+
+        assert!(!state.reachable);
+        assert_eq!(state.last_handshake_at, None);
+        assert_eq!(state.error.as_deref(), Some("awaiting handshake"));
     }
 
     #[test]

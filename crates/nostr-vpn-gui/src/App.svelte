@@ -3,6 +3,7 @@
   import { Check, Copy, Trash2 } from 'lucide-svelte'
   import QRCode from 'qrcode'
 
+  import { heroStateText } from './lib/hero-state.js'
   import {
     addNetwork,
     addParticipant,
@@ -258,19 +259,6 @@
     return 'muted'
   }
 
-  const heroStateText = (state: UiState) => {
-    if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
-      return 'Service required'
-    }
-    if (state.meshReady) {
-      return 'Connected'
-    }
-    if (state.sessionActive) {
-      return 'Connecting'
-    }
-    return 'Disconnected'
-  }
-
   const heroSubtext = (state: UiState) => {
     const network = activeNetwork(state)
     if ((serviceInstallRecommended || serviceEnableRecommended) && !state.sessionActive) {
@@ -293,10 +281,13 @@
   const networkPeerSummary = (network: NetworkView) => {
     const saved = `${network.participants.length} device${network.participants.length === 1 ? '' : 's'} saved`
     if (network.enabled) {
-      return `${saved} • ${network.onlineCount}/${network.expectedCount} peers online`
+      return `${saved} • ${onlineDeviceSummary(network.onlineCount, network.expectedCount)}`
     }
     return saved
   }
+
+  const onlineDeviceSummary = (onlineCount: number, expectedCount: number) =>
+    `${onlineCount}/${expectedCount} device${expectedCount === 1 ? '' : 's'} online`
 
   const networkHasParticipant = (network: NetworkView, npub: string) =>
     network.participants.some((participant) => participant.npub === npub)
@@ -401,6 +392,34 @@
     }
 
     return `Currently advertising extra routes: ${state.advertisedRoutes.join(', ')}`
+  }
+
+  const routingSectionMetaText = (state: UiState) => {
+    if (state.exitNode && state.advertiseExitNode) {
+      return 'Using remote exit + sharing local exit'
+    }
+    if (state.exitNode) {
+      return 'Using remote exit'
+    }
+    if (state.advertiseExitNode) {
+      return 'Sharing local exit'
+    }
+
+    return 'Direct mesh'
+  }
+
+  const routingModeStatusText = (state: UiState) => {
+    if (state.exitNode && state.advertiseExitNode) {
+      return 'Your internet-bound traffic uses the selected peer while this device also advertises default routes to others.'
+    }
+    if (state.exitNode) {
+      return selectedExitNodeStatusText(state)
+    }
+    if (state.advertiseExitNode) {
+      return 'This device is offering default-route traffic to peers while your own internet-bound traffic stays local.'
+    }
+
+    return 'Internet-bound traffic stays local; only mesh routes are used.'
   }
 
   const selectedExitNodeStatusText = (state: UiState) => {
@@ -861,7 +880,9 @@
           <div class="panel-kicker">Status</div>
           <div class="row hero-title-row">
             <h1 data-testid="active-network-title">{activeNetworkView.name}</h1>
-            <span class={`badge ${heroStateBadgeClass(state)}`}>{heroStateText(state)}</span>
+            <span class={`badge ${heroStateBadgeClass(state)}`}>
+              {heroStateText(state, { serviceInstallRecommended, serviceEnableRecommended })}
+            </span>
           </div>
           <div class="hero-subtitle">{heroSubtext(state)}</div>
         </div>
@@ -1025,7 +1046,9 @@
           <div class="panel-kicker">Active network</div>
           <h2>{activeNetworkView.name}</h2>
         </div>
-        <div class="section-meta">{activeNetworkView.onlineCount}/{activeNetworkView.expectedCount} online</div>
+        <div class="section-meta">
+          {onlineDeviceSummary(activeNetworkView.onlineCount, activeNetworkView.expectedCount)}
+        </div>
       </div>
 
       <div class="spotlight-meta-grid">
@@ -1258,56 +1281,92 @@
       <div class="section-title-row">
         <div>
           <div class="panel-kicker">Routing</div>
-          <h2>Exit Node</h2>
+          <h2>Routing & Sharing</h2>
         </div>
-        <div class="section-meta">{state.exitNode ? 'Selected' : 'Direct mesh'}</div>
+        <div class="section-meta">{routingSectionMetaText(state)}</div>
       </div>
 
-      <div class="config-path">{selectedExitNodeStatusText(state)}</div>
-      <div class="field-span field-panel exit-node-panel-body">
-        <input
-          class="text-input"
-          placeholder="Search peers by alias, npub, or tunnel IP"
-          data-testid="exit-node-search"
-          bind:value={exitNodeSearch}
-        />
-        <div class="exit-node-list" data-testid="exit-node-select">
-          <button
-            class={`exit-node-card ${!state.exitNode ? 'selected' : ''}`}
-            type="button"
-            on:click={() => onSelectExitNode('')}
-          >
-            <div class="row spread">
-              <div class="item-title">No exit node</div>
-              <span class="badge muted">Direct mesh</span>
-            </div>
-            <div class="item-sub">Keep default-route traffic off peer relays and use mesh routing only.</div>
-          </button>
+      <div class="field-grid">
+        <div class="field-panel">
+          <div class="field-label">Current Mode</div>
+          <div class="config-path">{routingModeStatusText(state)}</div>
+        </div>
 
-          {#each filteredExitNodeCandidates(state, exitNodeSearch) as participant}
+        <div class="field-panel">
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={state.advertiseExitNode}
+              on:change={(event) =>
+                onUpdateSettings({
+                  advertiseExitNode: (event.currentTarget as HTMLInputElement).checked,
+                })}
+            />
+            <div>Advertise this device as an exit node</div>
+          </label>
+          <div class="config-path settings-note">{offerExitNodeStatusText(state)}</div>
+        </div>
+
+        <label class="field-span">
+          <span>Advertised Routes</span>
+          <input
+            class="text-input"
+            placeholder="10.0.0.0/24, 192.168.0.0/24"
+            bind:value={advertisedRoutesDraft}
+            on:input={() =>
+              debounce('advertisedRoutes', () =>
+                onUpdateSettings({ advertisedRoutes: advertisedRoutesDraft }))}
+          />
+          <div class="config-path">{additionalRoutesStatusText(state)}</div>
+        </label>
+
+        <div class="field-span field-panel exit-node-panel-body">
+          <div class="field-label">Use A Peer Exit Node</div>
+          <div class="config-path">{selectedExitNodeStatusText(state)}</div>
+          <input
+            class="text-input"
+            placeholder="Search peers by alias, npub, or tunnel IP"
+            data-testid="exit-node-search"
+            bind:value={exitNodeSearch}
+          />
+          <div class="exit-node-list" data-testid="exit-node-select">
             <button
-              class={`exit-node-card ${
-                state.exitNode === participant.npub ? 'selected' : ''
-              } ${!participant.offersExitNode ? 'disabled' : ''}`}
+              class={`exit-node-card ${!state.exitNode ? 'selected' : ''}`}
               type="button"
-              on:click={() => onSelectExitNode(participant.npub)}
-              disabled={!participant.offersExitNode}
+              on:click={() => onSelectExitNode('')}
             >
               <div class="row spread">
-                <div class="item-title">{participant.magicDnsName || short(participant.npub, 18, 12)}</div>
-                <span class={`badge ${exitNodeAvailabilityClass(participant)}`}>
-                  {exitNodeAvailabilityText(participant)}
-                </span>
+                <div class="item-title">No exit node</div>
+                <span class="badge muted">Direct mesh</span>
               </div>
-              <div class="item-sub">
-                {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
-              </div>
+              <div class="item-sub">Keep default-route traffic off peer relays and use mesh routing only.</div>
             </button>
-          {/each}
 
-          {#if filteredExitNodeCandidates(state, exitNodeSearch).length === 0}
-            <div class="config-path">No peers match that search.</div>
-          {/if}
+            {#each filteredExitNodeCandidates(state, exitNodeSearch) as participant}
+              <button
+                class={`exit-node-card ${
+                  state.exitNode === participant.npub ? 'selected' : ''
+                } ${!participant.offersExitNode ? 'disabled' : ''}`}
+                type="button"
+                on:click={() => onSelectExitNode(participant.npub)}
+                disabled={!participant.offersExitNode}
+              >
+                <div class="row spread">
+                  <div class="item-title">{participant.magicDnsName || short(participant.npub, 18, 12)}</div>
+                  <span class={`badge ${exitNodeAvailabilityClass(participant)}`}>
+                    {exitNodeAvailabilityText(participant)}
+                  </span>
+                </div>
+                <div class="item-sub">
+                  {participant.statusText} | {participant.lastSignalText} | {participant.tunnelIp}
+                </div>
+              </button>
+            {/each}
+
+            {#if filteredExitNodeCandidates(state, exitNodeSearch).length === 0}
+              <div class="config-path">No peers match that search.</div>
+            {/if}
+          </div>
         </div>
       </div>
     </section>
@@ -1710,10 +1769,46 @@
     <details class="panel collapsible-panel">
       <summary class="collapsible-summary">
         <div>
-          <div class="panel-kicker">Advanced</div>
-          <h2>Settings</h2>
+          <div class="panel-kicker">Connection</div>
+          <h2>Session & Relays</h2>
         </div>
-        <div class="section-meta">Node & app</div>
+        <div class="section-meta">Startup & relay behavior</div>
+      </summary>
+
+      <div class="collapsible-body">
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.autoDisconnectRelaysWhenMeshReady}
+            on:change={(event) =>
+              onUpdateSettings({
+                autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
+              })}
+          />
+          <span>Auto-disconnect relays when mesh is ready</span>
+        </label>
+
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={state.autoconnect}
+            on:change={(event) =>
+              onUpdateSettings({
+                autoconnect: (event.currentTarget as HTMLInputElement).checked,
+              })}
+          />
+          <span>Auto-connect session on app start</span>
+        </label>
+      </div>
+    </details>
+
+    <details class="panel collapsible-panel">
+      <summary class="collapsible-summary">
+        <div>
+          <div class="panel-kicker">System</div>
+          <h2>Device & App</h2>
+        </div>
+        <div class="section-meta">Node, DNS & startup</div>
       </summary>
 
       <div class="collapsible-body">
@@ -1744,42 +1839,6 @@
         <label class="toggle-row">
           <input
             type="checkbox"
-            checked={state.autoDisconnectRelaysWhenMeshReady}
-            on:change={(event) =>
-              onUpdateSettings({
-                autoDisconnectRelaysWhenMeshReady: (event.target as HTMLInputElement).checked,
-              })}
-          />
-          <span>Auto-disconnect relays when mesh is ready</span>
-        </label>
-
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            checked={state.autoconnect}
-            on:change={(event) =>
-              onUpdateSettings({
-                autoconnect: (event.currentTarget as HTMLInputElement).checked,
-              })}
-          />
-          <span>Auto-connect session on app start</span>
-        </label>
-
-        <label class="toggle-row">
-          <input
-            type="checkbox"
-            checked={state.advertiseExitNode}
-            on:change={(event) =>
-              onUpdateSettings({
-                advertiseExitNode: (event.currentTarget as HTMLInputElement).checked,
-              })}
-          />
-          <span>Advertise exit node (default routes)</span>
-        </label>
-
-        <label class="toggle-row">
-          <input
-            type="checkbox"
             data-testid="autostart-toggle"
             checked={state.launchOnStartup}
             disabled={!autostartReady || autostartUpdating}
@@ -1802,18 +1861,6 @@
         </label>
 
         <div class="field-grid">
-          <label>
-            <span>Advertised Routes</span>
-            <input
-              class="text-input"
-              placeholder="10.0.0.0/24, 192.168.0.0/24"
-              bind:value={advertisedRoutesDraft}
-              on:input={() =>
-                debounce('advertisedRoutes', () =>
-                  onUpdateSettings({ advertisedRoutes: advertisedRoutesDraft }))}
-            />
-          </label>
-
           <label>
             <span>MagicDNS Suffix (Optional)</span>
             <input
