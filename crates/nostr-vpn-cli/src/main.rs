@@ -289,13 +289,13 @@ struct ServiceArgs {
 
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
-    /// Install and start the macOS launchd daemon.
+    /// Install and start the system service.
     Install(ServiceInstallArgs),
     /// Enable and start an installed system service.
     Enable(ServiceControlArgs),
     /// Stop and disable an installed system service.
     Disable(ServiceControlArgs),
-    /// Remove the macOS launchd daemon.
+    /// Remove the system service.
     Uninstall(ServiceUninstallArgs),
     /// Show service install/runtime status.
     Status(ServiceStatusArgs),
@@ -305,7 +305,7 @@ enum ServiceCommand {
 struct ServiceInstallArgs {
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long, default_value = "utun100")]
+    #[arg(long, default_value_t = default_tunnel_iface())]
     iface: String,
     #[arg(long, default_value_t = 20)]
     announce_interval_secs: u64,
@@ -393,7 +393,7 @@ struct ConnectArgs {
     participants: Vec<String>,
     #[arg(long)]
     relay: Vec<String>,
-    #[arg(long, default_value = "utun100")]
+    #[arg(long, default_value_t = default_tunnel_iface())]
     iface: String,
     #[arg(long, default_value_t = 20)]
     announce_interval_secs: u64,
@@ -409,7 +409,7 @@ struct DaemonArgs {
     participants: Vec<String>,
     #[arg(long)]
     relay: Vec<String>,
-    #[arg(long, default_value = "utun100")]
+    #[arg(long, default_value_t = default_tunnel_iface())]
     iface: String,
     #[arg(long, default_value_t = 20)]
     announce_interval_secs: u64,
@@ -425,7 +425,7 @@ struct StartArgs {
     participants: Vec<String>,
     #[arg(long)]
     relay: Vec<String>,
-    #[arg(long, default_value = "utun100")]
+    #[arg(long, default_value_t = default_tunnel_iface())]
     iface: String,
     #[arg(long, default_value_t = 20)]
     announce_interval_secs: u64,
@@ -7320,6 +7320,14 @@ fn uninstall_cli(args: UninstallCliArgs) -> Result<()> {
     uninstall_cli_path(&destination)
 }
 
+fn default_tunnel_iface() -> String {
+    if cfg!(target_os = "windows") {
+        "nvpn".to_string()
+    } else {
+        "utun100".to_string()
+    }
+}
+
 fn install_cli_to_path(destination: &Path, force: bool) -> Result<()> {
     let source = std::env::current_exe().context("failed to resolve current executable")?;
     let source = fs::canonicalize(&source)
@@ -10154,6 +10162,19 @@ mod tests {
             } else {
                 "nvpn"
             })
+        );
+    }
+
+    #[test]
+    fn default_tunnel_iface_matches_platform() {
+        let iface = super::default_tunnel_iface();
+        assert_eq!(
+            iface,
+            if cfg!(target_os = "windows") {
+                "nvpn"
+            } else {
+                "utun100"
+            }
         );
     }
 
