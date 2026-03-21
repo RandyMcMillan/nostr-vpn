@@ -3348,6 +3348,18 @@ fn tray_status_text(
     }
 }
 
+fn tray_vpn_status_menu_text(status_text: &str) -> String {
+    format!("VPN Status: {status_text}")
+}
+
+fn tray_vpn_toggle_text(session_active: bool) -> &'static str {
+    if session_active {
+        "Turn VPN Off"
+    } else {
+        "Turn VPN On"
+    }
+}
+
 fn tray_identity_text(identity_npub: &str) -> String {
     let identity_npub = identity_npub.trim();
     if identity_npub.is_empty() {
@@ -3572,16 +3584,15 @@ fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
     }
 
     vec![
-        TrayMenuItemSpec::Check {
-            id: TRAY_VPN_TOGGLE_MENU_ID.to_string(),
-            text: "VPN On".to_string(),
-            enabled: true,
-            checked: runtime_state.session_active,
-        },
         TrayMenuItemSpec::Text {
             id: None,
-            text: runtime_state.status_text.clone(),
+            text: tray_vpn_status_menu_text(&runtime_state.status_text),
             enabled: false,
+        },
+        TrayMenuItemSpec::Text {
+            id: Some(TRAY_VPN_TOGGLE_MENU_ID.to_string()),
+            text: tray_vpn_toggle_text(runtime_state.session_active).to_string(),
+            enabled: true,
         },
         TrayMenuItemSpec::Separator,
         TrayMenuItemSpec::Text {
@@ -4332,19 +4343,20 @@ mod tests {
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
         NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
         PeerPresenceStatus, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
-        TRAY_RUN_EXIT_NODE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
-        apply_network_invite_to_active_network, cli_binary_installed_at, config_path_from_roots,
-        expected_peer_count, extract_json_document, gui_launch_disposition,
-        gui_requires_service_enable, gui_requires_service_install, is_already_running_message,
-        is_mesh_complete, is_not_running_message, network_device_count,
-        network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
-        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label, runtime_capabilities_for_platform,
+        TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState,
+        active_network_invite_code, apply_network_invite_to_active_network,
+        cli_binary_installed_at, config_path_from_roots, expected_peer_count,
+        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, is_already_running_message, is_mesh_complete,
+        is_not_running_message, network_device_count, network_online_device_count,
+        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
+        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, runtime_capabilities_for_platform,
         should_defer_gui_daemon_start_to_service_on_autostart, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args, to_npub,
         tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
-        tray_status_text, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
+        within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
@@ -4681,6 +4693,16 @@ mod tests {
     }
 
     #[test]
+    fn tray_vpn_menu_texts_separate_status_from_action() {
+        assert_eq!(
+            tray_vpn_status_menu_text("Connected"),
+            "VPN Status: Connected"
+        );
+        assert_eq!(tray_vpn_toggle_text(true), "Turn VPN Off");
+        assert_eq!(tray_vpn_toggle_text(false), "Turn VPN On");
+    }
+
+    #[test]
     fn parse_advertised_routes_input_normalizes_and_deduplicates() {
         let routes = parse_advertised_routes_input("10.0.0.1/24, 10.0.0.0/24, ::1/64")
             .expect("routes should parse");
@@ -4934,7 +4956,7 @@ mod tests {
     }
 
     #[test]
-    fn tray_menu_spec_puts_toggle_first_and_settings_last() {
+    fn tray_menu_spec_puts_status_first_and_settings_last() {
         let spec = tray_menu_spec(&TrayRuntimeState {
             session_active: true,
             service_setup_required: false,
@@ -4971,11 +4993,19 @@ mod tests {
 
         assert!(matches!(
             spec.first(),
-            Some(TrayMenuItemSpec::Check {
+            Some(TrayMenuItemSpec::Text {
                 text,
-                checked: true,
+                enabled: false,
                 ..
-            }) if text == "VPN On"
+            }) if text == "VPN Status: Connected"
+        ));
+        assert!(matches!(
+            spec.get(1),
+            Some(TrayMenuItemSpec::Text {
+                id: Some(id),
+                text,
+                enabled: true,
+            }) if id == TRAY_VPN_TOGGLE_MENU_ID && text == "Turn VPN Off"
         ));
         assert!(spec.iter().any(|item| matches!(
             item,
