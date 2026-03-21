@@ -18,16 +18,11 @@ This repo is not just one binary. It currently ships:
 
 ## Downloads
 
-Most people on macOS want the desktop app:
+See the latest release notes and current assets:
 
-- [Download the latest macOS app (Apple Silicon)](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nostr-vpn-macos-arm64.zip)
-- [See the latest release notes and all assets](https://github.com/mmalmi/nostr-vpn/releases/latest)
+- [Latest release](https://github.com/mmalmi/nostr-vpn/releases/latest)
 
-If you want the headless CLI instead:
-
-- [macOS Apple Silicon CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-aarch64-apple-darwin.tar.gz)
-- [Linux x86_64 CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-x86_64-unknown-linux-musl.tar.gz)
-- [Linux ARM64 CLI](https://github.com/mmalmi/nostr-vpn/releases/latest/download/nvpn-aarch64-unknown-linux-musl.tar.gz)
+Most people on macOS want the Apple Silicon desktop app from that page. Headless users can grab the Apple Silicon macOS or Linux CLI tarballs there.
 
 Prebuilt Intel macOS release artifacts have been sunset. Intel Mac users should build from source or use an older release.
 
