@@ -7,7 +7,7 @@ export default defineConfig({
   plugins: [svelte()],
   clearScreen: false,
   define: {
-    __APP_VERSION__: JSON.stringify(process.env.npm_package_version ?? '0.2.8'),
+    __APP_VERSION__: JSON.stringify(process.env.npm_package_version ?? '0.2.9'),
   },
   server: {
     port: 1420,
