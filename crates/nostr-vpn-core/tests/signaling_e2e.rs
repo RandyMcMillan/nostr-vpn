@@ -12,6 +12,12 @@ use tokio::time::timeout;
 
 use crate::support::ws_relay::WsRelay;
 
+#[test]
+fn signaling_kind_uses_hashtree_style_ephemeral_range() {
+    assert_eq!(NOSTR_KIND_NOSTR_VPN, 25_050);
+    assert!((20_000..30_000).contains(&NOSTR_KIND_NOSTR_VPN));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn announces_over_local_nostr_relay() {
     let mut relay = WsRelay::new();
@@ -281,6 +287,119 @@ async fn relay_event_does_not_leak_plaintext_sensitive_fields() {
 
     sender.disconnect().await;
     receiver.disconnect().await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_and_private_events_include_stable_identifiers() {
+    let mut relay = WsRelay::new();
+    relay.start().await.expect("relay should start");
+    let relay_url = relay.url().expect("relay url");
+
+    let network_id = "nostr-vpn-identifier-tags".to_string();
+    let sender_keys = Keys::generate();
+    let receiver_keys = Keys::generate();
+    let sender_pubkey = sender_keys.public_key().to_hex();
+    let receiver_pubkey = receiver_keys.public_key().to_hex();
+
+    let sender = NostrSignalingClient::new_with_keys(
+        network_id.clone(),
+        sender_keys,
+        vec![sender_pubkey.clone(), receiver_pubkey.clone()],
+    )
+    .expect("sender client");
+
+    sender
+        .connect(std::slice::from_ref(&relay_url))
+        .await
+        .expect("sender connect");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    sender
+        .publish(SignalPayload::Hello)
+        .await
+        .expect("hello publish should succeed");
+
+    let announcement = PeerAnnouncement {
+        node_id: "sender-node".to_string(),
+        public_key: "sender-public".to_string(),
+        endpoint: "127.0.0.1:51820".to_string(),
+        local_endpoint: None,
+        public_endpoint: None,
+        tunnel_ip: "10.44.0.5/32".to_string(),
+        advertised_routes: Vec::new(),
+        timestamp: 42,
+    };
+
+    sender
+        .publish_to(
+            SignalPayload::Announce(announcement),
+            std::slice::from_ref(&receiver_pubkey),
+        )
+        .await
+        .expect("private publish should succeed");
+
+    let mut events = Vec::new();
+    for _ in 0..50 {
+        events = relay.events_snapshot().await;
+        if events
+            .iter()
+            .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN))
+            .count()
+            >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let vpn_events = events
+        .into_iter()
+        .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        vpn_events.len(),
+        2,
+        "expected hello and private events on relay"
+    );
+
+    let hello_event = vpn_events
+        .iter()
+        .find(|event| {
+            event
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "l" && tag[1] == "hello")
+        })
+        .expect("hello event should be stored");
+    assert!(
+        hello_event
+            .tags
+            .iter()
+            .any(|tag| tag.len() >= 2 && tag[0] == "d" && tag[1] == "hello"),
+        "hello event should include a stable d tag",
+    );
+
+    let private_event = vpn_events
+        .iter()
+        .find(|event| {
+            event
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "p" && tag[1] == receiver_pubkey)
+        })
+        .expect("private event should be stored");
+    assert!(
+        private_event.tags.iter().any(|tag| {
+            tag.len() >= 2
+                && tag[0] == "d"
+                && tag[1] == format!("private:{network_id}:{receiver_pubkey}")
+        }),
+        "private event should include a recipient-scoped d tag",
+    );
+
+    sender.disconnect().await;
     relay.stop().await;
 }
 

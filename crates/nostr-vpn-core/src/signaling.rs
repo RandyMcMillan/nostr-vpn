@@ -10,11 +10,12 @@ use tokio::sync::{Mutex, broadcast};
 use crate::config::normalize_nostr_pubkey;
 use crate::control::PeerAnnouncement;
 
-pub const NOSTR_KIND_NOSTR_VPN: u16 = 31990;
+pub const NOSTR_KIND_NOSTR_VPN: u16 = 25050;
 const SIGNAL_HELLO_TAG: &str = "hello";
 const SIGNAL_EXPIRATION_SECS: u64 = 300;
 const SIGNAL_HELLO_LOOKBACK_SECS: u64 = 60;
 const SIGNAL_PRIVATE_LOOKBACK_SECS: u64 = 120;
+const SIGNAL_HELLO_IDENTIFIER: &str = "hello";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -225,6 +226,7 @@ impl NostrSignalingClient {
 
         let expiration = Timestamp::now() + Duration::from_secs(SIGNAL_EXPIRATION_SECS);
         let tags = vec![
+            Tag::identifier(SIGNAL_HELLO_IDENTIFIER),
             Tag::custom(
                 TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::L)),
                 vec![SIGNAL_HELLO_TAG.to_string()],
@@ -333,6 +335,7 @@ impl NostrSignalingClient {
             .context("failed to encrypt signaling payload")?;
 
             let tags = vec![
+                Tag::identifier(private_signal_identifier(network_id, recipient)),
                 Tag::public_key(recipient_pubkey),
                 Tag::expiration(expiration),
             ];
@@ -491,6 +494,10 @@ impl NostrSignalingClient {
             }
         });
     }
+}
+
+fn private_signal_identifier(network_id: &str, recipient: &str) -> String {
+    format!("private:{network_id}:{recipient}")
 }
 
 fn normalize_participants(participants: Vec<String>) -> Result<HashSet<String>> {
