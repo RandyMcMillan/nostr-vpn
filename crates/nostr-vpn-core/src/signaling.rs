@@ -11,11 +11,13 @@ use crate::config::normalize_nostr_pubkey;
 use crate::control::PeerAnnouncement;
 
 pub const NOSTR_KIND_NOSTR_VPN: u16 = 25050;
+pub const NOSTR_KIND_NOSTR_VPN_LEGACY: u16 = 31990;
 const SIGNAL_HELLO_TAG: &str = "hello";
 const SIGNAL_EXPIRATION_SECS: u64 = 300;
 const SIGNAL_HELLO_LOOKBACK_SECS: u64 = 60;
 const SIGNAL_PRIVATE_LOOKBACK_SECS: u64 = 120;
 const SIGNAL_HELLO_IDENTIFIER: &str = "hello";
+const SIGNAL_KINDS: [u16; 2] = [NOSTR_KIND_NOSTR_VPN, NOSTR_KIND_NOSTR_VPN_LEGACY];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
@@ -140,15 +142,18 @@ impl NostrSignalingClient {
 
         self.client.connect().await;
 
-        let private_filter = Filter::new()
-            .kind(Kind::Custom(NOSTR_KIND_NOSTR_VPN))
-            .custom_tag(
-                SingleLetterTag::lowercase(Alphabet::P),
-                vec![self.own_pubkey.clone()],
-            )
-            .since(Timestamp::now() - Duration::from_secs(SIGNAL_PRIVATE_LOOKBACK_SECS));
-
-        let mut filters = vec![private_filter];
+        let mut filters = Vec::with_capacity(SIGNAL_KINDS.len() * 2);
+        for kind in signal_event_kinds() {
+            filters.push(
+                Filter::new()
+                    .kind(kind)
+                    .custom_tag(
+                        SingleLetterTag::lowercase(Alphabet::P),
+                        vec![self.own_pubkey.clone()],
+                    )
+                    .since(Timestamp::now() - Duration::from_secs(SIGNAL_PRIVATE_LOOKBACK_SECS)),
+            );
+        }
         let hello_authors = self
             .participant_pubkeys
             .iter()
@@ -156,15 +161,18 @@ impl NostrSignalingClient {
             .filter_map(|participant| PublicKey::from_hex(participant).ok())
             .collect::<Vec<_>>();
         if !hello_authors.is_empty() {
-            let hello_filter = Filter::new()
-                .kind(Kind::Custom(NOSTR_KIND_NOSTR_VPN))
-                .authors(hello_authors)
-                .custom_tag(
-                    SingleLetterTag::lowercase(Alphabet::L),
-                    vec![SIGNAL_HELLO_TAG],
-                )
-                .since(Timestamp::now() - Duration::from_secs(SIGNAL_HELLO_LOOKBACK_SECS));
-            filters.push(hello_filter);
+            for kind in signal_event_kinds() {
+                filters.push(
+                    Filter::new()
+                        .kind(kind)
+                        .authors(hello_authors.clone())
+                        .custom_tag(
+                            SingleLetterTag::lowercase(Alphabet::L),
+                            vec![SIGNAL_HELLO_TAG],
+                        )
+                        .since(Timestamp::now() - Duration::from_secs(SIGNAL_HELLO_LOOKBACK_SECS)),
+                );
+            }
         }
 
         self.client
@@ -233,19 +241,30 @@ impl NostrSignalingClient {
             ),
             Tag::expiration(expiration),
         ];
-        let event = EventBuilder::new(Kind::Custom(NOSTR_KIND_NOSTR_VPN), "", tags)
-            .to_event(&self.keys)
-            .context("failed to sign public hello event")?;
-        let output = self
-            .client
-            .send_event(event)
-            .await
-            .context("failed to publish public hello event")?;
-        if output.success.is_empty() {
-            return Err(anyhow!("public hello event rejected by all relays"));
+        let mut accepted = false;
+        let mut first_error = None;
+        for kind in signal_event_kinds() {
+            let event = EventBuilder::new(kind, "", tags.clone())
+                .to_event(&self.keys)
+                .context("failed to sign public hello event")?;
+            match self.client.send_event(event).await {
+                Ok(output) if !output.success.is_empty() => accepted = true,
+                Ok(_) => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error =
+                            Some(anyhow!(error).context("failed to publish public hello event"));
+                    }
+                }
+            }
         }
-
-        Ok(())
+        if accepted {
+            return Ok(());
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Err(anyhow!("public hello event rejected by all relays"))
     }
 
     async fn publish_private_to(
@@ -339,20 +358,33 @@ impl NostrSignalingClient {
                 Tag::public_key(recipient_pubkey),
                 Tag::expiration(expiration),
             ];
-            let builder =
-                EventBuilder::new(Kind::Custom(NOSTR_KIND_NOSTR_VPN), encrypted_content, tags);
-            let event = builder
-                .to_event(&self.keys)
-                .context("failed to sign private nostr event")?;
+            let mut accepted = false;
+            let mut first_error = None;
+            for kind in signal_event_kinds() {
+                let builder = EventBuilder::new(kind, encrypted_content.clone(), tags.clone());
+                let event = builder
+                    .to_event(&self.keys)
+                    .context("failed to sign private nostr event")?;
 
-            let output = self
-                .client
-                .send_event(event)
-                .await
-                .context("failed to publish private nostr event")?;
+                match self.client.send_event(event).await {
+                    Ok(output) if !output.success.is_empty() => accepted = true,
+                    Ok(_) => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(
+                                anyhow!(error).context("failed to publish private nostr event"),
+                            );
+                        }
+                    }
+                }
+            }
 
-            if !output.success.is_empty() {
+            if accepted {
                 delivered.insert(recipient.clone());
+                continue;
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
         }
 
@@ -393,7 +425,7 @@ impl NostrSignalingClient {
                 };
 
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind != Kind::Custom(NOSTR_KIND_NOSTR_VPN) {
+                    if !is_signal_event_kind(&event.kind) {
                         continue;
                     }
 
@@ -498,6 +530,14 @@ impl NostrSignalingClient {
 
 fn private_signal_identifier(network_id: &str, recipient: &str) -> String {
     format!("private:{network_id}:{recipient}")
+}
+
+fn signal_event_kinds() -> [Kind; 2] {
+    SIGNAL_KINDS.map(Kind::from)
+}
+
+fn is_signal_event_kind(kind: &Kind) -> bool {
+    SIGNAL_KINDS.contains(&kind.as_u16())
 }
 
 fn normalize_participants(participants: Vec<String>) -> Result<HashSet<String>> {

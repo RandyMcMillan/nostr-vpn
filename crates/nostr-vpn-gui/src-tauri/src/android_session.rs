@@ -48,6 +48,11 @@ struct ActiveTunnelTask {
     join: JoinHandle<()>,
 }
 
+struct MobileTunIo {
+    reader: tokio::fs::File,
+    writer: tokio::fs::File,
+}
+
 #[derive(Default)]
 struct TunnelTaskState {
     peer_statuses: Vec<PeerRuntimeStatus>,
@@ -467,10 +472,7 @@ async fn start_tunnel_task(
     if tun_fd < 0 {
         return Err(anyhow!("android vpn service returned an invalid tun fd"));
     }
-    configure_tun_fd(tun_fd).context("failed to configure android tun fd")?;
-
-    let std_file = unsafe { std::fs::File::from_raw_fd(tun_fd) };
-    let tun = tokio::fs::File::from_std(std_file);
+    let mut tun = open_mobile_tun_io(tun_fd).context("failed to open android tun io")?;
     let udp = tokio::net::UdpSocket::from_std(bind_socket)
         .context("failed to create async mobile wireguard udp socket")?;
 
@@ -497,7 +499,6 @@ async fn start_tunnel_task(
     let (stop_tx, mut stop_rx) = watch::channel(false);
     let task_state = state.clone();
     let join = tokio::spawn(async move {
-        let mut tun = tun;
         let udp = udp;
         let mut timer = tokio::time::interval(Duration::from_millis(ANDROID_TIMER_INTERVAL_MILLIS));
         let mut tun_buf = vec![0_u8; 65_535];
@@ -516,7 +517,7 @@ async fn start_tunnel_task(
                         break;
                     }
                 }
-                read = tun.read(&mut tun_buf) => {
+                read = tun.reader.read(&mut tun_buf) => {
                     match read {
                         Ok(0) => continue,
                         Ok(read) => {
@@ -549,7 +550,7 @@ async fn start_tunnel_task(
                         Ok((read, source)) => {
                             match runtime.receive_datagram(source, &udp_buf[..read]) {
                                 Ok(processed) => {
-                                    if let Err(error) = write_tunnel_packets(&mut tun, &processed.tunnel_packets).await {
+                                    if let Err(error) = write_tunnel_packets(&mut tun.writer, &processed.tunnel_packets).await {
                                         set_tunnel_error(&task_state, error);
                                         break;
                                     }
@@ -573,7 +574,7 @@ async fn start_tunnel_task(
                 }
                 _ = timer.tick() => {
                     let processed = runtime.tick_timers();
-                    if let Err(error) = write_tunnel_packets(&mut tun, &processed.tunnel_packets).await {
+                    if let Err(error) = write_tunnel_packets(&mut tun.writer, &processed.tunnel_packets).await {
                         set_tunnel_error(&task_state, error);
                         break;
                     }
@@ -1032,8 +1033,9 @@ fn tunnel_fingerprint(config: &AppConfig, listen_port: u16, peers: &[PlannedTunn
         .iter()
         .map(|peer| {
             format!(
-                "{}|{}|{}",
+                "{}|{}|{}|{}",
                 peer.peer.participant,
+                peer.peer.pubkey_b64,
                 peer.peer.endpoint,
                 peer.peer.allowed_ips.join(",")
             )
@@ -1122,6 +1124,20 @@ fn strip_cidr(value: &str) -> &str {
     value.split('/').next().unwrap_or(value)
 }
 
+fn open_mobile_tun_io(tun_fd: RawFd) -> Result<MobileTunIo> {
+    configure_tun_fd(tun_fd).context("failed to configure android tun fd")?;
+
+    let writer = unsafe { std::fs::File::from_raw_fd(tun_fd) };
+    let reader = writer
+        .try_clone()
+        .context("failed to duplicate android tun fd")?;
+
+    Ok(MobileTunIo {
+        reader: tokio::fs::File::from_std(reader),
+        writer: tokio::fs::File::from_std(writer),
+    })
+}
+
 fn configure_tun_fd(tun_fd: RawFd) -> Result<()> {
     let flags = unsafe { libc::fcntl(tun_fd, libc::F_GETFL) };
     if flags < 0 {
@@ -1176,6 +1192,7 @@ mod tests {
     use nostr_vpn_core::control::PeerAnnouncement;
     use nostr_vpn_core::paths::PeerPathBook;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn participant() -> String {
         Keys::generate().public_key().to_hex()
@@ -1293,6 +1310,27 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_fingerprint_changes_when_peer_public_key_changes() {
+        let config = AppConfig::generated();
+        let participant = participant();
+        let peer = |pubkey_b64: &str| super::PlannedTunnelPeer {
+            participant: participant.clone(),
+            endpoint: "192.168.178.44:51820".to_string(),
+            peer: super::TunnelPeer {
+                participant: participant.clone(),
+                pubkey_b64: pubkey_b64.to_string(),
+                endpoint: "192.168.178.44:51820".parse().expect("socket address"),
+                allowed_ips: vec!["10.44.1.158/32".to_string()],
+            },
+        };
+
+        let first = super::tunnel_fingerprint(&config, 51820, &[peer("peer-key-a")]);
+        let second = super::tunnel_fingerprint(&config, 51820, &[peer("peer-key-b")]);
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn tun_io_retries_would_block_and_interrupted() {
         assert!(super::should_retry_tun_io(&std::io::Error::from(
             std::io::ErrorKind::WouldBlock
@@ -1303,5 +1341,34 @@ mod tests {
         assert!(!super::should_retry_tun_io(&std::io::Error::from(
             std::io::ErrorKind::BrokenPipe
         )));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mobile_tun_io_supports_bidirectional_unseekable_fds() {
+        use std::io::{Read, Write};
+        use std::os::fd::IntoRawFd;
+        use std::os::unix::net::UnixStream;
+        use tokio::io::AsyncReadExt;
+
+        let (local, mut peer) = UnixStream::pair().expect("unix stream pair");
+        peer.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("peer read timeout");
+        let mut tun = super::open_mobile_tun_io(local.into_raw_fd()).expect("tun io");
+
+        peer.write_all(b"ping").expect("write inbound bytes");
+        let mut inbound = [0_u8; 4];
+        tun.reader
+            .read_exact(&mut inbound)
+            .await
+            .expect("read inbound bytes");
+        assert_eq!(&inbound, b"ping");
+
+        super::write_tunnel_packets(&mut tun.writer, &[b"pong".to_vec()])
+            .await
+            .expect("write outbound bytes");
+        let mut outbound = [0_u8; 4];
+        peer.read_exact(&mut outbound).expect("read outbound bytes");
+        assert_eq!(&outbound, b"pong");
     }
 }

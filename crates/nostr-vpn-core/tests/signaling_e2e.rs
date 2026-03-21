@@ -3,10 +3,13 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{
+    ClientBuilder, EventBuilder, Keys, Kind, PublicKey, Tag, Timestamp, nip44,
+};
 use nostr_vpn_core::control::PeerAnnouncement;
 use nostr_vpn_core::signaling::{
-    NOSTR_KIND_NOSTR_VPN, NostrSignalingClient, SignalPayload, SignalingNetwork,
+    NOSTR_KIND_NOSTR_VPN, NOSTR_KIND_NOSTR_VPN_LEGACY, NostrSignalingClient, SignalEnvelope,
+    SignalPayload, SignalingNetwork,
 };
 use tokio::time::timeout;
 
@@ -16,6 +19,7 @@ use crate::support::ws_relay::WsRelay;
 fn signaling_kind_uses_hashtree_style_ephemeral_range() {
     assert_eq!(NOSTR_KIND_NOSTR_VPN, 25_050);
     assert!((20_000..30_000).contains(&NOSTR_KIND_NOSTR_VPN));
+    assert_eq!(NOSTR_KIND_NOSTR_VPN_LEGACY, 31_990);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -404,6 +408,192 @@ async fn hello_and_private_events_include_stable_identifiers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollout_publishes_current_and_legacy_signal_kinds() {
+    let mut relay = WsRelay::new();
+    relay.start().await.expect("relay should start");
+    let relay_url = relay.url().expect("relay url");
+
+    let network_id = "nostr-vpn-rollout-kinds".to_string();
+    let sender_keys = Keys::generate();
+    let receiver_keys = Keys::generate();
+    let sender_pubkey = sender_keys.public_key().to_hex();
+    let receiver_pubkey = receiver_keys.public_key().to_hex();
+
+    let sender = NostrSignalingClient::new_with_keys(
+        network_id.clone(),
+        sender_keys,
+        vec![sender_pubkey.clone(), receiver_pubkey.clone()],
+    )
+    .expect("sender client");
+
+    sender
+        .connect(std::slice::from_ref(&relay_url))
+        .await
+        .expect("sender connect");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    sender
+        .publish(SignalPayload::Hello)
+        .await
+        .expect("hello publish should succeed");
+
+    sender
+        .publish_to(
+            SignalPayload::Announce(PeerAnnouncement {
+                node_id: "sender-node".to_string(),
+                public_key: "sender-public".to_string(),
+                endpoint: "127.0.0.1:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: None,
+                tunnel_ip: "10.44.0.5/32".to_string(),
+                advertised_routes: Vec::new(),
+                timestamp: 42,
+            }),
+            std::slice::from_ref(&receiver_pubkey),
+        )
+        .await
+        .expect("private publish should succeed");
+
+    let mut events = Vec::new();
+    for _ in 0..50 {
+        events = relay.events_snapshot().await;
+        let current_count = events
+            .iter()
+            .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN))
+            .count();
+        let legacy_count = events
+            .iter()
+            .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN_LEGACY))
+            .count();
+        if current_count >= 2 && legacy_count >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let current_events = events
+        .iter()
+        .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN))
+        .collect::<Vec<_>>();
+    let legacy_events = events
+        .iter()
+        .filter(|event| event.kind == u32::from(NOSTR_KIND_NOSTR_VPN_LEGACY))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        current_events.len(),
+        2,
+        "expected current hello and private events"
+    );
+    assert_eq!(
+        legacy_events.len(),
+        2,
+        "expected legacy hello and private events"
+    );
+    assert!(
+        legacy_events.iter().any(|event| {
+            event
+                .tags
+                .iter()
+                .any(|tag| tag.len() >= 2 && tag[0] == "d" && tag[1] == "hello")
+        }),
+        "legacy hello should include a stable d tag",
+    );
+    assert!(
+        legacy_events.iter().any(|event| {
+            event.tags.iter().any(|tag| {
+                tag.len() >= 2
+                    && tag[0] == "d"
+                    && tag[1] == format!("private:{network_id}:{receiver_pubkey}")
+            })
+        }),
+        "legacy private signal should include a recipient-scoped d tag",
+    );
+
+    sender.disconnect().await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receiver_accepts_legacy_signal_events_during_rollout() {
+    let mut relay = WsRelay::new();
+    relay.start().await.expect("relay should start");
+    let relay_url = relay.url().expect("relay url");
+
+    let network_id = "nostr-vpn-legacy-rollout".to_string();
+    let sender_keys = Keys::generate();
+    let receiver_keys = Keys::generate();
+    let sender_pubkey = sender_keys.public_key().to_hex();
+    let receiver_pubkey = receiver_keys.public_key().to_hex();
+
+    let sender_client = ClientBuilder::new()
+        .signer(sender_keys.clone())
+        .database(nostr_sdk::database::MemoryDatabase::new())
+        .build();
+    sender_client
+        .add_relay(&relay_url)
+        .await
+        .expect("sender add relay");
+    sender_client.connect().await;
+
+    let receiver = NostrSignalingClient::new_with_keys(
+        network_id.clone(),
+        receiver_keys,
+        vec![sender_pubkey.clone(), receiver_pubkey.clone()],
+    )
+    .expect("receiver client");
+    receiver
+        .connect(std::slice::from_ref(&relay_url))
+        .await
+        .expect("receiver connect");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    publish_legacy_hello(&sender_client, &sender_keys)
+        .await
+        .expect("legacy hello publish should succeed");
+
+    let hello = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timed out waiting for legacy hello")
+        .expect("message expected");
+    assert_eq!(hello.payload, SignalPayload::Hello);
+    assert_eq!(hello.network_id, network_id);
+
+    let announcement = PeerAnnouncement {
+        node_id: "legacy-node".to_string(),
+        public_key: "legacy-public".to_string(),
+        endpoint: "127.0.0.1:51820".to_string(),
+        local_endpoint: None,
+        public_endpoint: None,
+        tunnel_ip: "10.44.0.7/32".to_string(),
+        advertised_routes: Vec::new(),
+        timestamp: 77,
+    };
+    publish_legacy_private(
+        &sender_client,
+        &sender_keys,
+        &network_id,
+        &receiver_pubkey,
+        SignalPayload::Announce(announcement.clone()),
+    )
+    .await
+    .expect("legacy private publish should succeed");
+
+    let received = timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("timed out waiting for legacy private signal")
+        .expect("message expected");
+    assert_eq!(received.network_id, network_id);
+    assert_eq!(received.payload, SignalPayload::Announce(announcement));
+
+    let _ = sender_client.disconnect().await;
+    receiver.disconnect().await;
+    relay.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn targeted_private_publish_only_reaches_requested_recipient() {
     let mut relay = WsRelay::new();
     relay.start().await.expect("relay should start");
@@ -484,6 +674,72 @@ async fn targeted_private_publish_only_reaches_requested_recipient() {
     receiver_a.disconnect().await;
     receiver_b.disconnect().await;
     relay.stop().await;
+}
+
+async fn publish_legacy_hello(client: &nostr_sdk::Client, keys: &Keys) -> anyhow::Result<()> {
+    let expiration = Timestamp::now() + Duration::from_secs(300);
+    let event = EventBuilder::new(
+        Kind::Custom(NOSTR_KIND_NOSTR_VPN_LEGACY),
+        "",
+        vec![
+            Tag::identifier("hello"),
+            Tag::custom(
+                nostr_sdk::prelude::TagKind::SingleLetter(
+                    nostr_sdk::prelude::SingleLetterTag::lowercase(nostr_sdk::prelude::Alphabet::L),
+                ),
+                vec!["hello".to_string()],
+            ),
+            Tag::expiration(expiration),
+        ],
+    )
+    .to_event(keys)?;
+
+    let output = client.send_event(event).await?;
+    anyhow::ensure!(
+        !output.success.is_empty(),
+        "legacy hello rejected by all relays"
+    );
+    Ok(())
+}
+
+async fn publish_legacy_private(
+    client: &nostr_sdk::Client,
+    sender_keys: &Keys,
+    network_id: &str,
+    recipient_pubkey_hex: &str,
+    payload: SignalPayload,
+) -> anyhow::Result<()> {
+    let recipient_pubkey = PublicKey::from_hex(recipient_pubkey_hex)?;
+    let envelope = SignalEnvelope {
+        network_id: network_id.to_string(),
+        sender_pubkey: sender_keys.public_key().to_hex(),
+        payload,
+    };
+    let plaintext = serde_json::to_string(&envelope)?;
+    let encrypted = nip44::encrypt(
+        sender_keys.secret_key(),
+        &recipient_pubkey,
+        &plaintext,
+        nip44::Version::V2,
+    )?;
+    let expiration = Timestamp::now() + Duration::from_secs(300);
+    let event = EventBuilder::new(
+        Kind::Custom(NOSTR_KIND_NOSTR_VPN_LEGACY),
+        encrypted,
+        vec![
+            Tag::identifier(format!("private:{network_id}:{recipient_pubkey_hex}")),
+            Tag::public_key(recipient_pubkey),
+            Tag::expiration(expiration),
+        ],
+    )
+    .to_event(sender_keys)?;
+
+    let output = client.send_event(event).await?;
+    anyhow::ensure!(
+        !output.success.is_empty(),
+        "legacy private rejected by all relays"
+    );
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

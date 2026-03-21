@@ -1597,6 +1597,16 @@ impl OutboundAnnounceBook {
     }
 }
 
+fn maybe_reset_targeted_announce_cache_for_hello(
+    outbound_announces: &mut OutboundAnnounceBook,
+    sender_pubkey: &str,
+    payload: &SignalPayload,
+) {
+    if matches!(payload, SignalPayload::Hello) {
+        outbound_announces.forget(sender_pubkey);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct WireGuardPeerStatus {
     endpoint: Option<String>,
@@ -2442,7 +2452,7 @@ fn endpoint_prefers_runtime_local_ipv4(endpoint: &str) -> bool {
     }
 
     match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Ok(IpAddr::V4(ip)) => ipv4_is_local_only(ip),
         Ok(IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified(),
         Err(_) => false,
     }
@@ -3334,19 +3344,32 @@ fn nat_punch_targets(
     listen_port: u16,
 ) -> Vec<SocketAddr> {
     let own_local_endpoint = local_signal_endpoint(app, listen_port);
+    nat_punch_targets_for_local_endpoint(app, own_pubkey, peer_announcements, &own_local_endpoint)
+}
+
+fn nat_punch_targets_for_local_endpoint(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    own_local_endpoint: &str,
+) -> Vec<SocketAddr> {
     let mut targets = app
         .participant_pubkeys_hex()
         .iter()
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
         .filter_map(|participant| peer_announcements.get(participant))
         .filter_map(|announcement| {
-            let selected_endpoint = select_peer_endpoint(announcement, Some(&own_local_endpoint));
+            let selected_endpoint = select_peer_endpoint(announcement, Some(own_local_endpoint));
             if peer_endpoint_requires_public_signal(
                 app,
                 announcement,
                 &selected_endpoint,
-                Some(&own_local_endpoint),
+                Some(own_local_endpoint),
             ) {
+                return None;
+            }
+
+            if endpoints_share_local_only_ipv4_subnet(&selected_endpoint, own_local_endpoint) {
                 return None;
             }
 
@@ -4111,6 +4134,11 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                     outbound_announces.forget(&sender_pubkey);
                 }
                 if !changed {
+                    maybe_reset_targeted_announce_cache_for_hello(
+                        &mut outbound_announces,
+                        &sender_pubkey,
+                        &payload,
+                    );
                     if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
                         && let Err(error) = publish_private_announce_to_participants(
                             &client,
@@ -5062,6 +5090,14 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                         eprintln!("tunnel: peer heartbeat failed after peer signal: {error}");
                     }
                     if matches!(&payload, SignalPayload::Hello | SignalPayload::Announce(_))
+                        && {
+                            maybe_reset_targeted_announce_cache_for_hello(
+                                &mut outbound_announces,
+                                &sender_pubkey,
+                                &payload,
+                            );
+                            true
+                        }
                         && let Err(error) = publish_private_announce_to_participants(
                             &client,
                             &app,
@@ -8514,14 +8550,14 @@ mod tests {
         linux_route_get_spec_from_output, linux_route_target_is_ipv4,
         linux_service_status_from_show_output, load_config_with_overrides,
         local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
-        peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
-        pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
-        persisted_peer_cache_timeout_secs, planned_tunnel_peers, public_endpoint_for_listen_port,
-        public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
-        read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
-        relay_connection_action, request_daemon_reload, request_daemon_stop,
-        restore_daemon_peer_cache, route_targets_for_tunnel_peers,
+        nat_punch_targets, nat_punch_targets_for_local_endpoint, parse_exit_node_arg,
+        parse_nonzero_pid, peer_has_recent_handshake, peer_path_cache_timeout_secs,
+        peer_runtime_lookup, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
+        persisted_path_cache_timeout_secs, persisted_peer_cache_timeout_secs, planned_tunnel_peers,
+        public_endpoint_for_listen_port, public_signal_endpoint_from_mapping,
+        publish_error_requires_reconnect, read_daemon_peer_cache, read_daemon_state,
+        record_successful_runtime_paths, relay_connection_action, request_daemon_reload,
+        request_daemon_stop, restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
         take_daemon_control_request, uninstall_cli, utun_interface_candidates,
         windows_service_status_from_query_output, write_daemon_peer_cache,
@@ -8769,6 +8805,35 @@ mod tests {
 
         book.forget("peer-a");
         assert!(book.needs_send("peer-a", "fp1"));
+    }
+
+    #[test]
+    fn hello_signal_forces_targeted_private_announce_republish() {
+        let mut book = OutboundAnnounceBook::default();
+        book.mark_sent("peer-a", "fp1");
+        super::maybe_reset_targeted_announce_cache_for_hello(
+            &mut book,
+            "peer-a",
+            &SignalPayload::Hello,
+        );
+        assert!(book.needs_send("peer-a", "fp1"));
+
+        book.mark_sent("peer-a", "fp1");
+        super::maybe_reset_targeted_announce_cache_for_hello(
+            &mut book,
+            "peer-a",
+            &SignalPayload::Announce(PeerAnnouncement {
+                node_id: "node-a".to_string(),
+                public_key: "pubkey".to_string(),
+                endpoint: "192.0.2.10:51820".to_string(),
+                local_endpoint: None,
+                public_endpoint: Some("198.51.100.20:51820".to_string()),
+                tunnel_ip: "10.44.0.2/32".to_string(),
+                advertised_routes: Vec::new(),
+                timestamp: 1,
+            }),
+        );
+        assert!(!book.needs_send("peer-a", "fp1"));
     }
 
     #[test]
@@ -9399,6 +9464,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_local_signal_endpoint_prefers_detected_ipv4_for_cgnat_configured_endpoint() {
+        assert_eq!(
+            runtime_local_signal_endpoint(
+                "100.110.224.101:51820",
+                52000,
+                Some(Ipv4Addr::new(192, 168, 178, 80)),
+            ),
+            "192.168.178.80:52000"
+        );
+    }
+
+    #[test]
     fn runtime_local_signal_endpoint_keeps_public_configured_endpoint() {
         assert_eq!(
             runtime_local_signal_endpoint(
@@ -9931,13 +10008,64 @@ mod tests {
         .expect("planned tunnel peers");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].endpoint, "198.19.241.11:51820");
-        assert_eq!(
-            nat_punch_targets(&config, None, &announcements, 51820),
-            vec![
-                "198.19.241.11:51820"
-                    .parse()
-                    .expect("same-subnet punch target")
-            ]
+        assert!(
+            nat_punch_targets_for_local_endpoint(
+                &config,
+                None,
+                &announcements,
+                "198.19.241.3:51820"
+            )
+            .is_empty(),
+            "same-subnet peer should not trigger nat punch"
+        );
+    }
+
+    #[test]
+    fn cgnat_configured_host_endpoint_still_plans_same_lan_peer() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.nat.enabled = true;
+        config.node.endpoint = "100.110.224.101:51820".to_string();
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "192.168.178.44:51820".to_string(),
+            local_endpoint: Some("192.168.178.44:51820".to_string()),
+            public_endpoint: None,
+            tunnel_ip: "10.44.1.158/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 10,
+        };
+        let announcements = HashMap::from([(participant.clone(), announcement)]);
+        let own_local_endpoint = runtime_local_signal_endpoint(
+            &config.node.endpoint,
+            51820,
+            Some(Ipv4Addr::new(192, 168, 178, 80)),
+        );
+
+        let selected = planned_tunnel_peers(
+            &config,
+            None,
+            &announcements,
+            &mut PeerPathBook::default(),
+            Some(&own_local_endpoint),
+            10,
+        )
+        .expect("planned tunnel peers");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].endpoint, "192.168.178.44:51820");
+        assert!(
+            nat_punch_targets_for_local_endpoint(
+                &config,
+                None,
+                &announcements,
+                &own_local_endpoint
+            )
+            .is_empty(),
+            "same-lan peer should not trigger nat punch when local endpoint is known"
         );
     }
 
