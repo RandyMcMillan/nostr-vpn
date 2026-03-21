@@ -1,3 +1,5 @@
+use std::fs;
+
 use nostr_sdk::prelude::{Keys, ToBech32};
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, NetworkConfig, derive_mesh_tunnel_ip,
@@ -10,6 +12,17 @@ fn set_default_network_participants(config: &mut AppConfig, participants: Vec<St
     if let Some(network) = config.networks.first_mut() {
         network.participants = participants;
     }
+}
+
+fn unique_temp_config_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "nostr-vpn-{name}-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ))
 }
 
 #[test]
@@ -633,6 +646,60 @@ fn peer_aliases_use_npub_keys_in_serialized_config() {
 
     assert!(config.peer_aliases.contains_key(&peer_npub));
     assert!(!config.peer_aliases.contains_key(&peer_hex));
+}
+
+#[test]
+fn save_serializes_user_facing_pubkeys_as_npubs() {
+    let own = Keys::generate();
+    let peer = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let own_npub = own.public_key().to_bech32().expect("own npub");
+    let peer_hex = peer.public_key().to_hex();
+    let peer_npub = peer.public_key().to_bech32().expect("peer npub");
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex;
+    config.exit_node = peer_hex.clone();
+    set_default_network_participants(&mut config, vec![peer_hex.clone()]);
+    config.ensure_defaults();
+
+    let path = unique_temp_config_path("save-serializes-user-facing-pubkeys");
+    config.save(&path).expect("save config");
+    let raw = fs::read_to_string(&path).expect("read saved config");
+    let _ = fs::remove_file(&path);
+
+    assert!(raw.contains(&format!("public_key = \"{own_npub}\"")));
+    assert!(raw.contains(&format!("exit_node = \"{peer_npub}\"")));
+    assert!(raw.contains(&format!("participants = [\"{peer_npub}\"]")));
+    assert!(!raw.contains(&peer_hex));
+}
+
+#[test]
+fn save_and_load_round_trip_keeps_runtime_pubkeys_normalized() {
+    let own = Keys::generate();
+    let peer = Keys::generate();
+    let own_hex = own.public_key().to_hex();
+    let peer_hex = peer.public_key().to_hex();
+
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = own.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.exit_node = peer_hex.clone();
+    set_default_network_participants(&mut config, vec![peer_hex.clone()]);
+    config.ensure_defaults();
+
+    let path = unique_temp_config_path("save-load-roundtrip");
+    config.save(&path).expect("save config");
+    let loaded = AppConfig::load(&path).expect("load config");
+    let _ = fs::remove_file(&path);
+
+    assert_eq!(loaded.participant_pubkeys_hex(), vec![peer_hex.clone()]);
+    assert_eq!(loaded.exit_node, peer_hex);
+    assert_eq!(
+        loaded.own_nostr_pubkey_hex().expect("own pubkey hex"),
+        own_hex
+    );
 }
 
 #[test]

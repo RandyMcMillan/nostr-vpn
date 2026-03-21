@@ -230,6 +230,7 @@ impl AppConfig {
 
         let mut to_write = self.clone();
         to_write.ensure_defaults();
+        to_write.canonicalize_user_facing_pubkeys();
 
         let raw = toml::to_string_pretty(&to_write).with_context(|| "failed to encode TOML")?;
         fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
@@ -338,6 +339,23 @@ impl AppConfig {
         self.ensure_single_active_network();
         self.promote_legacy_network_ids();
         self.sync_legacy_network_id();
+        self.normalize_peer_aliases();
+    }
+
+    fn canonicalize_user_facing_pubkeys(&mut self) {
+        self.nostr.public_key = canonical_npub_key(&self.nostr.public_key).unwrap_or_default();
+        self.exit_node = canonical_npub_key(&self.exit_node).unwrap_or_default();
+
+        for network in &mut self.networks {
+            network.participants = network
+                .participants
+                .iter()
+                .filter_map(|participant| canonical_npub_key(participant))
+                .collect();
+            network.participants.sort();
+            network.participants.dedup();
+        }
+
         self.normalize_peer_aliases();
     }
 
@@ -1322,15 +1340,18 @@ fn npub_for_pubkey_hex(pubkey_hex: &str) -> String {
         .unwrap_or_else(|| pubkey_hex.to_string())
 }
 
+fn canonical_npub_key(value: &str) -> Option<String> {
+    let normalized = normalize_nostr_pubkey(value).ok()?;
+    Some(npub_for_pubkey_hex(&normalized))
+}
+
 fn normalize_npub_key(value: &str) -> Option<String> {
     let candidate = value.trim();
     if !candidate.starts_with("npub1") {
         return None;
     }
 
-    PublicKey::parse(candidate)
-        .ok()
-        .and_then(|public_key| public_key.to_bech32().ok())
+    canonical_npub_key(candidate)
 }
 
 fn uniquify_magic_dns_label(mut base: String, used: &mut HashSet<String>) -> String {
