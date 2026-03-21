@@ -569,10 +569,10 @@ jobs:
           body: |
             ## Downloads
 
-            ### Most people on macOS
-            Download the signed desktop app:
+            ### Most people
 
             - [Nostr VPN for macOS (Apple Silicon)](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/nostr-vpn-macos-arm64.zip)
+            - [Nostr VPN for Android](https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-android-arm64.apk)
 
             Prebuilt Intel macOS release artifacts have been sunset. Intel Mac users should build from source or use an older release.
 
@@ -620,9 +620,6 @@ jobs:
             cargo install --git https://github.com/${{ github.repository }} --locked --bin nvpn nostr-vpn-cli
             ```
 
-            ### Android app
-            Download `nostr-vpn-${{ github.event.inputs.tag || github.ref_name }}-android-arm64.apk` from this release for the Android app.
-            If Android signing secrets are not configured in GitHub Actions, the Android assets will be published as `*-unsigned.apk` and `*-unsigned.aab` instead.
             ### Verify
             ```bash
             nvpn --help
