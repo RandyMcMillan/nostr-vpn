@@ -451,15 +451,11 @@ const fn runtime_capabilities_for_platform(platform: RuntimePlatform) -> Runtime
         RuntimePlatform::Desktop => RuntimeCapabilities {
             platform: "desktop",
             mobile: false,
-            vpn_session_control_supported: !cfg!(target_os = "windows"),
+            vpn_session_control_supported: true,
             cli_install_supported: true,
             startup_settings_supported: true,
             tray_behavior_supported: true,
-            runtime_status_detail: if cfg!(target_os = "windows") {
-                "Windows desktop packaging and CLI/service setup are available, but tunnel control is not wired up yet."
-            } else {
-                ""
-            },
+            runtime_status_detail: "",
         },
         RuntimePlatform::Android => RuntimeCapabilities {
             platform: "android",
@@ -4424,6 +4420,7 @@ fn ios_force_connect_requested() -> bool {
     env_flag_is_truthy(NVPN_IOS_FORCE_CONNECT_ENV)
 }
 
+#[cfg(target_os = "ios")]
 fn env_flag_is_truthy(name: &str) -> bool {
     env::var(name).is_ok_and(|value| {
         let trimmed = value.trim();

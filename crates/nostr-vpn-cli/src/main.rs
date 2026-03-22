@@ -1,4 +1,8 @@
 mod diagnostics;
+#[cfg(any(target_os = "windows", test))]
+mod userspace_wg;
+#[cfg(any(target_os = "windows", test))]
+mod windows_tunnel;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -53,6 +57,8 @@ use crate::diagnostics::{
     PortMappingRuntime, build_health_issues, capture_network_snapshot, detect_captive_portal,
     run_netcheck_report, write_doctor_bundle,
 };
+#[cfg(target_os = "windows")]
+use crate::windows_tunnel::WindowsTunnelBackend;
 
 #[cfg(not(unix))]
 #[derive(Debug, Clone, Copy)]
@@ -1767,6 +1773,8 @@ struct CliTunnelRuntime {
     iface: String,
     handle: Option<DeviceHandle>,
     uapi_socket_path: Option<String>,
+    #[cfg(target_os = "windows")]
+    windows_runtime: Option<WindowsTunnelBackend>,
     last_fingerprint: Option<String>,
     active_listen_port: Option<u16>,
     #[cfg(target_os = "linux")]
@@ -1793,6 +1801,8 @@ impl CliTunnelRuntime {
             iface: iface.into(),
             handle: None,
             uapi_socket_path: None,
+            #[cfg(target_os = "windows")]
+            windows_runtime: None,
             last_fingerprint: None,
             active_listen_port: None,
             #[cfg(target_os = "linux")]
@@ -1804,6 +1814,7 @@ impl CliTunnelRuntime {
         }
     }
 
+    #[cfg(any(test, not(target_os = "windows")))]
     fn ensure_started(&mut self) -> Result<()> {
         if cfg!(not(unix)) {
             return Err(anyhow!(
@@ -1909,24 +1920,6 @@ impl CliTunnelRuntime {
         }
 
         let local_address = local_interface_address_for_tunnel(&app.node.tunnel_ip);
-        let route_targets = route_targets_for_tunnel_peers(&peers);
-        #[cfg(target_os = "linux")]
-        if route_targets.iter().any(|route| route == "0.0.0.0/0") {
-            self.capture_linux_original_default_route();
-        } else {
-            self.restore_linux_original_default_route();
-        }
-        #[cfg(target_os = "linux")]
-        let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
-            linux_bypass_route_specs(
-                app,
-                &peers,
-                &self.iface,
-                self.original_default_route.as_deref(),
-            )?
-        } else {
-            Vec::new()
-        };
         let fingerprint = tunnel_fingerprint(
             &self.iface,
             &app.node.private_key,
@@ -1934,136 +1927,186 @@ impl CliTunnelRuntime {
             &local_address,
             &peers,
         );
-        if self.last_fingerprint.as_deref() == Some(fingerprint.as_str()) && self.handle.is_some() {
+        if self.last_fingerprint.as_deref() == Some(fingerprint.as_str()) && self.is_running() {
             return Ok(());
         }
 
-        self.ensure_started()?;
-        let socket = self
-            .uapi_socket_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing uapi socket path"))?;
-
-        let private_key_hex = key_b64_to_hex(&app.node.private_key)?;
-        let primary_listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
-        let mut attempted_ports = HashSet::new();
-        let mut candidate_ports = Vec::with_capacity(16);
-        for _ in 0..16 {
-            if let Ok(fallback_port) = pick_available_udp_port() {
-                candidate_ports.push(fallback_port);
+        #[cfg(target_os = "windows")]
+        {
+            self.apply_windows_runtime(app, &local_address, &peers)?;
+            let applied_fingerprint = tunnel_fingerprint(
+                &self.iface,
+                &app.node.private_key,
+                self.listen_port(configured_listen_port),
+                &local_address,
+                &peers,
+            );
+            for planned in &planned_peers {
+                path_book.note_selected(&planned.participant, &planned.endpoint, now);
             }
+            self.last_fingerprint = Some(applied_fingerprint);
+            return Ok(());
         }
 
-        let mut selected_listen_port = None;
-        let mut last_bind_conflict = None;
-        let mut try_listen_port =
-            |listen_port: u16, warn_on_fallback: bool| -> Result<Option<u16>> {
-                if can_reuse_active_listen_port(
-                    self.handle.is_some(),
-                    self.last_fingerprint.is_some(),
-                    self.active_listen_port,
-                    listen_port,
-                ) {
-                    return Ok(Some(listen_port));
-                }
-                match wg_set(
-                    socket,
-                    &format!("private_key={private_key_hex}\nlisten_port={listen_port}"),
-                ) {
-                    Ok(()) => {
-                        if warn_on_fallback {
-                            eprintln!(
-                                "tunnel: listen_port {} busy, using fallback {}",
-                                primary_listen_port, listen_port
-                            );
-                        }
-                        Ok(Some(listen_port))
-                    }
-                    Err(error) => {
-                        let error_text = error.to_string();
-                        if !is_uapi_addr_in_use_error(&error_text) {
-                            return Err(error);
-                        }
-                        last_bind_conflict = Some(error);
-                        Ok(None)
-                    }
-                }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let route_targets = route_targets_for_tunnel_peers(&peers);
+            #[cfg(target_os = "linux")]
+            if route_targets.iter().any(|route| route == "0.0.0.0/0") {
+                self.capture_linux_original_default_route();
+            } else {
+                self.restore_linux_original_default_route();
+            }
+            #[cfg(target_os = "linux")]
+            let endpoint_bypass_specs = if route_targets_require_endpoint_bypass(&route_targets) {
+                linux_bypass_route_specs(
+                    app,
+                    &peers,
+                    &self.iface,
+                    self.original_default_route.as_deref(),
+                )?
+            } else {
+                Vec::new()
             };
 
-        for attempt in 0..PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
-            if let Some(listen_port) = try_listen_port(primary_listen_port, false)? {
-                selected_listen_port = Some(listen_port);
-                break;
-            }
-            if attempt + 1 < PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
-                thread::sleep(Duration::from_millis(PRIMARY_LISTEN_PORT_RETRY_DELAY_MS));
-            }
-        }
+            self.ensure_started()?;
+            let socket = self
+                .uapi_socket_path
+                .as_deref()
+                .ok_or_else(|| anyhow!("missing uapi socket path"))?;
 
-        if selected_listen_port.is_none() {
-            for listen_port in candidate_ports {
-                if !attempted_ports.insert(listen_port) || listen_port == primary_listen_port {
-                    continue;
+            let private_key_hex = key_b64_to_hex(&app.node.private_key)?;
+            let primary_listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
+            let mut attempted_ports = HashSet::new();
+            let mut candidate_ports = Vec::with_capacity(16);
+            for _ in 0..16 {
+                if let Ok(fallback_port) = pick_available_udp_port() {
+                    candidate_ports.push(fallback_port);
                 }
-                if let Some(listen_port) = try_listen_port(listen_port, true)? {
+            }
+
+            let mut selected_listen_port = None;
+            let mut last_bind_conflict = None;
+            let mut try_listen_port =
+                |listen_port: u16, warn_on_fallback: bool| -> Result<Option<u16>> {
+                    if can_reuse_active_listen_port(
+                        self.handle.is_some(),
+                        self.last_fingerprint.is_some(),
+                        self.active_listen_port,
+                        listen_port,
+                    ) {
+                        return Ok(Some(listen_port));
+                    }
+                    match wg_set(
+                        socket,
+                        &format!("private_key={private_key_hex}\nlisten_port={listen_port}"),
+                    ) {
+                        Ok(()) => {
+                            if warn_on_fallback {
+                                eprintln!(
+                                    "tunnel: listen_port {} busy, using fallback {}",
+                                    primary_listen_port, listen_port
+                                );
+                            }
+                            Ok(Some(listen_port))
+                        }
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            if !is_uapi_addr_in_use_error(&error_text) {
+                                return Err(error);
+                            }
+                            last_bind_conflict = Some(error);
+                            Ok(None)
+                        }
+                    }
+                };
+
+            for attempt in 0..PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
+                if let Some(listen_port) = try_listen_port(primary_listen_port, false)? {
                     selected_listen_port = Some(listen_port);
                     break;
                 }
+                if attempt + 1 < PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(PRIMARY_LISTEN_PORT_RETRY_DELAY_MS));
+                }
             }
-        }
 
-        self.active_listen_port = Some(selected_listen_port.ok_or_else(|| {
-            if let Some(error) = last_bind_conflict {
-                error.context("failed to allocate available wireguard listen port")
-            } else {
-                anyhow!("failed to configure wireguard listen port")
+            if selected_listen_port.is_none() {
+                for listen_port in candidate_ports {
+                    if !attempted_ports.insert(listen_port) || listen_port == primary_listen_port {
+                        continue;
+                    }
+                    if let Some(listen_port) = try_listen_port(listen_port, true)? {
+                        selected_listen_port = Some(listen_port);
+                        break;
+                    }
+                }
             }
-        })?);
-        wg_set(socket, "replace_peers=true")?;
 
-        for peer in &peers {
-            let mut body = format!(
-                "public_key={}\nendpoint={}\nreplace_allowed_ips=true",
-                peer.pubkey_hex, peer.endpoint
+            self.active_listen_port = Some(selected_listen_port.ok_or_else(|| {
+                if let Some(error) = last_bind_conflict {
+                    error.context("failed to allocate available wireguard listen port")
+                } else {
+                    anyhow!("failed to configure wireguard listen port")
+                }
+            })?);
+            wg_set(socket, "replace_peers=true")?;
+
+            for peer in &peers {
+                let mut body = format!(
+                    "public_key={}\nendpoint={}\nreplace_allowed_ips=true",
+                    peer.pubkey_hex, peer.endpoint
+                );
+                for allowed_ip in &peer.allowed_ips {
+                    body.push_str(&format!("\nallowed_ip={allowed_ip}"));
+                }
+                body.push_str("\npersistent_keepalive_interval=5");
+                wg_set(socket, &body)?;
+            }
+
+            apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
+            #[cfg(target_os = "linux")]
+            self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
+            #[cfg(target_os = "linux")]
+            if let Err(error) = flush_linux_route_cache() {
+                eprintln!("tunnel: failed to flush linux route cache: {error}");
+            }
+            #[cfg(target_os = "linux")]
+            self.reconcile_linux_exit_node_forwarding(app);
+
+            let applied_fingerprint = tunnel_fingerprint(
+                &self.iface,
+                &app.node.private_key,
+                self.listen_port(configured_listen_port),
+                &local_address,
+                &peers,
             );
-            for allowed_ip in &peer.allowed_ips {
-                body.push_str(&format!("\nallowed_ip={allowed_ip}"));
+            for planned in &planned_peers {
+                path_book.note_selected(&planned.participant, &planned.endpoint, now);
             }
-            body.push_str("\npersistent_keepalive_interval=5");
-            wg_set(socket, &body)?;
+            self.last_fingerprint = Some(applied_fingerprint);
+            Ok(())
         }
-
-        apply_local_interface_network(&self.iface, &local_address, &route_targets)?;
-        #[cfg(target_os = "linux")]
-        self.reconcile_linux_endpoint_bypass_routes(&endpoint_bypass_specs);
-        #[cfg(target_os = "linux")]
-        if let Err(error) = flush_linux_route_cache() {
-            eprintln!("tunnel: failed to flush linux route cache: {error}");
-        }
-        #[cfg(target_os = "linux")]
-        self.reconcile_linux_exit_node_forwarding(app);
-
-        let applied_fingerprint = tunnel_fingerprint(
-            &self.iface,
-            &app.node.private_key,
-            self.listen_port(configured_listen_port),
-            &local_address,
-            &peers,
-        );
-        for planned in &planned_peers {
-            path_book.note_selected(&planned.participant, &planned.endpoint, now);
-        }
-        self.last_fingerprint = Some(applied_fingerprint);
-        Ok(())
     }
 
     fn peer_status(&self) -> Result<HashMap<String, WireGuardPeerStatus>> {
-        let socket = self
-            .uapi_socket_path
-            .as_deref()
-            .ok_or_else(|| anyhow!("missing uapi socket path"))?;
-        let response = wg_get(socket)?;
-        Ok(parse_wg_peer_status(&response))
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow!("missing windows tunnel runtime"))?
+                .peer_status()
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let socket = self
+                .uapi_socket_path
+                .as_deref()
+                .ok_or_else(|| anyhow!("missing uapi socket path"))?;
+            let response = wg_get(socket)?;
+            Ok(parse_wg_peer_status(&response))
+        }
     }
 
     fn stop(&mut self) {
@@ -2078,12 +2121,115 @@ impl CliTunnelRuntime {
         }
         self.handle = None;
         self.uapi_socket_path = None;
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(runtime) = self.windows_runtime.as_mut() {
+                runtime.stop();
+            }
+            self.windows_runtime = None;
+        }
         self.last_fingerprint = None;
         self.active_listen_port = None;
     }
 
     fn listen_port(&self, configured: u16) -> u16 {
         self.active_listen_port.unwrap_or(configured)
+    }
+
+    fn is_running(&self) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            self.windows_runtime.is_some()
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.handle.is_some()
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn apply_windows_runtime(
+        &mut self,
+        app: &AppConfig,
+        local_address: &str,
+        peers: &[TunnelPeer],
+    ) -> Result<()> {
+        let primary_listen_port = self.active_listen_port.unwrap_or(app.node.listen_port);
+        let mut candidate_ports = Vec::with_capacity(16);
+        for _ in 0..16 {
+            if let Ok(fallback_port) = pick_available_udp_port() {
+                candidate_ports.push(fallback_port);
+            }
+        }
+
+        self.stop();
+
+        let mut selected = None;
+        let mut last_bind_conflict = None;
+        for attempt in 0..PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
+            match WindowsTunnelBackend::start(
+                &self.iface,
+                &app.node.private_key,
+                primary_listen_port,
+                local_address,
+                peers,
+            ) {
+                Ok(runtime) => {
+                    selected = Some((primary_listen_port, runtime));
+                    break;
+                }
+                Err(error) if is_resource_busy_message(&error.to_string()) => {
+                    last_bind_conflict = Some(error);
+                    if attempt + 1 < PRIMARY_LISTEN_PORT_RETRY_ATTEMPTS {
+                        thread::sleep(Duration::from_millis(PRIMARY_LISTEN_PORT_RETRY_DELAY_MS));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if selected.is_none() {
+            let mut attempted_ports = HashSet::new();
+            attempted_ports.insert(primary_listen_port);
+            for listen_port in candidate_ports {
+                if !attempted_ports.insert(listen_port) {
+                    continue;
+                }
+                match WindowsTunnelBackend::start(
+                    &self.iface,
+                    &app.node.private_key,
+                    listen_port,
+                    local_address,
+                    peers,
+                ) {
+                    Ok(runtime) => {
+                        eprintln!(
+                            "tunnel: listen_port {} busy, using fallback {}",
+                            primary_listen_port, listen_port
+                        );
+                        selected = Some((listen_port, runtime));
+                        break;
+                    }
+                    Err(error) if is_resource_busy_message(&error.to_string()) => {
+                        last_bind_conflict = Some(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let (listen_port, runtime) = selected.ok_or_else(|| {
+            if let Some(error) = last_bind_conflict {
+                error.context("failed to allocate available Windows WireGuard listen port")
+            } else {
+                anyhow!("failed to configure Windows WireGuard runtime")
+            }
+        })?;
+
+        self.windows_runtime = Some(runtime);
+        self.active_listen_port = Some(listen_port);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -2371,6 +2517,7 @@ impl CliTunnelRuntime {
     }
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn utun_interface_candidates(preferred: &str) -> Vec<String> {
     let Some(suffix) = preferred.strip_prefix("utun") else {
         return vec![preferred.to_string()];
@@ -2392,6 +2539,7 @@ fn is_resource_busy_message(message: &str) -> bool {
     lower.contains("resource busy") || lower.contains("address already in use")
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn is_uapi_addr_in_use_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("errno=48") || lower.contains("errno=98") || lower.contains("address in use")
@@ -2406,6 +2554,7 @@ fn pick_available_udp_port() -> Result<u16> {
     Ok(addr.port())
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn can_reuse_active_listen_port(
     handle_running: bool,
     config_applied: bool,
@@ -3588,6 +3737,7 @@ fn build_runtime_magic_dns_records(
     records
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn route_targets_for_tunnel_peers(peers: &[TunnelPeer]) -> Vec<String> {
     let mut route_targets = peers
         .iter()
@@ -7592,89 +7742,117 @@ fn unix_timestamp() -> u64 {
 }
 
 fn tunnel_up(args: &TunnelUpArgs) -> Result<()> {
-    if cfg!(not(unix)) {
-        return Err(anyhow!(
-            "tunnel-up is currently supported on unix platforms only"
-        ));
-    }
-
     if args.iface.trim().is_empty() {
         return Err(anyhow!("--iface must not be empty"));
     }
 
-    let private_key_hex = key_b64_to_hex(&args.private_key)?;
-    let peer_public_key_hex = key_b64_to_hex(&args.peer_public_key)?;
-
-    if args.hole_punch_attempts > 0 {
-        let peer_endpoint: SocketAddr = args.peer_endpoint.parse().with_context(|| {
-            format!(
-                "invalid --peer-endpoint '{}' (required as ip:port when hole-punching)",
-                args.peer_endpoint
-            )
-        })?;
-        let report = hole_punch_udp(
+    #[cfg(target_os = "windows")]
+    {
+        let peer = TunnelPeer {
+            pubkey_hex: key_b64_to_hex(&args.peer_public_key)?,
+            endpoint: args.peer_endpoint.clone(),
+            allowed_ips: vec![args.peer_allowed_ip.clone()],
+        };
+        let _runtime = WindowsTunnelBackend::start(
+            &args.iface,
+            &args.private_key,
             args.listen_port,
-            peer_endpoint,
-            args.hole_punch_attempts,
-            Duration::from_millis(args.hole_punch_interval_ms.max(1)),
-            Duration::from_millis(args.hole_punch_recv_timeout_ms.max(1)),
-        )
-        .context("pre-tunnel hole-punch failed")?;
+            &args.address,
+            &[peer],
+        )?;
 
         println!(
-            "pre-punch: sent {} packets from {} to {}, received_response={}",
-            report.packets_sent, report.local_addr, peer_endpoint, report.packet_received
+            "boringtun+wintun interface {} up: {}, peer {} via {}",
+            args.iface, args.address, args.peer_allowed_ip, args.peer_endpoint
         );
+
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
     }
 
-    // Keep handle alive for process lifetime; dropping tears down the device.
-    let _handle = DeviceHandle::new(
-        &args.iface,
-        DeviceConfig {
-            n_threads: 2,
-            #[cfg(target_os = "linux")]
-            use_connected_socket: false,
-            #[cfg(not(target_os = "linux"))]
-            use_connected_socket: true,
-            #[cfg(target_os = "linux")]
-            use_multi_queue: false,
-            #[cfg(target_os = "linux")]
-            uapi_fd: -1,
-        },
-    )
-    .with_context(|| format!("failed to create boringtun interface {}", args.iface))?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        if cfg!(not(unix)) {
+            return Err(anyhow!(
+                "tunnel-up is currently supported on unix platforms only"
+            ));
+        }
 
-    let uapi_socket = format!("/var/run/wireguard/{}.sock", args.iface);
-    wait_for_socket(&uapi_socket)?;
+        let private_key_hex = key_b64_to_hex(&args.private_key)?;
+        let peer_public_key_hex = key_b64_to_hex(&args.peer_public_key)?;
 
-    wg_set(
-        &uapi_socket,
-        &format!(
-            "private_key={private_key_hex}\nlisten_port={}",
-            args.listen_port
-        ),
-    )?;
-    wg_set(
-        &uapi_socket,
-        &format!(
-            "public_key={peer_public_key_hex}\nendpoint={}\nreplace_allowed_ips=true\nallowed_ip={}\npersistent_keepalive_interval={}",
-            args.peer_endpoint, args.peer_allowed_ip, args.keepalive_secs
-        ),
-    )?;
+        if args.hole_punch_attempts > 0 {
+            let peer_endpoint: SocketAddr = args.peer_endpoint.parse().with_context(|| {
+                format!(
+                    "invalid --peer-endpoint '{}' (required as ip:port when hole-punching)",
+                    args.peer_endpoint
+                )
+            })?;
+            let report = hole_punch_udp(
+                args.listen_port,
+                peer_endpoint,
+                args.hole_punch_attempts,
+                Duration::from_millis(args.hole_punch_interval_ms.max(1)),
+                Duration::from_millis(args.hole_punch_recv_timeout_ms.max(1)),
+            )
+            .context("pre-tunnel hole-punch failed")?;
 
-    apply_local_interface_network(
-        &args.iface,
-        &args.address,
-        std::slice::from_ref(&args.peer_allowed_ip),
-    )?;
+            println!(
+                "pre-punch: sent {} packets from {} to {}, received_response={}",
+                report.packets_sent, report.local_addr, peer_endpoint, report.packet_received
+            );
+        }
 
-    println!(
-        "boringtun interface {} up: {}, peer {} via {}",
-        args.iface, args.address, args.peer_allowed_ip, args.peer_endpoint
-    );
+        // Keep handle alive for process lifetime; dropping tears down the device.
+        let _handle = DeviceHandle::new(
+            &args.iface,
+            DeviceConfig {
+                n_threads: 2,
+                #[cfg(target_os = "linux")]
+                use_connected_socket: false,
+                #[cfg(not(target_os = "linux"))]
+                use_connected_socket: true,
+                #[cfg(target_os = "linux")]
+                use_multi_queue: false,
+                #[cfg(target_os = "linux")]
+                uapi_fd: -1,
+            },
+        )
+        .with_context(|| format!("failed to create boringtun interface {}", args.iface))?;
 
-    loop {
-        thread::sleep(Duration::from_secs(60));
+        let uapi_socket = format!("/var/run/wireguard/{}.sock", args.iface);
+        wait_for_socket(&uapi_socket)?;
+
+        wg_set(
+            &uapi_socket,
+            &format!(
+                "private_key={private_key_hex}\nlisten_port={}",
+                args.listen_port
+            ),
+        )?;
+        wg_set(
+            &uapi_socket,
+            &format!(
+                "public_key={peer_public_key_hex}\nendpoint={}\nreplace_allowed_ips=true\nallowed_ip={}\npersistent_keepalive_interval={}",
+                args.peer_endpoint, args.peer_allowed_ip, args.keepalive_secs
+            ),
+        )?;
+
+        apply_local_interface_network(
+            &args.iface,
+            &args.address,
+            std::slice::from_ref(&args.peer_allowed_ip),
+        )?;
+
+        println!(
+            "boringtun interface {} up: {}, peer {} via {}",
+            args.iface, args.address, args.peer_allowed_ip, args.peer_endpoint
+        );
+
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
     }
 }
 
@@ -8227,6 +8405,7 @@ fn linux_iptables_delete_rule(
     run_checked(&mut command)
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn apply_local_interface_network(
     iface: &str,
     address: &str,
@@ -8392,7 +8571,7 @@ fn wait_for_socket(path: &str) -> Result<()> {
     Err(anyhow!("timed out waiting for uapi socket at {path}"))
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "windows")))]
 fn wait_for_socket(path: &str) -> Result<()> {
     Err(anyhow!(
         "WireGuard control socket is unsupported on this platform: {path}"
@@ -8420,7 +8599,7 @@ fn wg_set(socket_path: &str, body: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "windows")))]
 fn wg_set(socket_path: &str, _body: &str) -> Result<()> {
     Err(anyhow!(
         "WireGuard control socket is unsupported on this platform: {socket_path}"
@@ -8448,13 +8627,14 @@ fn wg_get(socket_path: &str) -> Result<String> {
     Ok(response)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(target_os = "windows")))]
 fn wg_get(socket_path: &str) -> Result<String> {
     Err(anyhow!(
         "WireGuard control socket is unsupported on this platform: {socket_path}"
     ))
 }
 
+#[cfg(any(test, not(target_os = "windows")))]
 fn parse_wg_peer_status(response: &str) -> HashMap<String, WireGuardPeerStatus> {
     let mut peers = HashMap::new();
     let mut current_pubkey: Option<String> = None;

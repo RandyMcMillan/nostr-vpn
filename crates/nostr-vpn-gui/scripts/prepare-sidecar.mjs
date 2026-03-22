@@ -15,6 +15,8 @@ const guiRoot = resolve(scriptDir, '..')
 const workspaceRoot = resolve(guiRoot, '..', '..')
 const targetTriple = resolveTargetTriple(workspaceRoot)
 const exeSuffix = process.platform === 'win32' ? '.exe' : ''
+const isWindowsTarget =
+  (targetTriple && targetTriple.includes('windows')) || process.platform === 'win32'
 
 const cargoArgs = ['build', '--bin', 'nvpn', '-p', 'nostr-vpn-cli']
 if (release) {
@@ -47,6 +49,16 @@ const sidecarName = targetTriple
   : `nvpn${exeSuffix}`
 const sidecarBinary = resolve(sidecarDir, sidecarName)
 copyFileSync(sourceBinary, sidecarBinary)
+
+if (isWindowsTarget) {
+  const sourceDll = resolve(buildTargetRoot, 'wintun.dll')
+  if (!existsSync(sourceDll)) {
+    console.error(`expected wintun.dll at ${sourceDll}, but it was not found`)
+    process.exit(1)
+  }
+
+  copyFileSync(sourceDll, resolve(sidecarDir, 'wintun.dll'))
+}
 
 if (process.platform !== 'win32') {
   chmodSync(sidecarBinary, 0o755)
