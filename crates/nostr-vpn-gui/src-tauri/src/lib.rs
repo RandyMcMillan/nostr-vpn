@@ -3464,6 +3464,7 @@ where
     !started_from_autostart_args(args)
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RunningGuiInstance {
     pid: u32,
@@ -3472,10 +3473,14 @@ struct RunningGuiInstance {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GuiLaunchDisposition {
-    Continue { terminate_pids: Vec<u32> },
+    Continue {
+        terminate_pids: Vec<u32>,
+    },
+    #[cfg(any(test, target_os = "macos", target_os = "linux"))]
     Exit,
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn is_nostr_vpn_gui_process(command: &str) -> bool {
     command.contains("Contents/MacOS/nostr-vpn-gui")
         || command.ends_with("nostr-vpn-gui")
@@ -3483,6 +3488,7 @@ fn is_nostr_vpn_gui_process(command: &str) -> bool {
         || command.contains("/nostr-vpn-gui --")
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn parse_running_gui_instances(raw: &str, current_pid: u32) -> Vec<RunningGuiInstance> {
     raw.lines()
         .filter_map(|line| {
@@ -3510,6 +3516,7 @@ fn parse_running_gui_instances(raw: &str, current_pid: u32) -> Vec<RunningGuiIns
         .collect()
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
 fn gui_launch_disposition(
     launched_from_autostart: bool,
     other_instances: &[RunningGuiInstance],
@@ -4458,6 +4465,7 @@ pub fn run() {
         Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
             terminate_gui_instances(&terminate_pids);
         }
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         Ok(GuiLaunchDisposition::Exit) => return,
         Err(error) => {
             eprintln!("gui: failed to resolve GUI launch conflicts: {error}");
