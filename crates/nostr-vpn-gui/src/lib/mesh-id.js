@@ -31,6 +31,19 @@ export const formatMeshIdForDisplay = (value) => {
   return chunkMeshId(visible)
 }
 
+export const formatMeshIdDraftForDisplay = (value, currentMeshId = '') => {
+  const trimmed = value.trim()
+  if (!trimmed) {
+    return formatMeshIdForDisplay(currentMeshId)
+  }
+
+  if (!meshIdUsesCompatPrefix(trimmed)) {
+    return trimmed
+  }
+
+  return formatMeshIdForDisplay(trimmed)
+}
+
 export const canonicalizeMeshIdInput = (value, currentMeshId = '') => {
   const trimmed = value.trim()
   if (!trimmed) {

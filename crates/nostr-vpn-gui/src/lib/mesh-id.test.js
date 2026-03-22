@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import {
   MESH_ID_COMPAT_PREFIX,
   canonicalizeMeshIdInput,
+  formatMeshIdDraftForDisplay,
   formatMeshIdForDisplay,
   validateMeshIdInput,
 } from './mesh-id.js'
@@ -11,6 +12,17 @@ import {
 test('formatMeshIdForDisplay strips the compat prefix and groups compact ids', () => {
   assert.equal(formatMeshIdForDisplay('nostr-vpn:1234abcd5678ef90'), '1234-abcd-5678-ef90')
   assert.equal(formatMeshIdForDisplay('mesh-home'), 'mesh-home')
+})
+
+test('formatMeshIdDraftForDisplay keeps the hidden compat prefix out of inputs', () => {
+  const currentMeshId = `${MESH_ID_COMPAT_PREFIX}1234abcd5678ef90`
+
+  assert.equal(formatMeshIdDraftForDisplay('', currentMeshId), '1234-abcd-5678-ef90')
+  assert.equal(
+    formatMeshIdDraftForDisplay(`${MESH_ID_COMPAT_PREFIX}1234abcd5678ef90`, currentMeshId),
+    '1234-abcd-5678-ef90',
+  )
+  assert.equal(formatMeshIdDraftForDisplay('mesh-home', currentMeshId), 'mesh-home')
 })
 
 test('canonicalizeMeshIdInput restores the hidden compat prefix for generated ids', () => {

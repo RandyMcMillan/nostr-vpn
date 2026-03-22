@@ -7,6 +7,7 @@
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
   import {
     canonicalizeMeshIdInput,
+    formatMeshIdDraftForDisplay,
     formatMeshIdForDisplay,
     meshIdUsesCompatPrefix,
     validateMeshIdInput,
@@ -1256,7 +1257,10 @@
                 id={`active-network-mesh-${activeNetworkView.id}`}
                 class={`text-input network-mesh-id-input ${meshIdDraftError(activeNetworkView.id) ? 'text-input-invalid' : ''}`}
                 data-testid="active-network-mesh-id-input"
-                value={networkIdDrafts[activeNetworkView.id] ?? formatMeshIdForDisplay(activeNetworkView.networkId)}
+                value={formatMeshIdDraftForDisplay(
+                  networkIdDrafts[activeNetworkView.id] ?? '',
+                  activeNetworkView.networkId,
+                )}
                 on:input={(event) =>
                   onNetworkMeshIdInput(activeNetworkView.id, (event.currentTarget as HTMLInputElement).value)}
                 on:blur={(event) =>
@@ -1655,7 +1659,10 @@
                         id={`saved-network-mesh-${network.id}`}
                         class={`text-input network-mesh-id-input ${meshIdDraftError(network.id) ? 'text-input-invalid' : ''}`}
                         data-testid="saved-network-mesh-id-input"
-                        value={networkIdDrafts[network.id] ?? formatMeshIdForDisplay(network.networkId)}
+                        value={formatMeshIdDraftForDisplay(
+                          networkIdDrafts[network.id] ?? '',
+                          network.networkId,
+                        )}
                         on:input={(event) =>
                           onNetworkMeshIdInput(network.id, (event.currentTarget as HTMLInputElement).value)}
                         on:blur={(event) =>
