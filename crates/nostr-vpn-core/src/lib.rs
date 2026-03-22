@@ -5,6 +5,7 @@ pub mod diagnostics;
 pub mod magic_dns;
 pub mod nat;
 pub mod paths;
+pub mod platform_paths;
 pub mod presence;
 pub mod signaling;
 pub mod wireguard;

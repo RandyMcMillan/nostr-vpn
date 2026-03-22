@@ -50,6 +50,12 @@ use nostr_vpn_core::nat::{
     discover_public_udp_endpoint, discover_public_udp_endpoint_via_stun, hole_punch_udp,
 };
 use nostr_vpn_core::paths::PeerPathBook;
+#[cfg(target_os = "windows")]
+use nostr_vpn_core::platform_paths::{
+    legacy_config_path_from_dirs_config_dir, windows_default_config_path_for_state,
+    windows_machine_config_path_from_program_data_dir,
+    windows_service_config_path_from_sc_qc_output,
+};
 use nostr_vpn_core::presence::PeerPresenceBook;
 use nostr_vpn_core::signaling::{
     NostrSignalingClient, SignalEnvelope, SignalPayload, SignalingNetwork,
@@ -6970,7 +6976,24 @@ fn run_service_command(args: ServiceArgs) -> Result<()> {
 }
 
 fn service_install(args: ServiceInstallArgs) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    let config_path = windows_service_install_config_path(args.config)?;
+
+    #[cfg(not(target_os = "windows"))]
     let config_path = args.config.unwrap_or_else(default_config_path);
+
+    #[cfg(target_os = "windows")]
+    {
+        let legacy_config = legacy_config_path_from_dirs_config_dir(dirs::config_dir().as_deref());
+        if config_path != legacy_config && legacy_config.exists() {
+            stop_daemon(StopArgs {
+                config: Some(legacy_config),
+                timeout_secs: 5,
+                force: true,
+            })?;
+        }
+    }
+
     let mut config = load_or_default_config(&config_path)?;
     config.ensure_defaults();
     maybe_autoconfigure_node(&mut config);
@@ -8307,13 +8330,80 @@ fn default_windows_cli_install_dir() -> Option<PathBuf> {
 
 fn default_config_path() -> PathBuf {
     if let Some(dir) = dirs::config_dir() {
-        let mut path = dir;
-        path.push("nvpn");
-        path.push("config.toml");
-        return path;
+        #[cfg(target_os = "windows")]
+        {
+            let program_data_dir = windows_program_data_dir();
+            let service_config_path = windows_installed_service_config_path()
+                .ok()
+                .flatten()
+                .filter(|path| path.exists());
+            let machine_config_exists =
+                windows_machine_config_path_from_program_data_dir(program_data_dir.as_deref())
+                    .as_ref()
+                    .is_some_and(|path| path.exists());
+            let legacy_config = legacy_config_path_from_dirs_config_dir(Some(dir.as_path()));
+            let legacy_config_exists = legacy_config.exists();
+            return windows_default_config_path_for_state(
+                program_data_dir.as_deref(),
+                Some(dir.as_path()),
+                service_config_path.as_deref(),
+                machine_config_exists,
+                legacy_config_exists,
+            );
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut path = dir;
+            path.push("nvpn");
+            path.push("config.toml");
+            return path;
+        }
     }
 
     PathBuf::from("nvpn.toml")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_program_data_dir() -> Option<PathBuf> {
+    std::env::var_os("PROGRAMDATA").map(PathBuf::from)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installed_service_config_path() -> Result<Option<PathBuf>> {
+    let Some(output) = windows_service_config_query()? else {
+        return Ok(None);
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(windows_service_config_path_from_sc_qc_output(&stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_service_install_config_path(explicit_config: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(config_path) = explicit_config {
+        return Ok(config_path);
+    }
+
+    let legacy_config = legacy_config_path_from_dirs_config_dir(dirs::config_dir().as_deref());
+    let target_config =
+        windows_machine_config_path_from_program_data_dir(windows_program_data_dir().as_deref())
+            .unwrap_or_else(|| legacy_config.clone());
+
+    if target_config != legacy_config && !target_config.exists() && legacy_config.exists() {
+        if let Some(parent) = target_config.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(&legacy_config, &target_config).with_context(|| {
+            format!(
+                "failed to migrate Windows config {} to {}",
+                legacy_config.display(),
+                target_config.display()
+            )
+        })?;
+    }
+
+    Ok(target_config)
 }
 
 fn load_or_default_config(path: &Path) -> Result<AppConfig> {

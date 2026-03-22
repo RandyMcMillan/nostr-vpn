@@ -31,6 +31,13 @@ use nostr_vpn_core::config::{
     normalize_nostr_pubkey,
 };
 use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
+#[cfg(any(target_os = "windows", test))]
+use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
+#[cfg(target_os = "windows")]
+use nostr_vpn_core::platform_paths::{
+    legacy_config_path_from_dirs_config_dir, windows_machine_config_path_from_program_data_dir,
+    windows_service_config_path_from_sc_qc_output,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 use tauri::WindowEvent;
@@ -1356,7 +1363,7 @@ impl NvpnBackend {
         Err(anyhow!(message))
     }
 
-    fn install_system_service(&self) -> Result<()> {
+    fn install_system_service(&mut self) -> Result<()> {
         let runtime = current_runtime_capabilities();
         if !runtime.vpn_session_control_supported {
             return Err(anyhow!(runtime.runtime_status_detail));
@@ -1364,6 +1371,10 @@ impl NvpnBackend {
         if !self.service_supported {
             return Err(anyhow!(self.service_status_detail.clone()));
         }
+        #[cfg(target_os = "windows")]
+        let args = ["service", "install", "--force"];
+
+        #[cfg(not(target_os = "windows"))]
         let args = [
             "service",
             "install",
@@ -1376,6 +1387,8 @@ impl NvpnBackend {
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
+            #[cfg(target_os = "windows")]
+            self.reload_preferred_windows_config_path()?;
             return Ok(());
         }
 
@@ -1390,6 +1403,8 @@ impl NvpnBackend {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
+            #[cfg(target_os = "windows")]
+            self.reload_preferred_windows_config_path()?;
             return Ok(());
         }
 
@@ -1519,6 +1534,24 @@ impl NvpnBackend {
         }
 
         self.reload_daemon_process()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reload_preferred_windows_config_path(&mut self) -> Result<()> {
+        let preferred_path = default_config_path();
+        if preferred_path == self.config_path || !preferred_path.exists() {
+            return Ok(());
+        }
+
+        let mut config = AppConfig::load(&preferred_path)
+            .with_context(|| format!("failed to load config {}", preferred_path.display()))?;
+        config.ensure_defaults();
+        maybe_autoconfigure_node(&mut config);
+        self.config_path = preferred_path;
+        self.config = config;
+        self.ensure_relay_status_entries();
+        self.ensure_peer_status_entries();
+        Ok(())
     }
 
     #[cfg(target_os = "android")]
@@ -3291,6 +3324,7 @@ fn peer_presence_state_label(state: PeerPresenceStatus) -> &'static str {
     }
 }
 
+#[cfg(any(not(target_os = "windows"), test))]
 fn config_path_from_roots(
     app_config_dir: Option<&std::path::Path>,
     dirs_config_dir: Option<&std::path::Path>,
@@ -3306,9 +3340,68 @@ fn config_path_from_roots(
     PathBuf::from("nvpn.toml")
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn desktop_config_path_from_roots(
+    dirs_config_dir: Option<&std::path::Path>,
+    windows_program_data_dir: Option<&std::path::Path>,
+    windows_service_config_path: Option<&std::path::Path>,
+    machine_config_exists: bool,
+    legacy_config_exists: bool,
+) -> PathBuf {
+    windows_default_config_path_for_state(
+        windows_program_data_dir,
+        dirs_config_dir,
+        windows_service_config_path,
+        machine_config_exists,
+        legacy_config_exists,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn windows_program_data_dir() -> Option<PathBuf> {
+    std::env::var_os("PROGRAMDATA").map(PathBuf::from)
+}
+
+#[cfg(target_os = "windows")]
+fn windows_installed_service_config_path() -> Option<PathBuf> {
+    let output = ProcessCommand::new("sc.exe")
+        .args(["qc", "NvpnService"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    windows_service_config_path_from_sc_qc_output(&stdout)
+}
+
 fn default_config_path() -> PathBuf {
-    let config_dir = dirs::config_dir();
-    config_path_from_roots(None, config_dir.as_deref())
+    #[cfg(target_os = "windows")]
+    {
+        let dirs_config_dir = dirs::config_dir();
+        let program_data_dir = windows_program_data_dir();
+        let service_config_path =
+            windows_installed_service_config_path().filter(|path| path.exists());
+        let machine_config_exists =
+            windows_machine_config_path_from_program_data_dir(program_data_dir.as_deref())
+                .as_ref()
+                .is_some_and(|path| path.exists());
+        let legacy_config = legacy_config_path_from_dirs_config_dir(dirs_config_dir.as_deref());
+        let legacy_config_exists = legacy_config.exists();
+        return desktop_config_path_from_roots(
+            dirs_config_dir.as_deref(),
+            program_data_dir.as_deref(),
+            service_config_path.as_deref(),
+            machine_config_exists,
+            legacy_config_exists,
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let config_dir = dirs::config_dir();
+        config_path_from_roots(None, config_dir.as_deref())
+    }
 }
 
 fn resolve_backend_config_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<PathBuf> {
@@ -4791,14 +4884,15 @@ mod tests {
         TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
         TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
         apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
-        cli_binary_installed_at, config_path_from_roots, expected_peer_count,
-        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
-        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
-        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
-        network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
-        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label, pending_launch_action,
-        runtime_capabilities_for_platform, should_defer_gui_daemon_start_to_service_on_autostart,
+        cli_binary_installed_at, config_path_from_roots, desktop_config_path_from_roots,
+        expected_peer_count, extract_json_document, gui_launch_disposition,
+        gui_requires_service_enable, gui_requires_service_install, ios_runtime_status_detail,
+        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
+        is_not_running_message, network_device_count, network_online_device_count,
+        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
+        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, pending_launch_action, runtime_capabilities_for_platform,
+        should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
         tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
@@ -5867,6 +5961,37 @@ mod tests {
         let path = config_path_from_roots(None, Some(std::path::Path::new("/home/test/.config")));
 
         assert_eq!(path, PathBuf::from("/home/test/.config/nvpn/config.toml"));
+    }
+
+    #[test]
+    fn desktop_config_path_prefers_windows_service_config() {
+        let path = desktop_config_path_from_roots(
+            Some(std::path::Path::new(r"C:\Users\sirius\AppData\Roaming")),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            Some(std::path::Path::new(
+                r"C:\Users\sirius\AppData\Roaming\nvpn\config.toml",
+            )),
+            false,
+            true,
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from(r"C:\Users\sirius\AppData\Roaming\nvpn\config.toml")
+        );
+    }
+
+    #[test]
+    fn desktop_config_path_prefers_windows_machine_path_for_new_install() {
+        let path = desktop_config_path_from_roots(
+            Some(std::path::Path::new(r"C:\Users\sirius\AppData\Roaming")),
+            Some(std::path::Path::new(r"C:\ProgramData")),
+            None,
+            false,
+            false,
+        );
+
+        assert_eq!(path, PathBuf::from(r"C:\ProgramData\Nostr VPN\config.toml"));
     }
 
     #[test]
