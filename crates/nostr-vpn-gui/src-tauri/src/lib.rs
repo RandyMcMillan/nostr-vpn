@@ -17,9 +17,7 @@ use std::fs;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_os = "macos")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -3017,30 +3015,11 @@ fn resolve_nvpn_cli_path() -> Result<PathBuf> {
     if let Ok(exe) = env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        for candidate_name in &bundled_candidates {
-            let sibling = dir.join(candidate_name);
-            if sibling.exists()
-                && let Ok(validated) = validate_nvpn_binary(sibling)
+        for candidate in bundled_nvpn_candidate_paths(dir, &bundled_candidates) {
+            if candidate.exists()
+                && let Ok(validated) = validate_nvpn_binary(candidate)
             {
                 return Ok(validated);
-            }
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            if let Some(resources_dir) = dir
-                .parent()
-                .and_then(Path::parent)
-                .map(|path| path.join("Resources"))
-            {
-                for candidate_name in &bundled_candidates {
-                    let candidate = resources_dir.join(candidate_name);
-                    if candidate.exists()
-                        && let Ok(validated) = validate_nvpn_binary(candidate)
-                    {
-                        return Ok(validated);
-                    }
-                }
             }
         }
     }
@@ -3102,6 +3081,30 @@ fn cli_binary_installed_at(path: &std::path::Path) -> bool {
 
 fn nvpn_bundled_binary_candidates() -> Vec<String> {
     vec![nvpn_binary_name().to_string(), nvpn_sidecar_binary_name()]
+}
+
+fn bundled_nvpn_candidate_paths(exe_dir: &Path, candidate_names: &[String]) -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let search_dirs = {
+        let mut search_dirs = vec![exe_dir.to_path_buf(), exe_dir.join("binaries")];
+        if let Some(resources_dir) = exe_dir.parent().map(|path| path.join("Resources")) {
+            search_dirs.push(resources_dir.clone());
+            search_dirs.push(resources_dir.join("binaries"));
+        }
+        search_dirs
+    };
+
+    #[cfg(not(target_os = "macos"))]
+    let search_dirs = vec![exe_dir.to_path_buf(), exe_dir.join("binaries")];
+
+    search_dirs
+        .into_iter()
+        .flat_map(|dir| {
+            candidate_names
+                .iter()
+                .map(move |candidate_name| dir.join(candidate_name))
+        })
+        .collect()
 }
 
 fn nvpn_sidecar_binary_name() -> String {
@@ -4785,15 +4788,15 @@ mod tests {
         ParticipantView, PeerPresenceStatus, PendingLaunchAction, RuntimePlatform,
         TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
         TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
-        apply_network_invite_to_active_network, cli_binary_installed_at, config_path_from_roots,
-        expected_peer_count, extract_json_document, gui_launch_disposition,
-        gui_requires_service_enable, gui_requires_service_install, ios_runtime_status_detail,
-        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
-        is_not_running_message, network_device_count, network_online_device_count,
-        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
-        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
-        peer_state_label, pending_launch_action, runtime_capabilities_for_platform,
-        should_defer_gui_daemon_start_to_service_on_autostart,
+        apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
+        cli_binary_installed_at, config_path_from_roots, expected_peer_count,
+        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
+        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
+        network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
+        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
+        peer_presence_state_label, peer_state_label, pending_launch_action,
+        runtime_capabilities_for_platform, should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
         tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
@@ -5749,6 +5752,31 @@ mod tests {
 
         let _ = std::fs::remove_file(file_path);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bundled_nvpn_candidates_include_tauri_resource_binaries_subdir_on_macos() {
+        let exe_dir = PathBuf::from("/Applications/Nostr VPN.app/Contents/MacOS");
+        let candidates =
+            bundled_nvpn_candidate_paths(&exe_dir, &[String::from("nvpn-aarch64-apple-darwin")]);
+
+        assert!(candidates.contains(&PathBuf::from(
+            "/Applications/Nostr VPN.app/Contents/Resources/binaries/nvpn-aarch64-apple-darwin"
+        )));
+    }
+
+    #[test]
+    fn bundled_nvpn_candidates_include_tauri_binaries_subdir_on_windows_layouts() {
+        let exe_dir = PathBuf::from(r"C:\Program Files\Nostr VPN");
+        let candidates = bundled_nvpn_candidate_paths(
+            &exe_dir,
+            &[String::from("nvpn-aarch64-pc-windows-msvc.exe")],
+        );
+        let expected = exe_dir
+            .join("binaries")
+            .join("nvpn-aarch64-pc-windows-msvc.exe");
+
+        assert!(candidates.contains(&expected));
     }
 
     #[test]
