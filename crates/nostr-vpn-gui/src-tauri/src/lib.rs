@@ -64,6 +64,8 @@ const TRAY_EXIT_NODE_NONE_MENU_ID: &str = "tray_exit_node_none";
 const TRAY_EXIT_NODE_MENU_ID_PREFIX: &str = "tray_exit_node::";
 const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
+#[cfg(target_os = "ios")]
+const NVPN_IOS_FORCE_CONNECT_ENV: &str = "NVPN_IOS_FORCE_CONNECT";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
 const GUI_SERVICE_SETUP_REQUIRED_STATUS: &str =
     "Install background service to turn VPN on from the app";
@@ -507,6 +509,7 @@ struct NvpnBackend {
     service_status_detail: String,
     daemon_state: Option<DaemonRuntimeState>,
     launch_start_pending: bool,
+    force_connect_pending: bool,
 
     relay_status: HashMap<String, RelayStatus>,
     peer_status: HashMap<String, PeerLinkStatus>,
@@ -548,6 +551,18 @@ impl NvpnBackend {
         };
         #[cfg(target_os = "ios")]
         write_ios_probe("backend: config loaded");
+        #[cfg(target_os = "ios")]
+        {
+            let active_participants = config.participant_pubkeys_hex();
+            write_ios_probe(format!(
+                "backend: config summary autoconnect={} active_network_id={} active_participants={} own_npub={} config_path={}",
+                config.autoconnect,
+                config.effective_network_id(),
+                active_participants.len(),
+                shorten_middle(&config.nostr.public_key, 18, 8),
+                config_path.display()
+            ));
+        }
 
         config.ensure_defaults();
         maybe_autoconfigure_node(&mut config);
@@ -602,6 +617,7 @@ impl NvpnBackend {
             service_status_detail: String::new(),
             daemon_state: None,
             launch_start_pending: false,
+            force_connect_pending: false,
             relay_status,
             peer_status,
             lan_discovery_running: false,
@@ -679,6 +695,12 @@ impl NvpnBackend {
             backend.session_status = gui_service_setup_status_text(true).to_string();
         } else if wants_autoconnect && backend.gui_requires_service_enable() {
             backend.session_status = gui_service_enable_status_text(true).to_string();
+        }
+
+        #[cfg(target_os = "ios")]
+        if ios_force_connect_requested() {
+            backend.force_connect_pending = true;
+            write_ios_probe("backend: force connect deferred until first tick");
         }
 
         #[cfg(target_os = "ios")]
@@ -2345,25 +2367,40 @@ impl NvpnBackend {
         self.maybe_refresh_lan_discovery();
         self.handle_lan_discovery_events();
         self.prune_lan_peers();
-        self.maybe_start_pending_launch_daemon();
+        self.maybe_perform_pending_launch_action();
         self.sync_daemon_state();
     }
 
-    fn maybe_start_pending_launch_daemon(&mut self) {
-        if !self.launch_start_pending {
-            return;
-        }
-
-        #[cfg(target_os = "ios")]
-        write_ios_probe("backend: starting pending launch daemon");
-        self.launch_start_pending = false;
-        if let Err(error) = self.start_daemon_process() {
-            self.session_status = format!("Daemon start failed: {error}");
-            #[cfg(target_os = "ios")]
-            write_ios_probe(format!("backend: pending launch daemon failed: {error}"));
-        } else {
-            #[cfg(target_os = "ios")]
-            write_ios_probe("backend: pending launch daemon started");
+    fn maybe_perform_pending_launch_action(&mut self) {
+        match pending_launch_action(self.launch_start_pending, self.force_connect_pending) {
+            PendingLaunchAction::None => {}
+            PendingLaunchAction::StartDaemon => {
+                #[cfg(target_os = "ios")]
+                write_ios_probe("backend: starting pending launch daemon");
+                self.launch_start_pending = false;
+                if let Err(error) = self.start_daemon_process() {
+                    self.session_status = format!("Daemon start failed: {error}");
+                    #[cfg(target_os = "ios")]
+                    write_ios_probe(format!("backend: pending launch daemon failed: {error}"));
+                } else {
+                    #[cfg(target_os = "ios")]
+                    write_ios_probe("backend: pending launch daemon started");
+                }
+            }
+            PendingLaunchAction::ForceConnect => {
+                #[cfg(target_os = "ios")]
+                write_ios_probe("backend: starting pending force connect");
+                self.launch_start_pending = false;
+                self.force_connect_pending = false;
+                if let Err(error) = self.connect_session() {
+                    self.session_status = format!("Daemon start failed: {error}");
+                    #[cfg(target_os = "ios")]
+                    write_ios_probe(format!("backend: pending force connect failed: {error}"));
+                } else {
+                    #[cfg(target_os = "ios")]
+                    write_ios_probe("backend: pending force connect complete");
+                }
+            }
         }
     }
 
@@ -2929,6 +2966,26 @@ fn should_defer_gui_daemon_start_until_first_tick(
     defer_to_installed_service: bool,
 ) -> bool {
     platform == RuntimePlatform::Ios && should_start_on_launch && !defer_to_installed_service
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingLaunchAction {
+    None,
+    StartDaemon,
+    ForceConnect,
+}
+
+fn pending_launch_action(
+    launch_start_pending: bool,
+    force_connect_pending: bool,
+) -> PendingLaunchAction {
+    if force_connect_pending {
+        PendingLaunchAction::ForceConnect
+    } else if launch_start_pending {
+        PendingLaunchAction::StartDaemon
+    } else {
+        PendingLaunchAction::None
+    }
 }
 
 fn gui_service_setup_status_text(autoconnect: bool) -> &'static str {
@@ -4346,6 +4403,11 @@ fn tauri_protocol_request_path(uri: &tauri::http::Uri, origin: &str) -> String {
 }
 
 #[cfg(target_os = "ios")]
+fn reset_ios_probe() {
+    let _ = std::fs::write(std::env::temp_dir().join("nvpn-ios-probe.log"), b"");
+}
+
+#[cfg(target_os = "ios")]
 fn write_ios_probe(message: impl AsRef<str>) {
     let log_path = std::env::temp_dir().join("nvpn-ios-probe.log");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -4357,8 +4419,26 @@ fn write_ios_probe(message: impl AsRef<str>) {
     }
 }
 
+#[cfg(target_os = "ios")]
+fn ios_force_connect_requested() -> bool {
+    env_flag_is_truthy(NVPN_IOS_FORCE_CONNECT_ENV)
+}
+
+fn env_flag_is_truthy(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        let trimmed = value.trim();
+        !trimmed.is_empty()
+            && trimmed != "0"
+            && !trimmed.eq_ignore_ascii_case("false")
+            && !trimmed.eq_ignore_ascii_case("no")
+            && !trimmed.eq_ignore_ascii_case("off")
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "ios")]
+    reset_ios_probe();
     #[cfg(target_os = "ios")]
     write_ios_probe("run: entry");
 
@@ -4698,16 +4778,17 @@ mod tests {
     use super::{
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
         IOS_TAURI_ORIGIN, NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend,
-        ParticipantView, PeerPresenceStatus, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
-        TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState,
-        active_network_invite_code, apply_network_invite_to_active_network,
-        cli_binary_installed_at, config_path_from_roots, expected_peer_count,
-        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
-        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
-        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
-        network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
-        parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
-        peer_presence_state_label, peer_state_label, runtime_capabilities_for_platform,
+        ParticipantView, PeerPresenceStatus, PendingLaunchAction, RuntimePlatform,
+        TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID,
+        TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
+        apply_network_invite_to_active_network, cli_binary_installed_at, config_path_from_roots,
+        expected_peer_count, extract_json_document, gui_launch_disposition,
+        gui_requires_service_enable, gui_requires_service_install, ios_runtime_status_detail,
+        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
+        is_not_running_message, network_device_count, network_online_device_count,
+        parse_advertised_routes_input, parse_exit_node_input, parse_network_invite,
+        parse_running_gui_instances, peer_offers_exit_node, peer_presence_state_label,
+        peer_state_label, pending_launch_action, runtime_capabilities_for_platform,
         should_defer_gui_daemon_start_to_service_on_autostart,
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
@@ -4743,6 +4824,7 @@ mod tests {
             service_status_detail: String::new(),
             daemon_state: None,
             launch_start_pending: false,
+            force_connect_pending: false,
             relay_status: HashMap::new(),
             peer_status: HashMap::new(),
             lan_discovery_running: false,
@@ -5599,6 +5681,26 @@ mod tests {
             true,
             true
         ));
+    }
+
+    #[test]
+    fn pending_launch_action_prioritizes_force_connect() {
+        assert_eq!(
+            pending_launch_action(false, false),
+            PendingLaunchAction::None
+        );
+        assert_eq!(
+            pending_launch_action(true, false),
+            PendingLaunchAction::StartDaemon
+        );
+        assert_eq!(
+            pending_launch_action(false, true),
+            PendingLaunchAction::ForceConnect
+        );
+        assert_eq!(
+            pending_launch_action(true, true),
+            PendingLaunchAction::ForceConnect
+        );
     }
 
     #[cfg(unix)]

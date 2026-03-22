@@ -49,6 +49,38 @@ struct BridgeSymbols {
     free_string: BridgeFreeStringFn,
 }
 
+static REGISTERED_BRIDGE_SYMBOLS: OnceLock<BridgeSymbols> = OnceLock::new();
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nvpn_ios_register_bridge(
+    prepare: Option<BridgeNoArgsFn>,
+    start: Option<BridgeWithJsonFn>,
+    stop: Option<BridgeNoArgsFn>,
+    status: Option<BridgeNoArgsFn>,
+    free_string: Option<BridgeFreeStringFn>,
+) -> bool {
+    let Some(symbols) = prepare
+        .zip(start)
+        .zip(stop)
+        .zip(status)
+        .zip(free_string)
+        .map(
+            |((((prepare, start), stop), status), free_string)| BridgeSymbols {
+                prepare,
+                start,
+                stop,
+                status,
+                free_string,
+            },
+        )
+    else {
+        return false;
+    };
+
+    let _ = REGISTERED_BRIDGE_SYMBOLS.set(symbols);
+    true
+}
+
 pub(crate) fn prepare() -> Result<VpnStatus> {
     bridge_status_from_result(invoke_bridge_no_args(bridge_symbols()?.prepare)?)
 }
@@ -130,9 +162,13 @@ fn strip_cidr(value: &str) -> &str {
 }
 
 fn bridge_symbols() -> Result<BridgeSymbols> {
-    static BRIDGE_SYMBOLS: OnceLock<Result<BridgeSymbols, String>> = OnceLock::new();
+    if let Some(symbols) = REGISTERED_BRIDGE_SYMBOLS.get().copied() {
+        return Ok(symbols);
+    }
 
-    BRIDGE_SYMBOLS
+    static DLSYM_BRIDGE_SYMBOLS: OnceLock<Result<BridgeSymbols, String>> = OnceLock::new();
+
+    DLSYM_BRIDGE_SYMBOLS
         .get_or_init(|| {
             Ok(BridgeSymbols {
                 prepare: resolve_symbol("nvpn_ios_prepare")?,

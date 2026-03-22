@@ -110,7 +110,7 @@ targets:
     info:
       path: PacketTunnel/Info.plist
       properties:
-        CFBundleShortVersionString: 1.0
+        CFBundleShortVersionString: "0.2.9"
         CFBundleVersion: "0.2.9"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel

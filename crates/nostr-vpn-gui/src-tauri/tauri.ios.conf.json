@@ -11,6 +11,9 @@
     ]
   },
   "bundle": {
+    "iOS": {
+      "developmentTeam": "J8PPJKD7TA"
+    },
     "externalBin": []
   }
 }
