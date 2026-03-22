@@ -28,11 +28,12 @@ use base64::engine::general_purpose::STANDARD;
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use clap::{Args, Parser, Subcommand};
 use hex::encode as encode_hex;
+use netdev::get_interfaces;
 use nostr_vpn_core::config::{
     AppConfig, DEFAULT_RELAYS, maybe_autoconfigure_node, normalize_advertised_route,
     normalize_nostr_pubkey,
 };
-use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint};
+use nostr_vpn_core::control::{PeerAnnouncement, select_peer_endpoint_from_local_endpoints};
 use nostr_vpn_core::crypto::generate_keypair;
 use nostr_vpn_core::diagnostics::{
     HealthIssue, HealthSeverity, NetworkSummary, PortMappingStatus, ProbeState,
@@ -1475,16 +1476,23 @@ async fn publish_announcement(request: AnnounceRequest) -> Result<PublishedAnnou
     )?;
     client.connect(&relays).await?;
 
-    let announcement = PeerAnnouncement {
+    let listen_port = endpoint
+        .parse::<SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(app.node.listen_port);
+    let local_endpoint = if endpoint_is_local_only(&endpoint) {
+        endpoint.clone()
+    } else {
+        local_signal_endpoint(&app, listen_port)
+    };
+    let announcement = build_explicit_peer_announcement(
         node_id,
         public_key,
         endpoint,
-        local_endpoint: None,
-        public_endpoint: None,
+        local_endpoint,
         tunnel_ip,
-        advertised_routes: app.effective_advertised_routes(),
-        timestamp: unix_timestamp(),
-    };
+        app.effective_advertised_routes(),
+    );
 
     client
         .publish(SignalPayload::Announce(announcement.clone()))
@@ -1895,19 +1903,19 @@ impl CliTunnelRuntime {
     ) -> Result<()> {
         let configured_listen_port = app.node.listen_port;
         let listen_port = self.active_listen_port.unwrap_or(configured_listen_port);
-        let own_local_endpoint = local_signal_endpoint(app, listen_port);
+        let own_local_endpoints = runtime_local_signal_endpoints(app, listen_port);
         record_successful_runtime_paths(
             peer_announcements,
             self.peer_status().ok().as_ref(),
             path_book,
             now,
         );
-        let planned_peers = planned_tunnel_peers(
+        let planned_peers = planned_tunnel_peers_for_local_endpoints(
             app,
             own_pubkey,
             peer_announcements,
             path_book,
-            Some(&own_local_endpoint),
+            &own_local_endpoints,
             now,
         )?;
         let peers = planned_peers
@@ -2629,6 +2637,35 @@ fn local_signal_endpoint(app: &AppConfig, listen_port: u16) -> String {
     )
 }
 
+fn runtime_local_signal_endpoints(app: &AppConfig, listen_port: u16) -> Vec<String> {
+    let primary_endpoint = local_signal_endpoint(app, listen_port);
+    let mut endpoints = Vec::new();
+    let mut seen = HashSet::new();
+
+    if seen.insert(primary_endpoint.clone()) {
+        endpoints.push(primary_endpoint);
+    }
+
+    for interface in get_interfaces() {
+        if !interface.is_up() || interface.is_loopback() || interface.is_tun() {
+            continue;
+        }
+
+        for ip in interface.ipv4_addrs() {
+            if ip.is_loopback() || ip.is_unspecified() {
+                continue;
+            }
+
+            let endpoint = SocketAddrV4::new(ip, listen_port).to_string();
+            if seen.insert(endpoint.clone()) {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+
+    endpoints
+}
+
 fn discover_public_signal_endpoint(app: &AppConfig, listen_port: u16) -> Option<String> {
     if !app.nat.enabled {
         return None;
@@ -2756,6 +2793,7 @@ fn network_probe_timeout(app: &AppConfig) -> Duration {
     Duration::from_secs(app.nat.discovery_timeout_secs.max(2))
 }
 
+#[cfg(test)]
 fn build_peer_announcement(
     app: &AppConfig,
     listen_port: u16,
@@ -2777,6 +2815,34 @@ fn build_peer_announcement(
         public_endpoint,
         tunnel_ip: app.node.tunnel_ip.clone(),
         advertised_routes: app.effective_advertised_routes(),
+        timestamp: unix_timestamp(),
+    }
+}
+
+fn build_explicit_peer_announcement(
+    node_id: String,
+    public_key: String,
+    endpoint: String,
+    local_endpoint: String,
+    tunnel_ip: String,
+    advertised_routes: Vec<String>,
+) -> PeerAnnouncement {
+    let public_endpoint = (!endpoint_is_local_only(&endpoint) && endpoint != local_endpoint)
+        .then_some(endpoint.clone());
+    let endpoint = if public_endpoint.is_some() {
+        endpoint
+    } else {
+        local_endpoint.clone()
+    };
+
+    PeerAnnouncement {
+        node_id,
+        public_key,
+        endpoint,
+        local_endpoint: Some(local_endpoint),
+        public_endpoint,
+        tunnel_ip,
+        advertised_routes,
         timestamp: unix_timestamp(),
     }
 }
@@ -3260,6 +3326,7 @@ async fn publish_private_announce_to_participants(
     public_signal_endpoint: Option<&DiscoveredPublicSignalEndpoint>,
     outbound_announces: &mut OutboundAnnounceBook,
     participants: &[String],
+    peer_announcements: Option<&HashMap<String, PeerAnnouncement>>,
 ) -> Result<usize> {
     if participants.is_empty() {
         return Ok(0);
@@ -3268,8 +3335,11 @@ async fn publish_private_announce_to_participants(
     let actual_listen_port = tunnel_runtime.listen_port(app.node.listen_port);
     let public_endpoint =
         public_endpoint_for_listen_port(public_signal_endpoint, actual_listen_port);
-    let announcement = build_peer_announcement(app, actual_listen_port, public_endpoint.as_deref());
-    let fingerprint = announcement_fingerprint(&announcement);
+    let own_local_endpoints = runtime_local_signal_endpoints(app, actual_listen_port);
+    let fallback_local_endpoint = own_local_endpoints
+        .first()
+        .cloned()
+        .unwrap_or_else(|| local_signal_endpoint(app, actual_listen_port));
 
     let mut recipients = participants.to_vec();
     recipients.sort();
@@ -3277,6 +3347,24 @@ async fn publish_private_announce_to_participants(
 
     let mut sent = 0usize;
     for participant in recipients {
+        let local_endpoint = peer_announcements
+            .and_then(|announcements| announcements.get(&participant))
+            .and_then(|announcement| {
+                select_local_signal_endpoint_for_peer(announcement, &own_local_endpoints)
+            })
+            .unwrap_or_else(|| fallback_local_endpoint.clone());
+        let endpoint = public_endpoint
+            .clone()
+            .unwrap_or_else(|| local_endpoint.clone());
+        let announcement = build_explicit_peer_announcement(
+            app.node.id.clone(),
+            app.node.public_key.clone(),
+            endpoint,
+            local_endpoint,
+            app.node.tunnel_ip.clone(),
+            app.effective_advertised_routes(),
+        );
+        let fingerprint = announcement_fingerprint(&announcement);
         if !outbound_announces.needs_send(&participant, &fingerprint) {
             continue;
         }
@@ -3318,6 +3406,7 @@ async fn publish_private_announce_to_active_peers(
         public_signal_endpoint,
         outbound_announces,
         &participants,
+        Some(presence.active()),
     )
     .await
 }
@@ -3340,12 +3429,52 @@ fn recently_seen_participants(
         .collect()
 }
 
+fn select_local_signal_endpoint_for_peer(
+    announcement: &PeerAnnouncement,
+    own_local_endpoints: &[String],
+) -> Option<String> {
+    let peer_local_endpoint = announcement
+        .local_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .or_else(|| {
+            endpoint_is_local_only(&announcement.endpoint).then_some(announcement.endpoint.as_str())
+        })?;
+
+    own_local_endpoints
+        .iter()
+        .find(|own| endpoints_share_local_only_ipv4_subnet(own, peer_local_endpoint))
+        .cloned()
+}
+
+#[cfg(test)]
 fn planned_tunnel_peers(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     path_book: &mut PeerPathBook,
     own_local_endpoint: Option<&str>,
+    now: u64,
+) -> Result<Vec<PlannedTunnelPeer>> {
+    let own_local_endpoints = own_local_endpoint
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default();
+    planned_tunnel_peers_for_local_endpoints(
+        app,
+        own_pubkey,
+        peer_announcements,
+        path_book,
+        &own_local_endpoints,
+        now,
+    )
+}
+
+fn planned_tunnel_peers_for_local_endpoints(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    path_book: &mut PeerPathBook,
+    own_local_endpoints: &[String],
     now: u64,
 ) -> Result<Vec<PlannedTunnelPeer>> {
     let configured_participants = app.participant_pubkeys_hex();
@@ -3367,19 +3496,21 @@ fn planned_tunnel_peers(
         };
         path_book.refresh_from_announcement(participant.clone(), announcement, now);
         let selected_endpoint = path_book
-            .select_endpoint(
+            .select_endpoint_for_local_endpoints(
                 participant,
                 announcement,
-                own_local_endpoint,
+                own_local_endpoints,
                 now,
                 PEER_PATH_RETRY_AFTER_SECS,
             )
-            .unwrap_or_else(|| select_peer_endpoint(announcement, own_local_endpoint));
+            .unwrap_or_else(|| {
+                select_peer_endpoint_from_local_endpoints(announcement, own_local_endpoints)
+            });
         if peer_endpoint_requires_public_signal(
             app,
             announcement,
             &selected_endpoint,
-            own_local_endpoint,
+            own_local_endpoints,
         ) {
             continue;
         }
@@ -3461,7 +3592,7 @@ fn peer_endpoint_requires_public_signal(
     app: &AppConfig,
     announcement: &PeerAnnouncement,
     selected_endpoint: &str,
-    own_local_endpoint: Option<&str>,
+    own_local_endpoints: &[String],
 ) -> bool {
     if !app.nat.enabled {
         return false;
@@ -3477,8 +3608,9 @@ fn peer_endpoint_requires_public_signal(
 
     if announcement.local_endpoint.as_deref().is_some_and(|local| {
         local == selected_endpoint
-            && own_local_endpoint
-                .is_some_and(|own| endpoints_share_local_only_ipv4_subnet(local, own))
+            && own_local_endpoints
+                .iter()
+                .any(|own| endpoints_share_local_only_ipv4_subnet(local, own))
     }) {
         return false;
     }
@@ -3492,15 +3624,30 @@ fn nat_punch_targets(
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     listen_port: u16,
 ) -> Vec<SocketAddr> {
-    let own_local_endpoint = local_signal_endpoint(app, listen_port);
-    nat_punch_targets_for_local_endpoint(app, own_pubkey, peer_announcements, &own_local_endpoint)
+    let own_local_endpoints = runtime_local_signal_endpoints(app, listen_port);
+    nat_punch_targets_for_local_endpoints(app, own_pubkey, peer_announcements, &own_local_endpoints)
 }
 
+#[cfg(test)]
 fn nat_punch_targets_for_local_endpoint(
     app: &AppConfig,
     own_pubkey: Option<&str>,
     peer_announcements: &HashMap<String, PeerAnnouncement>,
     own_local_endpoint: &str,
+) -> Vec<SocketAddr> {
+    nat_punch_targets_for_local_endpoints(
+        app,
+        own_pubkey,
+        peer_announcements,
+        &[own_local_endpoint.to_string()],
+    )
+}
+
+fn nat_punch_targets_for_local_endpoints(
+    app: &AppConfig,
+    own_pubkey: Option<&str>,
+    peer_announcements: &HashMap<String, PeerAnnouncement>,
+    own_local_endpoints: &[String],
 ) -> Vec<SocketAddr> {
     let mut targets = app
         .participant_pubkeys_hex()
@@ -3508,17 +3655,20 @@ fn nat_punch_targets_for_local_endpoint(
         .filter(|participant| Some(participant.as_str()) != own_pubkey)
         .filter_map(|participant| peer_announcements.get(participant))
         .filter_map(|announcement| {
-            let selected_endpoint = select_peer_endpoint(announcement, Some(own_local_endpoint));
+            let selected_endpoint =
+                select_peer_endpoint_from_local_endpoints(announcement, own_local_endpoints);
             if peer_endpoint_requires_public_signal(
                 app,
                 announcement,
                 &selected_endpoint,
-                Some(own_local_endpoint),
+                own_local_endpoints,
             ) {
                 return None;
             }
 
-            if endpoints_share_local_only_ipv4_subnet(&selected_endpoint, own_local_endpoint) {
+            if own_local_endpoints.iter().any(|own_local_endpoint| {
+                endpoints_share_local_only_ipv4_subnet(&selected_endpoint, own_local_endpoint)
+            }) {
                 return None;
             }
 
@@ -4297,6 +4447,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
+                            Some(presence.known()),
                         )
                         .await
                     {
@@ -4342,6 +4493,7 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
                         public_signal_endpoint.as_ref(),
                         &mut outbound_announces,
                         std::slice::from_ref(&sender_pubkey),
+                        Some(presence.known()),
                     )
                     .await
                 {
@@ -5200,6 +5352,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
+                            Some(presence.known()),
                         )
                         .await
                     {
@@ -5255,6 +5408,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                             public_signal_endpoint.as_ref(),
                             &mut outbound_announces,
                             std::slice::from_ref(&sender_pubkey),
+                            Some(presence.known()),
                         )
                         .await
                     {
@@ -8731,14 +8885,16 @@ mod tests {
         linux_route_get_spec_from_output, linux_route_target_is_ipv4,
         linux_service_status_from_show_output, load_config_with_overrides,
         local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, nat_punch_targets_for_local_endpoint, parse_exit_node_arg,
-        parse_nonzero_pid, peer_has_recent_handshake, peer_path_cache_timeout_secs,
-        peer_runtime_lookup, peer_signal_timeout_secs, pending_tunnel_heartbeat_ips,
-        persisted_path_cache_timeout_secs, persisted_peer_cache_timeout_secs, planned_tunnel_peers,
-        public_endpoint_for_listen_port, public_signal_endpoint_from_mapping,
-        publish_error_requires_reconnect, read_daemon_peer_cache, read_daemon_state,
-        record_successful_runtime_paths, relay_connection_action, request_daemon_reload,
-        request_daemon_stop, restore_daemon_peer_cache, route_targets_for_tunnel_peers,
+        nat_punch_targets, nat_punch_targets_for_local_endpoint,
+        nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
+        peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
+        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
+        persisted_peer_cache_timeout_secs, planned_tunnel_peers,
+        planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
+        public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
+        read_daemon_peer_cache, read_daemon_state, record_successful_runtime_paths,
+        relay_connection_action, request_daemon_reload, request_daemon_stop,
+        restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
         take_daemon_control_request, uninstall_cli, utun_interface_candidates,
         windows_service_status_from_query_output, write_daemon_peer_cache,
@@ -8766,6 +8922,10 @@ mod tests {
             advertised_routes: Vec::new(),
             timestamp: 1,
         }
+    }
+
+    fn local_endpoints(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 
     #[test]
@@ -10247,6 +10407,117 @@ mod tests {
             )
             .is_empty(),
             "same-lan peer should not trigger nat punch when local endpoint is known"
+        );
+    }
+
+    #[test]
+    fn secondary_local_subnet_peer_is_planned_without_public_signal() {
+        let mut config = AppConfig::generated();
+        let participant = "11".repeat(32);
+        config.nat.enabled = true;
+        config.node.endpoint = "192.168.178.80:51820".to_string();
+        config.networks[0].participants = vec![participant.clone()];
+
+        let peer_keys = generate_keypair();
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: peer_keys.public_key.clone(),
+            endpoint: "10.211.55.3:51820".to_string(),
+            local_endpoint: Some("10.211.55.3:51820".to_string()),
+            public_endpoint: None,
+            tunnel_ip: "10.44.199.77/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 10,
+        };
+        let announcements = HashMap::from([(participant.clone(), announcement)]);
+        let own_local_endpoints = local_endpoints(&["192.168.178.80:51820", "10.211.55.2:51820"]);
+
+        let selected = planned_tunnel_peers_for_local_endpoints(
+            &config,
+            None,
+            &announcements,
+            &mut PeerPathBook::default(),
+            &own_local_endpoints,
+            10,
+        )
+        .expect("planned tunnel peers");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].endpoint, "10.211.55.3:51820");
+        assert!(
+            nat_punch_targets_for_local_endpoints(
+                &config,
+                None,
+                &announcements,
+                &own_local_endpoints
+            )
+            .is_empty(),
+            "peer reachable on a secondary local subnet should not require nat punch"
+        );
+    }
+
+    #[test]
+    fn explicit_announcement_keeps_local_endpoint_for_private_override() {
+        let announcement = super::build_explicit_peer_announcement(
+            "peer-a".to_string(),
+            generate_keypair().public_key,
+            "10.211.55.3:51820".to_string(),
+            "10.211.55.3:51820".to_string(),
+            "10.44.199.77/32".to_string(),
+            Vec::new(),
+        );
+
+        assert_eq!(announcement.endpoint, "10.211.55.3:51820");
+        assert_eq!(
+            announcement.local_endpoint.as_deref(),
+            Some("10.211.55.3:51820")
+        );
+        assert!(announcement.public_endpoint.is_none());
+    }
+
+    #[test]
+    fn explicit_announcement_keeps_public_and_local_endpoints_separate() {
+        let announcement = super::build_explicit_peer_announcement(
+            "peer-a".to_string(),
+            generate_keypair().public_key,
+            "203.0.113.20:51820".to_string(),
+            "192.168.178.80:51820".to_string(),
+            "10.44.0.239/32".to_string(),
+            Vec::new(),
+        );
+
+        assert_eq!(announcement.endpoint, "203.0.113.20:51820");
+        assert_eq!(
+            announcement.local_endpoint.as_deref(),
+            Some("192.168.178.80:51820")
+        );
+        assert_eq!(
+            announcement.public_endpoint.as_deref(),
+            Some("203.0.113.20:51820")
+        );
+    }
+
+    #[test]
+    fn matching_peer_subnet_selects_secondary_local_signal_endpoint() {
+        let announcement = PeerAnnouncement {
+            node_id: "peer-a".to_string(),
+            public_key: generate_keypair().public_key,
+            endpoint: "10.211.55.3:51820".to_string(),
+            local_endpoint: Some("10.211.55.3:51820".to_string()),
+            public_endpoint: None,
+            tunnel_ip: "10.44.199.77/32".to_string(),
+            advertised_routes: Vec::new(),
+            timestamp: 10,
+        };
+        let own_local_endpoints = local_endpoints(&[
+            "192.168.178.80:51820",
+            "10.211.55.2:51820",
+            "10.37.129.2:51820",
+        ]);
+
+        assert_eq!(
+            super::select_local_signal_endpoint_for_peer(&announcement, &own_local_endpoints)
+                .as_deref(),
+            Some("10.211.55.2:51820")
         );
     }
 

@@ -2,7 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::{PeerAnnouncement, select_peer_endpoint};
+use crate::control::{
+    PeerAnnouncement, endpoint_shares_private_ipv4_subnet,
+    select_peer_endpoint_from_local_endpoints,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum PeerPathSource {
@@ -187,7 +190,28 @@ impl PeerPathBook {
         now: u64,
         retry_after_secs: u64,
     ) -> Option<String> {
-        let default_endpoint = select_peer_endpoint(announcement, own_local_endpoint);
+        let own_local_endpoints = own_local_endpoint
+            .map(|value| vec![value.to_string()])
+            .unwrap_or_default();
+        self.select_endpoint_for_local_endpoints(
+            participant,
+            announcement,
+            &own_local_endpoints,
+            now,
+            retry_after_secs,
+        )
+    }
+
+    pub fn select_endpoint_for_local_endpoints(
+        &self,
+        participant: &str,
+        announcement: &PeerAnnouncement,
+        own_local_endpoints: &[String],
+        now: u64,
+        retry_after_secs: u64,
+    ) -> Option<String> {
+        let default_endpoint =
+            select_peer_endpoint_from_local_endpoints(announcement, own_local_endpoints);
         let state = self.peers.get(participant);
         let Some(state) = state else {
             return Some(default_endpoint);
@@ -200,7 +224,7 @@ impl PeerPathBook {
             .endpoints
             .iter()
             .max_by_key(|(endpoint, tracked)| {
-                candidate_rank(endpoint, tracked, own_local_endpoint, &default_endpoint)
+                candidate_rank(endpoint, tracked, own_local_endpoints, &default_endpoint)
             })
             .map(|(endpoint, _)| endpoint.clone())?;
 
@@ -220,10 +244,10 @@ impl PeerPathBook {
             .endpoints
             .get(&preferred)
             .expect("preferred endpoint should exist");
-        let current_same_subnet_local = own_local_endpoint
-            .is_some_and(|own| endpoints_share_private_ipv4_subnet(current_endpoint, own));
-        let preferred_same_subnet_local = own_local_endpoint
-            .is_some_and(|own| endpoints_share_private_ipv4_subnet(&preferred, own));
+        let current_same_subnet_local =
+            endpoint_shares_private_ipv4_subnet(current_endpoint, own_local_endpoints);
+        let preferred_same_subnet_local =
+            endpoint_shares_private_ipv4_subnet(&preferred, own_local_endpoints);
 
         if current_endpoint == &preferred {
             return Some(preferred);
@@ -295,11 +319,10 @@ fn announcement_endpoints(announcement: &PeerAnnouncement) -> Vec<(String, PeerP
 fn candidate_rank(
     endpoint: &str,
     tracked: &TrackedPeerPath,
-    own_local_endpoint: Option<&str>,
+    own_local_endpoints: &[String],
     default_endpoint: &str,
 ) -> (u64, u8, u8, u64) {
-    let same_subnet_local =
-        own_local_endpoint.is_some_and(|own| endpoints_share_private_ipv4_subnet(endpoint, own));
+    let same_subnet_local = endpoint_shares_private_ipv4_subnet(endpoint, own_local_endpoints);
     let default_match = endpoint == default_endpoint;
     let last_success_at = if path_success_still_applies(endpoint, tracked, same_subnet_local) {
         tracked.last_success_at.unwrap_or(0)
@@ -345,25 +368,4 @@ fn endpoint_is_local_only(endpoint: &str) -> bool {
         }
         Err(_) => host.eq_ignore_ascii_case("localhost"),
     }
-}
-
-fn endpoints_share_private_ipv4_subnet(left: &str, right: &str) -> bool {
-    let Ok(left_addr) = left.parse::<std::net::SocketAddr>() else {
-        return false;
-    };
-    let Ok(right_addr) = right.parse::<std::net::SocketAddr>() else {
-        return false;
-    };
-
-    let (std::net::SocketAddr::V4(left_v4), std::net::SocketAddr::V4(right_v4)) =
-        (left_addr, right_addr)
-    else {
-        return false;
-    };
-
-    let left_ip = *left_v4.ip();
-    let right_ip = *right_v4.ip();
-    (left_ip.is_private() || left_ip.is_link_local())
-        && (right_ip.is_private() || right_ip.is_link_local())
-        && left_ip.octets()[0..3] == right_ip.octets()[0..3]
 }

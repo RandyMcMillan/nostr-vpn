@@ -68,6 +68,30 @@ pub fn select_peer_endpoint(
         .to_string()
 }
 
+pub fn select_peer_endpoint_from_local_endpoints(
+    announcement: &PeerAnnouncement,
+    own_local_endpoints: &[String],
+) -> String {
+    if let Some(peer_local) = announcement.local_endpoint.as_deref()
+        && endpoint_shares_private_ipv4_subnet(peer_local, own_local_endpoints)
+    {
+        return peer_local.to_string();
+    }
+
+    announcement
+        .public_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .unwrap_or(&announcement.endpoint)
+        .to_string()
+}
+
+pub fn endpoint_shares_private_ipv4_subnet(endpoint: &str, own_local_endpoints: &[String]) -> bool {
+    own_local_endpoints
+        .iter()
+        .any(|own_local| endpoints_share_private_ipv4_subnet(endpoint, own_local))
+}
+
 fn endpoints_share_private_ipv4_subnet(left: &str, right: &str) -> bool {
     let Ok(left_addr) = left.parse::<SocketAddr>() else {
         return false;
