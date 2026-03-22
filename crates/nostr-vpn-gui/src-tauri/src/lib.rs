@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -62,6 +62,7 @@ const LAN_DISCOVERY_STALE_AFTER_SECS: u64 = 16;
 // session window so idle peers do not flap back to "awaiting handshake".
 const PEER_ONLINE_GRACE_SECS: u64 = 180;
 const PEER_PRESENCE_GRACE_SECS: u64 = 45;
+const SERVICE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
 const TRAY_IDENTITY_MENU_ID: &str = "tray_identity";
@@ -511,6 +512,7 @@ struct NvpnBackend {
     service_disabled: bool,
     service_running: bool,
     service_status_detail: String,
+    last_service_status_refresh_at: Option<Instant>,
     daemon_state: Option<DaemonRuntimeState>,
     launch_start_pending: bool,
     force_connect_pending: bool,
@@ -619,6 +621,7 @@ impl NvpnBackend {
             service_disabled: false,
             service_running: false,
             service_status_detail: String::new(),
+            last_service_status_refresh_at: None,
             daemon_state: None,
             launch_start_pending: false,
             force_connect_pending: false,
@@ -1049,10 +1052,55 @@ impl NvpnBackend {
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
-        self.config.save(&self.config_path)?;
+        if let Err(error) = self.config.save(&self.config_path) {
+            #[cfg(target_os = "windows")]
+            {
+                if requires_admin_privileges(&error.to_string()) {
+                    self.persist_config_with_admin_privileges()?;
+                } else {
+                    return Err(error);
+                }
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                return Err(error);
+            }
+        }
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn persist_config_with_admin_privileges(&self) -> Result<()> {
+        let temp_path = windows_temp_config_import_path();
+        self.config.save(&temp_path).with_context(|| {
+            format!(
+                "failed to stage config for elevated import {}",
+                temp_path.display()
+            )
+        })?;
+
+        let result = (|| {
+            let source = temp_path
+                .to_str()
+                .ok_or_else(|| anyhow!("temp config path is not valid UTF-8"))?;
+            let target = self
+                .config_path
+                .to_str()
+                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?;
+            self.run_nvpn_command_with_admin_privileges(windows_elevated_config_import_args(
+                source, target,
+            ))
+        })();
+
+        let _ = fs::remove_file(&temp_path);
+        result
+    }
+
+    fn invalidate_service_status_cache(&mut self) {
+        self.last_service_status_refresh_at = None;
     }
 
     fn ensure_relay_status_entries(&mut self) {
@@ -1391,6 +1439,7 @@ impl NvpnBackend {
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
+            self.invalidate_service_status_cache();
             #[cfg(target_os = "windows")]
             self.reload_preferred_windows_config_path()?;
             return Ok(());
@@ -1407,6 +1456,7 @@ impl NvpnBackend {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
+            self.invalidate_service_status_cache();
             #[cfg(target_os = "windows")]
             self.reload_preferred_windows_config_path()?;
             return Ok(());
@@ -1415,7 +1465,7 @@ impl NvpnBackend {
         Err(anyhow!(message))
     }
 
-    fn uninstall_system_service(&self) -> Result<()> {
+    fn uninstall_system_service(&mut self) -> Result<()> {
         let runtime = current_runtime_capabilities();
         if !runtime.vpn_session_control_supported {
             return Err(anyhow!(runtime.runtime_status_detail));
@@ -1434,6 +1484,7 @@ impl NvpnBackend {
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
@@ -1448,13 +1499,14 @@ impl NvpnBackend {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
         Err(anyhow!(message))
     }
 
-    fn enable_system_service(&self) -> Result<()> {
+    fn enable_system_service(&mut self) -> Result<()> {
         let runtime = current_runtime_capabilities();
         if !runtime.vpn_session_control_supported {
             return Err(anyhow!(runtime.runtime_status_detail));
@@ -1473,6 +1525,7 @@ impl NvpnBackend {
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
@@ -1487,13 +1540,14 @@ impl NvpnBackend {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
         Err(anyhow!(message))
     }
 
-    fn disable_system_service(&self) -> Result<()> {
+    fn disable_system_service(&mut self) -> Result<()> {
         let runtime = current_runtime_capabilities();
         if !runtime.vpn_session_control_supported {
             return Err(anyhow!(runtime.runtime_status_detail));
@@ -1512,6 +1566,7 @@ impl NvpnBackend {
         let output = self.run_nvpn_command(args)?;
 
         if output.status.success() {
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
@@ -1526,6 +1581,7 @@ impl NvpnBackend {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
         if requires_admin_privileges(&message) {
             self.run_nvpn_command_with_admin_privileges(args)?;
+            self.invalidate_service_status_cache();
             return Ok(());
         }
 
@@ -1942,8 +1998,18 @@ impl NvpnBackend {
             return;
         }
 
+        let now = Instant::now();
+        if !service_state_refresh_due(
+            self.last_service_status_refresh_at,
+            now,
+            SERVICE_STATUS_REFRESH_INTERVAL,
+        ) {
+            return;
+        }
+
         match self.fetch_cli_service_status() {
             Ok(status) => {
+                self.last_service_status_refresh_at = Some(now);
                 self.service_supported = status.supported;
                 self.service_installed = status.installed;
                 self.service_disabled = status.disabled;
@@ -1977,6 +2043,7 @@ impl NvpnBackend {
                 );
             }
             Err(error) => {
+                self.last_service_status_refresh_at = Some(now);
                 self.service_supported = cfg!(any(
                     target_os = "macos",
                     target_os = "linux",
@@ -3214,6 +3281,33 @@ fn requires_admin_privileges(message: &str) -> bool {
         || lower.contains("admin privileges")
 }
 
+fn service_state_refresh_due(
+    last_refresh_at: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    last_refresh_at
+        .map(|last_refresh_at| now.duration_since(last_refresh_at) >= interval)
+        .unwrap_or(true)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_elevated_config_import_args<'a>(source: &'a str, target: &'a str) -> [&'a str; 5] {
+    ["apply-config", "--source", source, "--config", target]
+}
+
+#[cfg(target_os = "windows")]
+fn windows_temp_config_import_path() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    env::temp_dir().join(format!(
+        "nvpn-config-import-{}-{nonce}.toml",
+        std::process::id()
+    ))
+}
+
 fn is_already_running_message(message: &str) -> bool {
     message.to_ascii_lowercase().contains("already running")
 }
@@ -4247,56 +4341,64 @@ fn run_tray_backend_action<R: tauri::Runtime>(
 }
 
 #[tauri::command]
-fn tick(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+async fn tick(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
+    let ui = with_backend_async(state, |backend| {
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn connect_session(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
-        backend.connect_session()?;
-        backend.tick();
-        Ok(backend.ui_state())
-    })?;
-    refresh_tray_menu(&app);
-    Ok(ui)
-}
-
-#[tauri::command]
-fn disconnect_session(
+async fn connect_session(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
-        backend.disconnect_session()?;
+    let ui = with_backend_async(state, |backend| {
+        backend.connect_session()?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn install_cli(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+async fn disconnect_session(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, |backend| {
+        backend.disconnect_session()?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+async fn install_cli(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend_async(state, |backend| {
         backend.install_cli_binary()?;
         backend.tick();
         Ok(backend.ui_state())
     })
+    .await
 }
 
 #[tauri::command]
-fn uninstall_cli(state: State<'_, AppState>) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+async fn uninstall_cli(state: State<'_, AppState>) -> Result<UiState, String> {
+    with_backend_async(state, |backend| {
         backend.uninstall_cli_binary()?;
         backend.tick();
         Ok(backend.ui_state())
     })
+    .await
 }
 
 #[tauri::command]
@@ -4360,173 +4462,185 @@ async fn disable_system_service(
 }
 
 #[tauri::command]
-fn add_network(
+async fn add_network(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     name: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.add_network(&name)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn rename_network(
+async fn rename_network(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     name: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.rename_network(&network_id, &name)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn remove_network(
+async fn remove_network(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.remove_network(&network_id)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn set_network_mesh_id(
+async fn set_network_mesh_id(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     mesh_id: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.set_network_mesh_id(&network_id, &mesh_id)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn set_network_enabled(
+async fn set_network_enabled(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     enabled: bool,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.set_network_enabled(&network_id, enabled)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn add_participant(
+async fn add_participant(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     npub: String,
     alias: Option<String>,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.add_participant(&network_id, &npub, alias.as_deref())?;
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn import_network_invite(
+async fn import_network_invite(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     invite: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.import_network_invite(&invite)?;
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn remove_participant(
+async fn remove_participant(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     network_id: String,
     npub: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.remove_participant(&network_id, &npub)?;
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn set_participant_alias(
+async fn set_participant_alias(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     npub: String,
     alias: String,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.set_participant_alias(&npub, &alias)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
 
 #[tauri::command]
-fn add_relay(state: State<'_, AppState>, relay: String) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+async fn add_relay(state: State<'_, AppState>, relay: String) -> Result<UiState, String> {
+    with_backend_async(state, move |backend| {
         backend.add_relay(&relay)?;
         backend.tick();
         Ok(backend.ui_state())
     })
+    .await
 }
 
 #[tauri::command]
-fn remove_relay(state: State<'_, AppState>, relay: String) -> Result<UiState, String> {
-    with_backend(state, |backend| {
+async fn remove_relay(state: State<'_, AppState>, relay: String) -> Result<UiState, String> {
+    with_backend_async(state, move |backend| {
         backend.remove_relay(&relay)?;
         backend.tick();
         Ok(backend.ui_state())
     })
+    .await
 }
 
 #[tauri::command]
-fn update_settings(
+async fn update_settings(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     patch: SettingsPatch,
 ) -> Result<UiState, String> {
-    let ui = with_backend(state, |backend| {
+    let ui = with_backend_async(state, move |backend| {
         backend.update_settings(patch)?;
         backend.tick();
         Ok(backend.ui_state())
-    })?;
+    })
+    .await?;
     refresh_tray_menu(&app);
     Ok(ui)
 }
@@ -4944,14 +5058,14 @@ mod tests {
         should_surface_existing_instance_args, started_from_autostart_args,
         tauri_protocol_request_path, to_npub, tray_exit_node_entries, tray_identity_text,
         tray_menu_spec, tray_network_groups, tray_status_text, tray_vpn_status_menu_text,
-        tray_vpn_toggle_text, validate_nvpn_binary, within_peer_online_grace,
-        within_peer_presence_grace,
+        tray_vpn_toggle_text, validate_nvpn_binary, windows_elevated_config_import_args,
+        within_peer_online_grace, within_peer_presence_grace,
     };
     use nostr_vpn_core::config::AppConfig;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
     use tokio::runtime::Runtime;
 
     fn test_backend(participant: &str) -> NvpnBackend {
@@ -4973,6 +5087,7 @@ mod tests {
             service_disabled: false,
             service_running: false,
             service_status_detail: String::new(),
+            last_service_status_refresh_at: None,
             daemon_state: None,
             launch_start_pending: false,
             force_connect_pending: false,
@@ -6063,6 +6178,46 @@ mod tests {
         );
 
         assert_eq!(path, PathBuf::from(r"C:\ProgramData\Nostr VPN\config.toml"));
+    }
+
+    #[test]
+    fn windows_elevated_config_import_command_uses_source_and_target_paths() {
+        let args = windows_elevated_config_import_args(
+            r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+            r"C:\ProgramData\Nostr VPN\config.toml",
+        );
+
+        assert_eq!(
+            args,
+            [
+                "apply-config",
+                "--source",
+                r"C:\Users\sirius\AppData\Local\Temp\nvpn-import.toml",
+                "--config",
+                r"C:\ProgramData\Nostr VPN\config.toml",
+            ]
+        );
+    }
+
+    #[test]
+    fn service_state_refresh_due_only_after_interval() {
+        let now = Instant::now();
+
+        assert!(super::service_state_refresh_due(
+            None,
+            now,
+            Duration::from_secs(5)
+        ));
+        assert!(!super::service_state_refresh_due(
+            Some(now),
+            now + Duration::from_secs(4),
+            Duration::from_secs(5)
+        ));
+        assert!(super::service_state_refresh_due(
+            Some(now),
+            now + Duration::from_secs(5),
+            Duration::from_secs(5)
+        ));
     }
 
     #[test]

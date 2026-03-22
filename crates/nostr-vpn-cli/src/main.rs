@@ -247,6 +247,9 @@ enum Command {
     Ip(IpArgs),
     /// Resolve a node/tunnel IP to peer metadata.
     Whois(WhoisArgs),
+    /// Internal config import helper for elevated GUI writes.
+    #[command(hide = true)]
+    ApplyConfig(ApplyConfigArgs),
     /// Broadcast this node's presence signal over Nostr.
     Announce {
         #[arg(long)]
@@ -650,6 +653,14 @@ struct WhoisArgs {
     discover_secs: u64,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Debug, Args)]
+struct ApplyConfigArgs {
+    #[arg(long)]
+    source: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -1147,6 +1158,10 @@ async fn run_command(command: Command) -> Result<()> {
                 println!("endpoint={}", peer.endpoint);
                 println!("timestamp={}", peer.timestamp);
             }
+        }
+        Command::ApplyConfig(args) => {
+            let config_path = args.config.unwrap_or_else(default_config_path);
+            apply_config_file(&args.source, &config_path)?;
         }
         Command::Announce {
             config,
@@ -8294,6 +8309,17 @@ fn init_config(path: &Path, force: bool, participants: Vec<String>) -> Result<()
     Ok(())
 }
 
+fn apply_config_file(source_path: &Path, target_path: &Path) -> Result<()> {
+    let mut config = AppConfig::load(source_path)
+        .with_context(|| format!("failed to load source config {}", source_path.display()))?;
+    config.ensure_defaults();
+    maybe_autoconfigure_node(&mut config);
+    config
+        .save(target_path)
+        .with_context(|| format!("failed to save config {}", target_path.display()))?;
+    Ok(())
+}
+
 fn default_cli_install_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -9434,23 +9460,24 @@ mod tests {
         AppConfig, Cli, DaemonPeerCacheEntry, DaemonPeerCacheRestore, DaemonPeerCacheState,
         DaemonRuntimeState, DiscoveredPublicSignalEndpoint, InstallCliArgs, LinuxExitNodeIpFamily,
         OutboundAnnounceBook, PeerAnnouncement, TunnelPeer, UninstallCliArgs, WireGuardPeerStatus,
-        announcement_fingerprint, apply_participants_override, build_daemon_reload_config,
-        build_peer_announcement, build_runtime_magic_dns_records, can_reuse_active_listen_port,
-        connected_peer_count_for_runtime, daemon_control_file_path, daemon_peer_cache_file_path,
-        daemon_peer_transport_state, daemon_pids_from_ps_output, daemon_reconnect_backoff_delay,
-        daemon_session_active, daemon_session_idle_status, default_cli_install_path,
-        endpoint_with_listen_port, install_cli, is_uapi_addr_in_use_error, key_b64_to_hex,
-        kill_error_requires_control_fallback, linux_default_route_device_from_output,
-        linux_exit_node_default_route_families, linux_exit_node_firewall_binary,
-        linux_exit_node_forward_in_rule, linux_exit_node_forward_out_rule,
-        linux_exit_node_ipv4_masquerade_rule, linux_exit_node_source_cidr, linux_ipv4_route_source,
-        linux_route_get_spec_from_output, linux_route_target_is_ipv4,
-        linux_service_status_from_show_output, load_config_with_overrides,
-        local_interface_address_for_tunnel, macos_service_disabled_from_print_disabled_output,
-        nat_punch_targets, nat_punch_targets_for_local_endpoint,
-        nat_punch_targets_for_local_endpoints, parse_exit_node_arg, parse_nonzero_pid,
-        peer_has_recent_handshake, peer_path_cache_timeout_secs, peer_runtime_lookup,
-        peer_signal_timeout_secs, pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
+        announcement_fingerprint, apply_config_file, apply_participants_override,
+        build_daemon_reload_config, build_peer_announcement, build_runtime_magic_dns_records,
+        can_reuse_active_listen_port, connected_peer_count_for_runtime, daemon_control_file_path,
+        daemon_peer_cache_file_path, daemon_peer_transport_state, daemon_pids_from_ps_output,
+        daemon_reconnect_backoff_delay, daemon_session_active, daemon_session_idle_status,
+        default_cli_install_path, endpoint_with_listen_port, install_cli,
+        is_uapi_addr_in_use_error, key_b64_to_hex, kill_error_requires_control_fallback,
+        linux_default_route_device_from_output, linux_exit_node_default_route_families,
+        linux_exit_node_firewall_binary, linux_exit_node_forward_in_rule,
+        linux_exit_node_forward_out_rule, linux_exit_node_ipv4_masquerade_rule,
+        linux_exit_node_source_cidr, linux_ipv4_route_source, linux_route_get_spec_from_output,
+        linux_route_target_is_ipv4, linux_service_status_from_show_output,
+        load_config_with_overrides, local_interface_address_for_tunnel,
+        macos_service_disabled_from_print_disabled_output, nat_punch_targets,
+        nat_punch_targets_for_local_endpoint, nat_punch_targets_for_local_endpoints,
+        parse_exit_node_arg, parse_nonzero_pid, peer_has_recent_handshake,
+        peer_path_cache_timeout_secs, peer_runtime_lookup, peer_signal_timeout_secs,
+        pending_tunnel_heartbeat_ips, persisted_path_cache_timeout_secs,
         persisted_peer_cache_timeout_secs, planned_tunnel_peers,
         planned_tunnel_peers_for_local_endpoints, public_endpoint_for_listen_port,
         public_signal_endpoint_from_mapping, publish_error_requires_reconnect,
@@ -11450,6 +11477,31 @@ mod tests {
         })
         .expect("uninstall custom cli target");
         assert!(!target.exists(), "uninstall should remove target");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_config_file_writes_target_config() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock is after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nvpn-apply-config-test-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        let source = dir.join("source.toml");
+        let target = dir.join("target.toml");
+        let mut config = AppConfig::generated();
+        config.node_name = "windows-box".to_string();
+        config.networks[0].participants = vec!["ab".repeat(32)];
+        config.save(&source).expect("save source config");
+
+        apply_config_file(&source, &target).expect("apply config should succeed");
+
+        let loaded = AppConfig::load(&target).expect("load target config");
+        assert_eq!(loaded.node_name, "windows-box");
+        assert_eq!(loaded.participant_pubkeys_hex(), vec!["ab".repeat(32)]);
 
         let _ = fs::remove_dir_all(&dir);
     }
