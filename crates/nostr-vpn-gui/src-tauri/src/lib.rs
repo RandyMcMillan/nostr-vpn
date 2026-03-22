@@ -3170,6 +3170,8 @@ fn requires_admin_privileges(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("operation not permitted")
         || lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("openscmanager failed 5")
         || lower.contains("did you run with sudo")
         || lower.contains("admin privileges")
 }
@@ -5639,6 +5641,12 @@ mod tests {
         assert!(!gui_requires_service_enable(true, true, false, false));
         assert!(!gui_requires_service_enable(true, false, true, false));
         assert!(!gui_requires_service_enable(false, true, true, false));
+    }
+
+    #[test]
+    fn admin_privilege_detection_matches_windows_access_denied_errors() {
+        let message = "nvpn service install failed\nstdout: daemon: not running\nError: sc create service failed\nstdout: [SC] OpenSCManager FAILED 5: Access is denied.\nstderr:";
+        assert!(super::requires_admin_privileges(message));
     }
 
     #[test]
