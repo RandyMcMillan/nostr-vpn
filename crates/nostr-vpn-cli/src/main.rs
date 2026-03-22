@@ -1608,7 +1608,7 @@ async fn probe_iroh_relay(args: ProbeIrohRelayArgs) -> Result<()> {
         None => IrohRelayMode::Default,
     };
 
-    let sender = IrohEndpoint::builder(iroh_presets::N0)
+    let sender = IrohEndpoint::builder(iroh_presets::Minimal)
         .secret_key(IrohSecretKey::generate(&mut rand::rng()))
         .alpns(vec![IROH_RELAY_PROBE_ALPN.to_vec()])
         .clear_ip_transports()
@@ -1616,7 +1616,7 @@ async fn probe_iroh_relay(args: ProbeIrohRelayArgs) -> Result<()> {
         .bind()
         .await
         .context("failed to bind iroh sender endpoint")?;
-    let receiver = IrohEndpoint::builder(iroh_presets::N0)
+    let receiver = IrohEndpoint::builder(iroh_presets::Minimal)
         .secret_key(IrohSecretKey::generate(&mut rand::rng()))
         .alpns(vec![IROH_RELAY_PROBE_ALPN.to_vec()])
         .clear_ip_transports()
