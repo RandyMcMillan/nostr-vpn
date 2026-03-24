@@ -31,11 +31,28 @@ export interface ParticipantView {
   lastSignalText: string
 }
 
+export interface OutboundJoinRequestView {
+  recipientNpub: string
+  recipientPubkeyHex: string
+  requestedAtText: string
+}
+
+export interface InboundJoinRequestView {
+  requesterNpub: string
+  requesterPubkeyHex: string
+  requesterNodeName: string
+  requestedAtText: string
+}
+
 export interface NetworkView {
   id: string
   name: string
   enabled: boolean
   networkId: string
+  joinRequestsEnabled: boolean
+  inviteInviterNpub: string
+  outboundJoinRequest: OutboundJoinRequestView | null
+  inboundJoinRequests: InboundJoinRequestView[]
   onlineCount: number
   expectedCount: number
   participants: ParticipantView[]

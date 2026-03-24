@@ -485,6 +485,10 @@ fn active_network_helpers_ignore_inactive_networks() {
             enabled: true,
             network_id: "mesh-home".to_string(),
             participants: vec![peer_a.clone()],
+            listen_for_join_requests: true,
+            invite_inviter: String::new(),
+            outbound_join_request: None,
+            inbound_join_requests: Vec::new(),
         },
         NetworkConfig {
             id: "network-2".to_string(),
@@ -492,6 +496,10 @@ fn active_network_helpers_ignore_inactive_networks() {
             enabled: false,
             network_id: "mesh-work".to_string(),
             participants: vec![peer_b.clone()],
+            listen_for_join_requests: true,
+            invite_inviter: String::new(),
+            outbound_join_request: None,
+            inbound_join_requests: Vec::new(),
         },
     ];
     config.ensure_defaults();

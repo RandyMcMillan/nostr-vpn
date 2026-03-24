@@ -120,6 +120,35 @@ pub struct NetworkConfig {
     pub network_id: String,
     #[serde(default)]
     pub participants: Vec<String>,
+    #[serde(
+        default = "default_listen_for_join_requests",
+        skip_serializing_if = "is_true"
+    )]
+    pub listen_for_join_requests: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub invite_inviter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_join_request: Option<PendingOutboundJoinRequest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_join_requests: Vec<PendingInboundJoinRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PendingOutboundJoinRequest {
+    #[serde(default)]
+    pub recipient: String,
+    #[serde(default)]
+    pub requested_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PendingInboundJoinRequest {
+    #[serde(default)]
+    pub requester: String,
+    #[serde(default)]
+    pub requester_node_name: String,
+    #[serde(default)]
+    pub requested_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +170,10 @@ impl Default for AppConfig {
                 enabled: default_network_enabled(),
                 network_id: default_network_id(),
                 participants: Vec::new(),
+                listen_for_join_requests: default_listen_for_join_requests(),
+                invite_inviter: String::new(),
+                outbound_join_request: None,
+                inbound_join_requests: Vec::new(),
             }],
             node_name: default_node_name(),
             auto_disconnect_relays_when_mesh_ready: default_auto_disconnect_relays_when_mesh_ready(
@@ -298,6 +331,10 @@ impl AppConfig {
                 enabled: true,
                 network_id: default_network_id(),
                 participants: Vec::new(),
+                listen_for_join_requests: default_listen_for_join_requests(),
+                invite_inviter: String::new(),
+                outbound_join_request: None,
+                inbound_join_requests: Vec::new(),
             });
         }
 
@@ -323,6 +360,7 @@ impl AppConfig {
             if network.network_id.trim().is_empty() {
                 network.network_id = default_network_id();
             }
+            network.invite_inviter = normalize_nostr_pubkey(&network.invite_inviter).unwrap_or_default();
 
             network.participants = network
                 .participants
@@ -331,6 +369,14 @@ impl AppConfig {
                 .collect();
             network.participants.sort();
             network.participants.dedup();
+            network.outbound_join_request = normalize_outbound_join_request(
+                network.outbound_join_request.take(),
+                &network.participants,
+            );
+            network.inbound_join_requests = normalize_inbound_join_requests(
+                std::mem::take(&mut network.inbound_join_requests),
+                &network.participants,
+            );
         }
 
         self.ensure_single_active_network();
@@ -350,6 +396,11 @@ impl AppConfig {
                 .collect();
             network.participants.sort();
             network.participants.dedup();
+            network.invite_inviter = canonical_npub_key(&network.invite_inviter).unwrap_or_default();
+            network.outbound_join_request =
+                canonicalize_outbound_join_request(network.outbound_join_request.take());
+            network.inbound_join_requests =
+                canonicalize_inbound_join_requests(std::mem::take(&mut network.inbound_join_requests));
         }
 
         self.normalize_peer_aliases();
@@ -448,6 +499,10 @@ impl AppConfig {
             enabled: false,
             network_id: default_network_id(),
             participants: Vec::new(),
+            listen_for_join_requests: default_listen_for_join_requests(),
+            invite_inviter: String::new(),
+            outbound_join_request: None,
+            inbound_join_requests: Vec::new(),
         });
         id
     }
@@ -506,6 +561,18 @@ impl AppConfig {
         }
 
         self.networks[index].enabled = false;
+        Ok(())
+    }
+
+    pub fn set_network_join_requests_enabled(
+        &mut self,
+        network_id: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let network = self
+            .network_by_id_mut(network_id)
+            .ok_or_else(|| anyhow::anyhow!("network not found"))?;
+        network.listen_for_join_requests = enabled;
         Ok(())
     }
 
@@ -960,6 +1027,14 @@ const fn default_network_enabled() -> bool {
     true
 }
 
+const fn default_listen_for_join_requests() -> bool {
+    true
+}
+
+const fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_network_name(ordinal: usize) -> String {
     format!("Network {ordinal}")
 }
@@ -1327,6 +1402,79 @@ fn npub_for_pubkey_hex(pubkey_hex: &str) -> String {
 fn canonical_npub_key(value: &str) -> Option<String> {
     let normalized = normalize_nostr_pubkey(value).ok()?;
     Some(npub_for_pubkey_hex(&normalized))
+}
+
+fn normalize_outbound_join_request(
+    request: Option<PendingOutboundJoinRequest>,
+    _participants: &[String],
+) -> Option<PendingOutboundJoinRequest> {
+    let request = request?;
+    let recipient = normalize_nostr_pubkey(&request.recipient).ok()?;
+    Some(PendingOutboundJoinRequest {
+        recipient,
+        requested_at: request.requested_at,
+    })
+}
+
+fn canonicalize_outbound_join_request(
+    request: Option<PendingOutboundJoinRequest>,
+) -> Option<PendingOutboundJoinRequest> {
+    let request = request?;
+    let recipient = canonical_npub_key(&request.recipient)?;
+    Some(PendingOutboundJoinRequest {
+        recipient,
+        requested_at: request.requested_at,
+    })
+}
+
+fn normalize_inbound_join_requests(
+    requests: Vec<PendingInboundJoinRequest>,
+    participants: &[String],
+) -> Vec<PendingInboundJoinRequest> {
+    let mut deduped = HashMap::new();
+
+    for request in requests {
+        let Ok(requester) = normalize_nostr_pubkey(&request.requester) else {
+            continue;
+        };
+        if participants.iter().any(|participant| participant == &requester) {
+            continue;
+        }
+
+        let normalized = PendingInboundJoinRequest {
+            requester: requester.clone(),
+            requester_node_name: request.requester_node_name.trim().to_string(),
+            requested_at: request.requested_at,
+        };
+        if deduped
+            .get(&requester)
+            .map(|existing: &PendingInboundJoinRequest| existing.requested_at >= normalized.requested_at)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        deduped.insert(requester, normalized);
+    }
+
+    let mut normalized = deduped.into_values().collect::<Vec<_>>();
+    normalized.sort_by(|left, right| left.requester.cmp(&right.requester));
+    normalized
+}
+
+fn canonicalize_inbound_join_requests(
+    requests: Vec<PendingInboundJoinRequest>,
+) -> Vec<PendingInboundJoinRequest> {
+    requests
+        .into_iter()
+        .filter_map(|request| {
+            let requester = canonical_npub_key(&request.requester)?;
+            Some(PendingInboundJoinRequest {
+                requester,
+                requester_node_name: request.requester_node_name,
+                requested_at: request.requested_at,
+            })
+        })
+        .collect()
 }
 
 fn normalize_npub_key(value: &str) -> Option<String> {

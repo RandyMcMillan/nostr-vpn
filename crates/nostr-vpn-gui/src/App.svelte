@@ -21,6 +21,7 @@
     addNetwork,
     addParticipant,
     addRelay,
+    acceptJoinRequest,
     connectSession,
     disableSystemService,
     disconnectSession,
@@ -33,7 +34,9 @@
     removeParticipant,
     removeRelay,
     renameNetwork,
+    requestNetworkJoin,
     setNetworkEnabled,
+    setNetworkJoinRequestsEnabled,
     setNetworkMeshId,
     setParticipantAlias,
     setAutostartEnabled,
@@ -288,6 +291,34 @@
     state.networks.find((network) => network.enabled) ?? state.networks[0]
 
   const inactiveNetworks = (state: UiState) => state.networks.filter((network) => !network.enabled)
+
+  const inviteInviterParticipant = (network: NetworkView) =>
+    network.inviteInviterNpub
+      ? network.participants.find((participant) => participant.npub === network.inviteInviterNpub)
+      : undefined
+
+  const joinRequestButtonLabel = (network: NetworkView) => {
+    if (inviteInviterParticipant(network)?.state === 'online') {
+      return 'Connected'
+    }
+    if (network.outboundJoinRequest) {
+      return 'Requested'
+    }
+    return 'Request Join'
+  }
+
+  const joinRequestStatusText = (network: NetworkView) => {
+    if (inviteInviterParticipant(network)?.state === 'online') {
+      return 'Mesh connection received'
+    }
+    if (network.outboundJoinRequest) {
+      return `Requested ${network.outboundJoinRequest.requestedAtText}`
+    }
+    if (!network.inviteInviterNpub) {
+      return ''
+    }
+    return `Imported from ${short(network.inviteInviterNpub, 18, 12)}. Send a Nostr join request if they have not added this device yet.`
+  }
 
   const describeInviteScanError = (err: unknown) => {
     const name =
@@ -1195,6 +1226,18 @@
     await importInviteCode(invite)
   }
 
+  async function onRequestNetworkJoin(networkId: string) {
+    await runAction(() => requestNetworkJoin(networkId))
+  }
+
+  async function onAcceptJoinRequest(networkId: string, requesterNpub: string) {
+    await runAction(() => acceptJoinRequest(networkId, requesterNpub))
+  }
+
+  async function onToggleJoinRequests(networkId: string, enabled: boolean) {
+    await runAction(() => setNetworkJoinRequestsEnabled(networkId, enabled))
+  }
+
   async function onStartLanPairing() {
     await runAction(() => startLanPairing())
   }
@@ -1642,6 +1685,45 @@
           <div class="config-path">
             Includes the Mesh ID, your npub, and the relay list for {activeNetworkView.name}.
           </div>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={activeNetworkView.joinRequestsEnabled}
+              on:change={(event) =>
+                onToggleJoinRequests(
+                  activeNetworkView.id,
+                  (event.currentTarget as HTMLInputElement).checked,
+                )}
+            />
+            <div>Listen for join requests</div>
+          </label>
+          <div class="config-path">
+            Accept encrypted join requests for this mesh from invite holders, even if they are not configured yet.
+          </div>
+          {#if activeNetworkView.inboundJoinRequests.length > 0}
+            <div class="lan-title">Pending join requests</div>
+            <div class="stack rows">
+              {#each activeNetworkView.inboundJoinRequests as request}
+                <div class="item-row" data-testid="join-request-row">
+                  <div class="item-main">
+                    <div class="item-title">
+                      {request.requesterNodeName || short(request.requesterNpub, 22, 12)}
+                    </div>
+                    <div class="item-sub">
+                      {short(request.requesterNpub, 18, 12)} | requested {request.requestedAtText}
+                    </div>
+                  </div>
+                  <button
+                    class="btn"
+                    data-testid="accept-join-request"
+                    on:click={() => onAcceptJoinRequest(activeNetworkView.id, request.requesterNpub)}
+                  >
+                    Accept
+                  </button>
+                </div>
+              {/each}
+            </div>
+          {/if}
           <div class="mesh-share-actions">
             <button class="btn copy-btn" data-testid="copy-network-invite" on:click={copyInvite}>
               <span class="copy-icon" aria-hidden="true">
@@ -1706,6 +1788,29 @@
         <div class="invite-help">
           Fastest: paste an invite from another device. LAN pairing can also broadcast yours nearby for 15 minutes.
         </div>
+        {#if activeNetworkView.inviteInviterNpub}
+          <div class="mesh-share-actions">
+            <button
+              class="btn"
+              data-testid="request-network-join"
+              on:click={() => onRequestNetworkJoin(activeNetworkView.id)}
+              disabled={
+                Boolean(activeNetworkView.outboundJoinRequest) ||
+                inviteInviterParticipant(activeNetworkView)?.state === 'online'
+              }
+            >
+              {joinRequestButtonLabel(activeNetworkView)}
+            </button>
+            {#if activeNetworkView.outboundJoinRequest}
+              <span class="badge warn">
+                Requested {activeNetworkView.outboundJoinRequest.requestedAtText}
+              </span>
+            {:else if inviteInviterParticipant(activeNetworkView)?.state === 'online'}
+              <span class="badge ok">Connected</span>
+            {/if}
+          </div>
+          <div class="config-path">{joinRequestStatusText(activeNetworkView)}</div>
+        {/if}
         <div class="invite-import-fields">
           <input
             class="text-input invite-import-input"
@@ -2005,6 +2110,11 @@
                     <div class="row network-directory-title-row">
                       <div class="item-title">{network.name}</div>
                       <span class="badge muted">Saved</span>
+                      {#if network.inboundJoinRequests.length > 0}
+                        <span class="badge warn">
+                          {network.inboundJoinRequests.length} request{network.inboundJoinRequests.length === 1 ? '' : 's'}
+                        </span>
+                      {/if}
                     </div>
                     <div class="config-path" data-testid="network-mesh-id">
                       Mesh ID: {formatMeshIdForDisplay(network.networkId)}
@@ -2071,6 +2181,44 @@
                     <div class="config-path saved-network-note">
                       Activate this saved network when you want to switch the current mesh to it.
                     </div>
+                  </div>
+
+                  <div class="participant-add-panel">
+                    <div class="participant-add-label">Join requests</div>
+                    <label class="toggle-row">
+                      <input
+                        type="checkbox"
+                        checked={network.joinRequestsEnabled}
+                        on:change={(event) =>
+                          onToggleJoinRequests(
+                            network.id,
+                            (event.currentTarget as HTMLInputElement).checked,
+                          )}
+                      />
+                      <div>Listen for join requests</div>
+                    </label>
+                    <div class="config-path">
+                      Accept encrypted join requests for this saved mesh without activating it first.
+                    </div>
+                    {#if network.inboundJoinRequests.length > 0}
+                      <div class="stack rows">
+                        {#each network.inboundJoinRequests as request}
+                          <div class="item-row">
+                            <div class="item-main">
+                              <div class="item-title">
+                                {request.requesterNodeName || short(request.requesterNpub, 22, 12)}
+                              </div>
+                              <div class="item-sub">
+                                {short(request.requesterNpub, 18, 12)} | requested {request.requestedAtText}
+                              </div>
+                            </div>
+                            <button class="btn" on:click={() => onAcceptJoinRequest(network.id, request.requesterNpub)}>
+                              Accept
+                            </button>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
                   </div>
 
                   <div class="participant-add-panel">

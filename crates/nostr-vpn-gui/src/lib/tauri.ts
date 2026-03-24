@@ -31,6 +31,13 @@ type MockNetworkInvite = {
   relays: string[]
 }
 
+const emptyMockJoinRequestState = () => ({
+  joinRequestsEnabled: true,
+  inviteInviterNpub: '',
+  outboundJoinRequest: null,
+  inboundJoinRequests: [],
+})
+
 const pseudoHexFromNpub = (npub: string) => {
   const seed = npub
     .replace(/^npub1/i, '')
@@ -150,6 +157,7 @@ const mockState: UiState = {
       name: 'Network 1',
       enabled: true,
       networkId: 'mockmesh1234',
+      ...emptyMockJoinRequestState(),
       onlineCount: 0,
       expectedCount: 0,
       participants: [],
@@ -217,6 +225,19 @@ const updateMockRelaySummary = () => {
 }
 
 const recomputeMockConnectivity = () => {
+  mockState.networks = mockState.networks.map((network) => ({
+    ...network,
+    outboundJoinRequest:
+      network.outboundJoinRequest &&
+      network.participants.some(
+        (participant) =>
+          participant.npub === network.outboundJoinRequest?.recipientNpub &&
+          participant.state === 'online',
+      )
+        ? null
+        : network.outboundJoinRequest,
+  }))
+
   mockState.networks = mockState.networks.map((network) => ({
     ...network,
     onlineCount: countOnlineDevices(network, mockState.sessionActive),
@@ -413,6 +434,7 @@ export const addNetwork = (name: string) =>
           name: normalized,
           enabled: false,
           networkId: id.replace(/-/g, ''),
+          ...emptyMockJoinRequestState(),
           onlineCount: 0,
           expectedCount: 0,
           participants: [],
@@ -467,6 +489,46 @@ export const setNetworkEnabled = (networkId: string, enabled: boolean) =>
         if (enabled) {
           activateMockNetwork(networkId)
         }
+        return asResult()
+      })()
+
+export const setNetworkJoinRequestsEnabled = (networkId: string, enabled: boolean) =>
+  isTauriRuntime()
+    ? invoke<UiState>('set_network_join_requests_enabled', { networkId, enabled })
+    : (() => {
+        mockState.networks = mockState.networks.map((network) =>
+          network.id === networkId
+            ? { ...network, joinRequestsEnabled: enabled }
+            : network,
+        )
+        return asResult()
+      })()
+
+export const requestNetworkJoin = (networkId: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('request_network_join', { networkId })
+    : (() => {
+        mockState.networks = mockState.networks.map((network) => {
+          if (network.id !== networkId || !network.inviteInviterNpub) {
+            return network
+          }
+
+          const recipient =
+            network.participants.find(
+              (participant) => participant.npub === network.inviteInviterNpub,
+            ) ?? null
+
+          return {
+            ...network,
+            outboundJoinRequest: {
+              recipientNpub: network.inviteInviterNpub,
+              recipientPubkeyHex:
+                recipient?.pubkeyHex ?? pseudoHexFromNpub(network.inviteInviterNpub),
+              requestedAtText: '0s ago',
+            },
+          }
+        })
+        mockState.sessionStatus = 'Join request sent'
         return asResult()
       })()
 
@@ -531,6 +593,7 @@ export const importNetworkInvite = (invite: string) =>
             name: parsed.networkName.trim() || `Network ${mockState.networks.length + 1}`,
             enabled: false,
             networkId: parsed.networkId.trim() || id.replace(/-/g, ''),
+            ...emptyMockJoinRequestState(),
             onlineCount: 0,
             expectedCount: 0,
             participants: [],
@@ -551,6 +614,7 @@ export const importNetworkInvite = (invite: string) =>
         if (parsed.networkId.trim()) {
           targetNetwork.networkId = parsed.networkId.trim()
         }
+        targetNetwork.inviteInviterNpub = parsed.inviterNpub
         activateMockNetwork(targetNetwork.id)
         upsertMockParticipant(targetNetwork.id, parsed.inviterNpub)
         for (const relay of parsed.relays) {
@@ -605,6 +669,25 @@ export const removeParticipant = (networkId: string, npub: string) =>
           }
         })
 
+        return asResult()
+      })()
+
+export const acceptJoinRequest = (networkId: string, requesterNpub: string) =>
+  isTauriRuntime()
+    ? invoke<UiState>('accept_join_request', { networkId, requesterNpub })
+    : (() => {
+        upsertMockParticipant(networkId, requesterNpub)
+        mockState.networks = mockState.networks.map((network) =>
+          network.id === networkId
+            ? {
+                ...network,
+                inboundJoinRequests: network.inboundJoinRequests.filter(
+                  (request) => request.requesterNpub !== requesterNpub,
+                ),
+              }
+            : network,
+        )
+        mockState.sessionStatus = 'Join request accepted'
         return asResult()
       })()
 

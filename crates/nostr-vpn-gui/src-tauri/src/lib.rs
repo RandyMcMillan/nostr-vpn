@@ -31,10 +31,14 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nostr_sdk::prelude::{PublicKey, ToBech32};
 use nostr_vpn_core::config::{
-    AppConfig, derive_mesh_tunnel_ip, maybe_autoconfigure_node, normalize_advertised_route,
-    normalize_nostr_pubkey, normalize_runtime_network_id,
+    AppConfig, PendingInboundJoinRequest, PendingOutboundJoinRequest, derive_mesh_tunnel_ip,
+    maybe_autoconfigure_node, normalize_advertised_route, normalize_nostr_pubkey,
+    normalize_runtime_network_id,
 };
 use nostr_vpn_core::diagnostics::{HealthIssue, NetworkSummary, PortMappingStatus};
+use nostr_vpn_core::join_requests::{
+    MeshJoinRequest, NostrJoinRequestListener, ReceivedMeshJoinRequest, publish_join_request,
+};
 #[cfg(any(target_os = "windows", test))]
 use nostr_vpn_core::platform_paths::windows_default_config_path_for_state;
 #[cfg(any(target_os = "windows", test))]
@@ -64,6 +68,7 @@ const LAN_PAIRING_STALE_AFTER_SECS: u64 = 16;
 const LAN_PAIRING_DURATION_SECS: u64 = 15 * 60;
 const LAN_PAIRING_ANNOUNCEMENT_VERSION: u8 = 2;
 const LAN_PAIRING_BUFFER_BYTES: usize = 8192;
+const JOIN_REQUEST_LISTENER_RETRY_SECS: u64 = 5;
 // Keep the GUI's online/offline grace aligned with the daemon's WireGuard
 // session window so idle peers do not flap back to "awaiting handshake".
 const PEER_ONLINE_GRACE_SECS: u64 = 180;
@@ -268,11 +273,32 @@ struct ParticipantView {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct OutboundJoinRequestView {
+    recipient_npub: String,
+    recipient_pubkey_hex: String,
+    requested_at_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InboundJoinRequestView {
+    requester_npub: String,
+    requester_pubkey_hex: String,
+    requester_node_name: String,
+    requested_at_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct NetworkView {
     id: String,
     name: String,
     enabled: bool,
     network_id: String,
+    listen_for_join_requests: bool,
+    invite_inviter_npub: String,
+    outbound_join_request: Option<OutboundJoinRequestView>,
+    inbound_join_requests: Vec<InboundJoinRequestView>,
     online_count: usize,
     expected_count: usize,
     participants: Vec<ParticipantView>,
@@ -554,6 +580,9 @@ struct NvpnBackend {
     lan_pairing_expires_at: Option<SystemTime>,
     lan_peers: HashMap<String, LanPeerRecord>,
 
+    join_request_rx: Option<mpsc::Receiver<ReceivedMeshJoinRequest>>,
+    join_request_stop: Option<Arc<AtomicBool>>,
+
     magic_dns_status: String,
 }
 
@@ -661,6 +690,8 @@ impl NvpnBackend {
             lan_pairing_stop: None,
             lan_pairing_expires_at: None,
             lan_peers: HashMap::new(),
+            join_request_rx: None,
+            join_request_stop: None,
             magic_dns_status: "DNS disabled (VPN off)".to_string(),
         };
         #[cfg(target_os = "ios")]
@@ -668,6 +699,9 @@ impl NvpnBackend {
 
         backend.ensure_relay_status_entries();
         backend.ensure_peer_status_entries();
+        if let Err(error) = backend.start_join_request_listener() {
+            eprintln!("gui: failed to start join request listener: {error}");
+        }
         #[cfg(target_os = "ios")]
         write_ios_probe("backend: status entries ensured");
         #[cfg(target_os = "ios")]
@@ -900,6 +934,7 @@ impl NvpnBackend {
 
         self.ensure_peer_status_entries();
         self.ensure_relay_status_entries();
+        self.restart_join_request_listener()?;
         if persist_outcome.needs_explicit_daemon_reload() {
             self.reload_daemon_if_running()?;
         }
@@ -918,6 +953,22 @@ impl NvpnBackend {
         self.config
             .remove_participant_from_network(network_id, &normalized)?;
         self.peer_status.remove(&normalized);
+        if let Some(network) = self.config.network_by_id_mut(network_id) {
+            if network.invite_inviter == normalized {
+                network.invite_inviter.clear();
+            }
+            if network
+                .outbound_join_request
+                .as_ref()
+                .map(|request| request.recipient == normalized)
+                .unwrap_or(false)
+            {
+                network.outbound_join_request = None;
+            }
+            network
+                .inbound_join_requests
+                .retain(|request| request.requester != normalized);
+        }
 
         self.config.ensure_defaults();
         maybe_autoconfigure_node(&mut self.config);
@@ -929,6 +980,86 @@ impl NvpnBackend {
                 self.reload_daemon_process()?;
             }
             self.session_status = "Participant removed and applied.".to_string();
+        }
+        self.sync_daemon_state();
+
+        Ok(())
+    }
+
+    fn set_network_join_requests_enabled(&mut self, network_id: &str, enabled: bool) -> Result<()> {
+        self.config
+            .set_network_join_requests_enabled(network_id, enabled)?;
+        self.persist_config_without_daemon_reload()?;
+        self.session_status = if enabled {
+            "Join requests enabled.".to_string()
+        } else {
+            "Join requests disabled.".to_string()
+        };
+        Ok(())
+    }
+
+    fn request_network_join(&mut self, network_id: &str) -> Result<()> {
+        let network = self
+            .config
+            .network_by_id(network_id)
+            .ok_or_else(|| anyhow!("network not found"))?;
+        if network.invite_inviter.trim().is_empty() {
+            return Err(anyhow!("this network was not imported from an invite"));
+        }
+        if let Some(request) = &network.outbound_join_request
+            && request.recipient == network.invite_inviter
+        {
+            return Ok(());
+        }
+
+        let keys = self.config.nostr_keys()?;
+        let relays = self.config.nostr.relays.clone();
+        let recipient = network.invite_inviter.clone();
+        let request = MeshJoinRequest {
+            network_id: normalize_runtime_network_id(&network.network_id),
+            requester_node_name: self.config.node_name.trim().to_string(),
+        };
+        self.runtime.block_on(publish_join_request(
+            keys,
+            &relays,
+            recipient.clone(),
+            request,
+        ))?;
+
+        if let Some(network) = self.config.network_by_id_mut(network_id) {
+            network.outbound_join_request = Some(PendingOutboundJoinRequest {
+                recipient: recipient.clone(),
+                requested_at: current_unix_timestamp(),
+            });
+        }
+        self.persist_config_without_daemon_reload()?;
+        self.session_status = format!("Join request sent to {}.", shorten_middle(&to_npub(&recipient), 18, 12));
+        Ok(())
+    }
+
+    fn accept_join_request(&mut self, network_id: &str, requester_npub: &str) -> Result<()> {
+        let requester = normalize_nostr_pubkey(requester_npub)?;
+        self.config
+            .add_participant_to_network(network_id, &requester)?;
+        if let Some(network) = self.config.network_by_id_mut(network_id) {
+            network
+                .inbound_join_requests
+                .retain(|request| request.requester != requester);
+        }
+        self.peer_status.entry(requester).or_default();
+
+        self.config.ensure_defaults();
+        maybe_autoconfigure_node(&mut self.config);
+        let persist_outcome = self.persist_config()?;
+
+        self.ensure_peer_status_entries();
+        if self.daemon_running {
+            if persist_outcome.needs_explicit_daemon_reload() {
+                self.reload_daemon_process()?;
+            }
+            self.session_status = "Join request accepted and applied.".to_string();
+        } else {
+            self.session_status = "Join request accepted.".to_string();
         }
         self.sync_daemon_state();
 
@@ -1003,6 +1134,7 @@ impl NvpnBackend {
         let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
+        self.restart_join_request_listener()?;
         if persist_outcome.needs_explicit_daemon_reload() {
             self.reload_daemon_if_running()?;
         }
@@ -1028,6 +1160,7 @@ impl NvpnBackend {
         let persist_outcome = self.persist_config()?;
 
         self.ensure_relay_status_entries();
+        self.restart_join_request_listener()?;
         if persist_outcome.needs_explicit_daemon_reload() {
             self.reload_daemon_if_running()?;
         }
@@ -1172,6 +1305,11 @@ impl NvpnBackend {
         self.ensure_relay_status_entries();
         self.ensure_peer_status_entries();
         Ok(PersistConfigOutcome::SavedLocally)
+    }
+
+    fn persist_config_without_daemon_reload(&mut self) -> Result<()> {
+        let _ = self.persist_config()?;
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
@@ -2407,6 +2545,32 @@ impl NvpnBackend {
         }
     }
 
+    fn outbound_join_request_view(
+        &self,
+        request: &PendingOutboundJoinRequest,
+    ) -> OutboundJoinRequestView {
+        OutboundJoinRequestView {
+            recipient_npub: to_npub(&request.recipient),
+            recipient_pubkey_hex: request.recipient.clone(),
+            requested_at_text: join_request_age_text(request.requested_at),
+        }
+    }
+
+    fn inbound_join_request_views(
+        &self,
+        requests: &[PendingInboundJoinRequest],
+    ) -> Vec<InboundJoinRequestView> {
+        requests
+            .iter()
+            .map(|request| InboundJoinRequestView {
+                requester_npub: to_npub(&request.requester),
+                requester_pubkey_hex: request.requester.clone(),
+                requester_node_name: request.requester_node_name.clone(),
+                requested_at_text: join_request_age_text(request.requested_at),
+            })
+            .collect()
+    }
+
     fn network_rows(&self) -> Vec<NetworkView> {
         let own_pubkey_hex = self.config.own_nostr_pubkey_hex().ok();
         let mut rows = Vec::with_capacity(self.config.networks.len());
@@ -2463,6 +2627,18 @@ impl NvpnBackend {
                 name: network.name.clone(),
                 enabled: network.enabled,
                 network_id: normalize_runtime_network_id(&network.network_id),
+                listen_for_join_requests: network.listen_for_join_requests,
+                invite_inviter_npub: if network.invite_inviter.is_empty() {
+                    String::new()
+                } else {
+                    to_npub(&network.invite_inviter)
+                },
+                outbound_join_request: network
+                    .outbound_join_request
+                    .as_ref()
+                    .map(|request| self.outbound_join_request_view(request)),
+                inbound_join_requests: self
+                    .inbound_join_request_views(&network.inbound_join_requests),
                 online_count,
                 expected_count,
                 participants: participant_rows,
@@ -2604,8 +2780,11 @@ impl NvpnBackend {
 
     fn tick(&mut self) {
         self.refresh_lan_pairing();
+        self.refresh_join_requests();
+        self.clear_connected_join_requests();
         self.maybe_perform_pending_launch_action();
         self.sync_daemon_state();
+        self.clear_connected_join_requests();
     }
 
     fn maybe_perform_pending_launch_action(&mut self) {
@@ -2649,6 +2828,172 @@ impl NvpnBackend {
 
         self.handle_lan_pairing_events();
         self.prune_lan_peers();
+    }
+
+    fn refresh_join_requests(&mut self) {
+        self.handle_join_request_events();
+    }
+
+    fn start_join_request_listener(&mut self) -> Result<()> {
+        if self.join_request_rx.is_some() {
+            return Ok(());
+        }
+
+        let secret_key = self.config.nostr.secret_key.trim().to_string();
+        if secret_key.is_empty() || self.config.nostr.relays.is_empty() {
+            return Ok(());
+        }
+
+        let relays = self.config.nostr.relays.clone();
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+
+        self.runtime.spawn(async move {
+            run_join_request_listener(tx, stop_flag, secret_key, relays).await;
+        });
+
+        self.join_request_rx = Some(rx);
+        self.join_request_stop = Some(stop);
+        Ok(())
+    }
+
+    fn stop_join_request_listener(&mut self) {
+        if let Some(stop) = self.join_request_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.join_request_rx = None;
+    }
+
+    fn restart_join_request_listener(&mut self) -> Result<()> {
+        self.stop_join_request_listener();
+        self.start_join_request_listener()
+    }
+
+    fn handle_join_request_events(&mut self) {
+        let recv_result = self
+            .join_request_rx
+            .as_ref()
+            .map(|receiver| receiver.try_recv());
+
+        match recv_result {
+            Some(Ok(event)) => {
+                self.apply_join_request_event(event);
+
+                let mut pending = Vec::new();
+                if let Some(receiver) = &self.join_request_rx {
+                    while let Ok(event) = receiver.try_recv() {
+                        pending.push(event);
+                    }
+                }
+                for event in pending {
+                    self.apply_join_request_event(event);
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.join_request_rx = None;
+                self.join_request_stop = None;
+                if let Err(error) = self.start_join_request_listener() {
+                    eprintln!("gui: failed to restart join request listener: {error}");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_join_request_event(&mut self, event: ReceivedMeshJoinRequest) {
+        let target_network_id = self
+            .config
+            .networks
+            .iter()
+            .find(|network| {
+                network.listen_for_join_requests
+                    && normalize_runtime_network_id(&network.network_id) == event.request.network_id
+            })
+            .map(|network| network.id.clone());
+        let Some(target_network_id) = target_network_id else {
+            return;
+        };
+
+        let mut changed = false;
+        let mut network_name = String::new();
+        if let Some(network) = self.config.network_by_id_mut(&target_network_id) {
+            if network
+                .participants
+                .iter()
+                .any(|participant| participant == &event.sender_pubkey)
+            {
+                return;
+            }
+
+            network_name = network.name.clone();
+            let requester_node_name = event.request.requester_node_name.trim().to_string();
+            if let Some(existing) = network
+                .inbound_join_requests
+                .iter_mut()
+                .find(|request| request.requester == event.sender_pubkey)
+            {
+                if existing.requested_at < event.requested_at
+                    || existing.requester_node_name != requester_node_name
+                {
+                    existing.requested_at = existing.requested_at.max(event.requested_at);
+                    existing.requester_node_name = requester_node_name;
+                    changed = true;
+                }
+            } else {
+                network.inbound_join_requests.push(PendingInboundJoinRequest {
+                    requester: event.sender_pubkey.clone(),
+                    requester_node_name,
+                    requested_at: event.requested_at,
+                });
+                network
+                    .inbound_join_requests
+                    .sort_by(|left, right| left.requester.cmp(&right.requester));
+                changed = true;
+            }
+        }
+
+        if changed {
+            if let Err(error) = self.persist_config_without_daemon_reload() {
+                self.session_status = format!("Failed to persist join request: {error}");
+            } else {
+                self.session_status = format!("Join request received for {network_name}.");
+            }
+        }
+    }
+
+    fn clear_connected_join_requests(&mut self) {
+        let own_pubkey_hex = self.config.own_nostr_pubkey_hex().ok();
+        let completed_networks = self
+            .config
+            .networks
+            .iter()
+            .filter_map(|network| {
+                let request = network.outbound_join_request.as_ref()?;
+                if matches!(
+                    self.peer_state_for(&request.recipient, own_pubkey_hex.as_deref()),
+                    ConfiguredPeerStatus::Online
+                ) {
+                    Some(network.id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if completed_networks.is_empty() {
+            return;
+        }
+
+        for network_id in completed_networks {
+            if let Some(network) = self.config.network_by_id_mut(&network_id) {
+                network.outbound_join_request = None;
+            }
+        }
+
+        if let Err(error) = self.persist_config_without_daemon_reload() {
+            eprintln!("gui: failed to clear completed join request state: {error}");
+        }
     }
 
     fn lan_pairing_remaining_secs(&self) -> u64 {
@@ -3020,7 +3365,19 @@ fn apply_network_invite_to_active_network(
 
     config.set_network_enabled(&target_network_entry_id, true)?;
     config.set_network_mesh_id(&target_network_entry_id, &invite.network_id)?;
-    config.add_participant_to_network(&target_network_entry_id, &invite.inviter_npub)?;
+    let normalized_inviter =
+        config.add_participant_to_network(&target_network_entry_id, &invite.inviter_npub)?;
+    if let Some(network) = config.network_by_id_mut(&target_network_entry_id) {
+        network.invite_inviter = normalized_inviter.clone();
+        if network
+            .outbound_join_request
+            .as_ref()
+            .map(|request| request.recipient != normalized_inviter)
+            .unwrap_or(false)
+        {
+            network.outbound_join_request = None;
+        }
+    }
 
     if should_adopt_name {
         config.rename_network(&target_network_entry_id, &invite.network_name)?;
@@ -3492,6 +3849,21 @@ fn epoch_secs_to_system_time(value: u64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(value))
 }
 
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+fn join_request_age_text(requested_at: u64) -> String {
+    let age_secs = epoch_secs_to_system_time(requested_at)
+        .and_then(|requested_at| requested_at.elapsed().ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("{age_secs}s ago")
+}
+
 fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
     if value.len() <= head + tail + 3 {
         return value.to_string();
@@ -3723,6 +4095,54 @@ fn decode_lan_pairing_announcement(payload: &[u8], own_npub: &str) -> Option<Lan
         invite: parsed.invite,
         seen_at: SystemTime::now(),
     })
+}
+
+async fn run_join_request_listener(
+    tx: mpsc::Sender<ReceivedMeshJoinRequest>,
+    stop_flag: Arc<AtomicBool>,
+    secret_key: String,
+    relays: Vec<String>,
+) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let listener = match NostrJoinRequestListener::from_secret_key(&secret_key) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("gui: failed to initialize join request listener: {error}");
+                return;
+            }
+        };
+
+        if let Err(error) = listener.connect(&relays).await {
+            eprintln!("gui: join request listener connect failed: {error}");
+            tokio::time::sleep(Duration::from_secs(JOIN_REQUEST_LISTENER_RETRY_SECS)).await;
+            continue;
+        }
+
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                listener.disconnect().await;
+                return;
+            }
+
+            match tokio::time::timeout(Duration::from_millis(500), listener.recv()).await {
+                Ok(Some(event)) => {
+                    if tx.send(event).is_err() {
+                        listener.disconnect().await;
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        listener.disconnect().await;
+        tokio::time::sleep(Duration::from_secs(JOIN_REQUEST_LISTENER_RETRY_SECS)).await;
+    }
 }
 
 async fn run_lan_pairing_loop(
@@ -4733,6 +5153,39 @@ async fn set_network_enabled(
 }
 
 #[tauri::command]
+async fn set_network_join_requests_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+    enabled: bool,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.set_network_join_requests_enabled(&network_id, enabled)?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+async fn request_network_join(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.request_network_join(&network_id)?;
+        backend.tick();
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
 async fn add_participant(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -4803,6 +5256,23 @@ async fn remove_participant(
 ) -> Result<UiState, String> {
     let ui = with_backend_async(state, move |backend| {
         backend.remove_participant(&network_id, &npub)?;
+        Ok(backend.ui_state())
+    })
+    .await?;
+    refresh_tray_menu(&app);
+    Ok(ui)
+}
+
+#[tauri::command]
+async fn accept_join_request(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    network_id: String,
+    requester_npub: String,
+) -> Result<UiState, String> {
+    let ui = with_backend_async(state, move |backend| {
+        backend.accept_join_request(&network_id, &requester_npub)?;
+        backend.tick();
         Ok(backend.ui_state())
     })
     .await?;
@@ -5228,11 +5698,14 @@ pub fn run() {
             remove_network,
             set_network_mesh_id,
             set_network_enabled,
+            set_network_join_requests_enabled,
+            request_network_join,
             add_participant,
             import_network_invite,
             start_lan_pairing,
             stop_lan_pairing,
             remove_participant,
+            accept_join_request,
             set_participant_alias,
             add_relay,
             remove_relay,
@@ -5286,11 +5759,13 @@ mod tests {
         windows_should_use_daemon_owned_config_apply, within_peer_online_grace,
         within_peer_presence_grace,
     };
-    use nostr_vpn_core::config::AppConfig;
+    use nostr_vpn_core::config::{
+        AppConfig, PendingInboundJoinRequest, PendingOutboundJoinRequest,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::runtime::Runtime;
 
     fn test_backend(participant: &str) -> NvpnBackend {
@@ -5323,6 +5798,8 @@ mod tests {
             lan_pairing_stop: None,
             lan_pairing_expires_at: None,
             lan_peers: HashMap::new(),
+            join_request_rx: None,
+            join_request_stop: None,
             magic_dns_status: String::new(),
         }
     }
@@ -5844,6 +6321,26 @@ mod tests {
     }
 
     #[test]
+    fn applying_network_invite_tracks_inviter_for_join_requests() {
+        let inviter_hex =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let invite = NetworkInvite {
+            v: 1,
+            network_name: "Home".to_string(),
+            network_id: "mesh-home".to_string(),
+            inviter_npub: to_npub(&inviter_hex),
+            relays: vec!["wss://invite.example".to_string()],
+        };
+        let mut config = AppConfig::generated();
+
+        apply_network_invite_to_active_network(&mut config, &invite).expect("invite should apply");
+
+        let network = config.active_network();
+        assert!(network.listen_for_join_requests);
+        assert_eq!(network.invite_inviter, inviter_hex);
+    }
+
+    #[test]
     fn decode_lan_pairing_announcement_extracts_invite_metadata() {
         let inviter_hex =
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
@@ -5935,6 +6432,69 @@ mod tests {
     }
 
     #[test]
+    fn network_rows_include_join_request_metadata() {
+        let inviter = "66".repeat(32);
+        let requester = "77".repeat(32);
+        let mut backend = test_backend(&inviter);
+        backend.config.networks[0].invite_inviter = inviter.clone();
+        backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
+            recipient: inviter.clone(),
+            requested_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("epoch")
+                .as_secs(),
+        });
+        backend.config.networks[0].inbound_join_requests = vec![PendingInboundJoinRequest {
+            requester: requester.clone(),
+            requester_node_name: "alice-phone".to_string(),
+            requested_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("epoch")
+                .as_secs(),
+        }];
+
+        let rows = backend.network_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].invite_inviter_npub, to_npub(&inviter));
+        assert!(rows[0].outbound_join_request.is_some());
+        assert_eq!(rows[0].inbound_join_requests.len(), 1);
+        assert_eq!(
+            rows[0].inbound_join_requests[0].requester_npub,
+            to_npub(&requester)
+        );
+        assert_eq!(
+            rows[0].inbound_join_requests[0].requester_node_name,
+            "alice-phone"
+        );
+    }
+
+    #[test]
+    fn tick_clears_pending_outbound_join_request_after_connection_arrives() {
+        let inviter = "88".repeat(32);
+        let mut backend = test_backend(&inviter);
+        backend.config.networks[0].invite_inviter = inviter.clone();
+        backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
+            recipient: inviter.clone(),
+            requested_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("epoch")
+                .as_secs(),
+        });
+        backend.peer_status.insert(
+            inviter.clone(),
+            super::PeerLinkStatus {
+                reachable: Some(true),
+                ..super::PeerLinkStatus::default()
+            },
+        );
+
+        backend.tick();
+
+        assert!(backend.config.networks[0].outbound_join_request.is_none());
+    }
+
+    #[test]
     fn lan_peer_rows_include_invite_metadata_for_join_actions() {
         let participant = "55".repeat(32);
         let invite = format!("{NETWORK_INVITE_PREFIX}payload-123");
@@ -5990,6 +6550,10 @@ mod tests {
                 name: "Home".to_string(),
                 enabled: true,
                 network_id: "mesh-home".to_string(),
+                listen_for_join_requests: true,
+                invite_inviter_npub: String::new(),
+                outbound_join_request: None,
+                inbound_join_requests: Vec::new(),
                 online_count: 1,
                 expected_count: 2,
                 participants: vec![
@@ -6026,6 +6590,10 @@ mod tests {
                 name: "Lab".to_string(),
                 enabled: false,
                 network_id: "mesh-lab".to_string(),
+                listen_for_join_requests: true,
+                invite_inviter_npub: String::new(),
+                outbound_join_request: None,
+                inbound_join_requests: Vec::new(),
                 online_count: 0,
                 expected_count: 1,
                 participants: vec![ParticipantView {
@@ -6058,6 +6626,10 @@ mod tests {
                     name: "Home".to_string(),
                     enabled: true,
                     network_id: "mesh-home".to_string(),
+                    listen_for_join_requests: true,
+                    invite_inviter_npub: String::new(),
+                    outbound_join_request: None,
+                    inbound_join_requests: Vec::new(),
                     online_count: 1,
                     expected_count: 1,
                     participants: vec![ParticipantView {
@@ -6079,6 +6651,10 @@ mod tests {
                     name: "Work".to_string(),
                     enabled: true,
                     network_id: "mesh-work".to_string(),
+                    listen_for_join_requests: true,
+                    invite_inviter_npub: String::new(),
+                    outbound_join_request: None,
+                    inbound_join_requests: Vec::new(),
                     online_count: 1,
                     expected_count: 1,
                     participants: vec![
@@ -6147,6 +6723,10 @@ mod tests {
                 name: "Home".to_string(),
                 enabled: true,
                 network_id: "mesh-home".to_string(),
+                listen_for_join_requests: true,
+                invite_inviter_npub: String::new(),
+                outbound_join_request: None,
+                inbound_join_requests: Vec::new(),
                 online_count: 1,
                 expected_count: 1,
                 participants: vec![ParticipantView {
