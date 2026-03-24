@@ -409,6 +409,24 @@ body {
   color: var(--cyan);
 }
 
+.hero-device-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.hero-device-name-input {
+  margin-top: 8px;
+  font-size: 21px;
+  font-weight: 650;
+  padding: 9px 10px;
+}
+
+.hero-device-preview {
+  font-family: 'JetBrains Mono', 'SFMono-Regular', ui-monospace, monospace;
+  color: var(--cyan);
+}
+
 .hero-identity-row {
   display: flex;
   align-items: flex-start;

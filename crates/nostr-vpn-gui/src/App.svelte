@@ -20,6 +20,7 @@
     formatMeshIdForDisplay,
     validateMeshIdInput,
   } from './lib/mesh-id.js'
+  import { nodeNameDnsPreview } from './lib/node-name.js'
   import {
     addNetwork,
     addParticipant,
@@ -124,6 +125,10 @@
   const processedDeepLinks = new Set<string>()
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
+  const nodeNamePreviewText = (nodeName: string, suffix: string) => {
+    const preview = nodeNameDnsPreview(nodeName, suffix)
+    return preview ? `Shared as ${preview}` : 'Shared name has no DNS-safe .nvpn label yet.'
+  }
 
   $: serviceInstallRecommended = !!state?.serviceSupported && !state.serviceInstalled
   $: serviceEnableRecommended =
@@ -1576,9 +1581,15 @@
           </div>
         </div>
 
-        <div class="hero-stat-card">
+        <div class="hero-stat-card hero-device-card">
           <div class="panel-kicker">This device</div>
-          <div class="hero-stat-value">{state.nodeName}</div>
+          <input
+            class="text-input hero-device-name-input"
+            data-testid="node-name-input"
+            bind:value={nodeNameDraft}
+            on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
+          />
+          <div class="config-path hero-device-preview">{nodeNamePreviewText(nodeNameDraft, state.magicDnsSuffix)}</div>
           <div class="config-path">{state.tunnelIp} • {state.endpoint}</div>
         </div>
       </div>
@@ -2705,16 +2716,6 @@
               on:input={() =>
                 debounce('magicDnsSuffix', () =>
                   onUpdateSettings({ magicDnsSuffix: magicDnsSuffixDraft }))}
-            />
-          </label>
-
-          <label>
-            <span>Node Name</span>
-            <input
-              class="text-input"
-              data-testid="node-name-input"
-              bind:value={nodeNameDraft}
-              on:input={() => debounce('nodeName', () => onUpdateSettings({ nodeName: nodeNameDraft }))}
             />
           </label>
 
