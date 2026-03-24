@@ -3589,8 +3589,10 @@ fn run_debug_automation_from_deep_link<R: tauri::Runtime>(
         return Err(anyhow!("application state is unavailable"));
     };
 
-    with_backend(state, |backend| run_debug_automation_command(backend, &command))
-        .map_err(|error| anyhow!(error))?;
+    with_backend(state, |backend| {
+        run_debug_automation_command(backend, &command)
+    })
+    .map_err(|error| anyhow!(error))?;
     refresh_tray_menu(app);
     let _ = show_main_window(app);
     Ok(true)
@@ -5924,11 +5926,10 @@ mod tests {
         TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
         apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
         cli_binary_installed_at, config_path_from_roots, decode_lan_pairing_announcement,
-        desktop_config_path_from_roots, expected_peer_count, extract_json_document,
-        epoch_secs_to_system_time, gui_launch_disposition, gui_requires_service_enable,
-        gui_requires_service_install, ios_runtime_status_detail,
-        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
-        is_not_running_message, network_device_count,
+        desktop_config_path_from_roots, epoch_secs_to_system_time, expected_peer_count,
+        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
+        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
         network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
         parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
         peer_presence_state_label, peer_state_label, pending_launch_action,
@@ -6740,12 +6741,14 @@ mod tests {
         backend.clear_connected_join_requests();
 
         assert!(backend.config.networks[0].outbound_join_request.is_some());
-        assert_eq!(backend.peer_status[&inviter].last_handshake_at, previous_handshake_at);
+        assert_eq!(
+            backend.peer_status[&inviter].last_handshake_at,
+            previous_handshake_at
+        );
     }
 
     #[test]
-    fn clearing_join_requests_clears_when_peer_becomes_reachable_without_daemon_timestamp(
-    ) {
+    fn clearing_join_requests_clears_when_peer_becomes_reachable_without_daemon_timestamp() {
         let inviter = "88".repeat(32);
         let mut backend = test_backend(&inviter);
         backend.config.networks[0].invite_inviter = inviter.clone();
@@ -6769,9 +6772,9 @@ mod tests {
 
         assert!(backend.config.networks[0].outbound_join_request.is_none());
         assert!(
-            backend.peer_status[&inviter]
-                .last_handshake_at
-                .is_some_and(|value| value > epoch_secs_to_system_time(requested_at).expect("epoch"))
+            backend.peer_status[&inviter].last_handshake_at.is_some_and(
+                |value| value > epoch_secs_to_system_time(requested_at).expect("epoch")
+            )
         );
     }
 

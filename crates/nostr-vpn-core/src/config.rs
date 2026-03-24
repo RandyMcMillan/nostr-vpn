@@ -18,6 +18,7 @@ pub const DEFAULT_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://relay.primal.net",
 ];
+const LEGACY_DEFAULT_NODE_NAME: &str = "nostr-vpn-node";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NostrConfig {
@@ -271,8 +272,12 @@ impl AppConfig {
     }
 
     pub fn ensure_defaults(&mut self) {
-        if self.node_name.trim().is_empty() {
-            self.node_name = default_node_name();
+        self.ensure_nostr_identity();
+        if uses_default_node_name(&self.node_name) {
+            self.node_name = self
+                .own_nostr_pubkey_hex()
+                .map(|pubkey_hex| default_node_name_for_pubkey(&pubkey_hex))
+                .unwrap_or_else(|_| default_node_name());
         }
 
         self.magic_dns_suffix = normalize_magic_dns_suffix(&self.magic_dns_suffix);
@@ -315,8 +320,6 @@ impl AppConfig {
             self.node.private_key = key_pair.private_key;
             self.node.public_key = key_pair.public_key;
         }
-
-        self.ensure_nostr_identity();
         self.exit_node = normalize_nostr_pubkey(self.exit_node.trim()).unwrap_or_default();
         if let Ok(own_pubkey) = self.own_nostr_pubkey_hex()
             && self.exit_node == own_pubkey
@@ -1075,7 +1078,16 @@ fn default_peer_aliases() -> HashMap<String, String> {
 }
 
 fn default_node_name() -> String {
-    "nostr-vpn-node".to_string()
+    LEGACY_DEFAULT_NODE_NAME.to_string()
+}
+
+fn uses_default_node_name(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty() || trimmed == LEGACY_DEFAULT_NODE_NAME
+}
+
+pub fn default_node_name_for_pubkey(pubkey_hex: &str) -> String {
+    default_magic_dns_label_for_pubkey(pubkey_hex, &HashSet::new())
 }
 
 const fn default_auto_disconnect_relays_when_mesh_ready() -> bool {

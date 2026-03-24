@@ -2,7 +2,7 @@ use std::fs;
 
 use nostr_sdk::prelude::{Keys, ToBech32};
 use nostr_vpn_core::config::{
-    AppConfig, DEFAULT_RELAYS, NetworkConfig, derive_mesh_tunnel_ip,
+    AppConfig, DEFAULT_RELAYS, NetworkConfig, default_node_name_for_pubkey, derive_mesh_tunnel_ip,
     derive_network_id_from_participants, maybe_autoconfigure_node, needs_endpoint_autoconfig,
     needs_tunnel_ip_autoconfig, normalize_nostr_pubkey,
 };
@@ -52,11 +52,14 @@ fn network_id_derivation_is_order_independent() {
 #[test]
 fn generated_config_auto_populates_keys() {
     let config = AppConfig::generated();
+    let own_hex = config.own_nostr_pubkey_hex().expect("own pubkey hex");
 
     assert!(!config.node.private_key.is_empty());
     assert!(!config.node.public_key.is_empty());
     assert!(!config.nostr.secret_key.is_empty());
     assert!(!config.nostr.public_key.is_empty());
+    assert_eq!(config.node_name, default_node_name_for_pubkey(&own_hex));
+    assert_ne!(config.node_name, "nostr-vpn-node");
     assert!(!config.nostr.relays.is_empty());
     assert!(config.auto_disconnect_relays_when_mesh_ready);
     assert!(config.autoconnect);
@@ -194,6 +197,34 @@ fn legacy_prefixed_network_ids_are_normalized_at_runtime() {
 
     assert_eq!(config.networks[0].network_id, "nostr-vpn:1234abcd5678ef90");
     assert_eq!(config.effective_network_id(), "1234abcd5678ef90");
+}
+
+#[test]
+fn legacy_default_node_name_migrates_to_pubkey_petname() {
+    let keys = Keys::generate();
+    let own_hex = keys.public_key().to_hex();
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = keys.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex.clone();
+    config.node_name = "nostr-vpn-node".to_string();
+
+    config.ensure_defaults();
+
+    assert_eq!(config.node_name, default_node_name_for_pubkey(&own_hex));
+}
+
+#[test]
+fn custom_node_name_is_preserved() {
+    let keys = Keys::generate();
+    let own_hex = keys.public_key().to_hex();
+    let mut config = AppConfig::generated();
+    config.nostr.secret_key = keys.secret_key().to_secret_hex();
+    config.nostr.public_key = own_hex;
+    config.node_name = "my-pocket-router".to_string();
+
+    config.ensure_defaults();
+
+    assert_eq!(config.node_name, "my-pocket-router");
 }
 
 #[test]
