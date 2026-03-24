@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte'
+  import { invoke } from '@tauri-apps/api/core'
+  import { listen } from '@tauri-apps/api/event'
   import jsQR from 'jsqr'
   import { Check, Copy, Trash2 } from 'lucide-svelte'
   import QRCode from 'qrcode'
@@ -10,6 +12,7 @@
     remainingSecsFromDeadline,
   } from './lib/countdown.js'
   import { heroStateText, heroStatusDetailText } from './lib/hero-state.js'
+  import { parseAppDeepLink } from './lib/deep-link-actions.js'
   import { decodeInvitePayload, determineInviteImportTarget } from './lib/invite-code.js'
   import {
     canonicalizeMeshIdInput,
@@ -104,6 +107,7 @@
   let pollHandle: number | null = null
   let lanPairingTickHandle: number | null = null
   let copiedHandle: number | null = null
+  let deepLinkUnlisten: (() => void) | null = null
   let refreshInFlight = false
   let actionInFlight = false
   let serviceInstallRecommended = false
@@ -117,6 +121,7 @@
   let appDisposed = false
   let lanPairingDeadlineMs: number | null = null
   let lanPairingDisplayRemainingSecs = 0
+  const processedDeepLinks = new Set<string>()
 
   const NETWORK_MESH_ID_IDLE_COMMIT_MS = 5000
 
@@ -870,6 +875,78 @@
     }
   }
 
+  async function ensureStateLoaded() {
+    if (!state) {
+      await refresh()
+    }
+    return state
+  }
+
+  async function handleAppDeepLink(url: string) {
+    const normalized = url.trim()
+    if (!normalized || processedDeepLinks.has(normalized)) {
+      return
+    }
+    processedDeepLinks.add(normalized)
+
+    const action = parseAppDeepLink(normalized)
+    if (!action) {
+      return
+    }
+
+    if (action.type === 'invite') {
+      await runAction(() => importNetworkInvite(action.invite))
+      return
+    }
+
+    if (action.type === 'tick') {
+      await refresh()
+      return
+    }
+
+    const current = await ensureStateLoaded()
+    const network = current ? activeNetwork(current) : null
+    if (!network) {
+      return
+    }
+
+    if (action.type === 'request-join') {
+      await runAction(() => requestNetworkJoin(network.id))
+      return
+    }
+
+    await runAction(() => acceptJoinRequest(network.id, action.requesterNpub))
+  }
+
+  async function initializeDeepLinkHandling() {
+    if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+      return
+    }
+
+    try {
+      deepLinkUnlisten = await listen('deep-link://new-url', async (event) => {
+        const urls = Array.isArray(event.payload) ? event.payload : []
+        for (const url of urls) {
+          if (typeof url === 'string') {
+            await handleAppDeepLink(url)
+          }
+        }
+      })
+
+      const current = await invoke<string[] | null>('plugin:deep-link|get_current')
+      if (!Array.isArray(current)) {
+        return
+      }
+      for (const url of current) {
+        if (typeof url === 'string') {
+          await handleAppDeepLink(url)
+        }
+      }
+    } catch (err) {
+      console.error('Failed to initialize deep-link handling', err)
+    }
+  }
+
   function markBootReady() {
     if (bootReadyDispatched) {
       return
@@ -1396,6 +1473,11 @@
         return
       }
 
+      await initializeDeepLinkHandling()
+      if (appDisposed) {
+        return
+      }
+
       markBootReady()
       await refreshAutostart()
       if (appDisposed) {
@@ -1417,6 +1499,9 @@
     }
     if (copiedHandle) {
       window.clearTimeout(copiedHandle)
+    }
+    if (deepLinkUnlisten) {
+      deepLinkUnlisten()
     }
     for (const timer of debouncers.values()) {
       window.clearTimeout(timer)

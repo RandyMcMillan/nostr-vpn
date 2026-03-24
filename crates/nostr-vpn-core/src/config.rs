@@ -360,7 +360,8 @@ impl AppConfig {
             if network.network_id.trim().is_empty() {
                 network.network_id = default_network_id();
             }
-            network.invite_inviter = normalize_nostr_pubkey(&network.invite_inviter).unwrap_or_default();
+            network.invite_inviter =
+                normalize_nostr_pubkey(&network.invite_inviter).unwrap_or_default();
 
             network.participants = network
                 .participants
@@ -396,11 +397,13 @@ impl AppConfig {
                 .collect();
             network.participants.sort();
             network.participants.dedup();
-            network.invite_inviter = canonical_npub_key(&network.invite_inviter).unwrap_or_default();
+            network.invite_inviter =
+                canonical_npub_key(&network.invite_inviter).unwrap_or_default();
             network.outbound_join_request =
                 canonicalize_outbound_join_request(network.outbound_join_request.take());
-            network.inbound_join_requests =
-                canonicalize_inbound_join_requests(std::mem::take(&mut network.inbound_join_requests));
+            network.inbound_join_requests = canonicalize_inbound_join_requests(std::mem::take(
+                &mut network.inbound_join_requests,
+            ));
         }
 
         self.normalize_peer_aliases();
@@ -1437,7 +1440,10 @@ fn normalize_inbound_join_requests(
         let Ok(requester) = normalize_nostr_pubkey(&request.requester) else {
             continue;
         };
-        if participants.iter().any(|participant| participant == &requester) {
+        if participants
+            .iter()
+            .any(|participant| participant == &requester)
+        {
             continue;
         }
 
@@ -1448,7 +1454,9 @@ fn normalize_inbound_join_requests(
         };
         if deduped
             .get(&requester)
-            .map(|existing: &PendingInboundJoinRequest| existing.requested_at >= normalized.requested_at)
+            .map(|existing: &PendingInboundJoinRequest| {
+                existing.requested_at >= normalized.requested_at
+            })
             .unwrap_or(false)
         {
             continue;

@@ -28,7 +28,7 @@ struct NostrEvent {
     sig: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RelayEventSnapshot {
     pub pubkey: String,
     pub kind: u32,

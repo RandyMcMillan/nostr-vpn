@@ -330,7 +330,7 @@ Docker e2e scripts under [`scripts/`](scripts):
 - `./scripts/e2e-exit-node-docker.sh`
   Verifies exit-node advertisement, selection, tunnel traffic to the chosen exit node, and default-route traffic crossing the exit path to an external target. Set `NVPN_EXIT_NODE_E2E_PUBLIC_IP=9.9.9.9` (or another reachable public IP) to also prove a real internet hop routes through the tunnel.
 - `./scripts/e2e-tauri-driver-docker.sh`
-  Builds the GUI in a Linux container, runs a Tauri-driver smoke test, and writes a screenshot to `artifacts/screenshots/tauri-driver-e2e.png`.
+  Builds the GUI in a Linux container, runs the Tauri-driver GUI smoke plus invite join-request regression flow, and writes screenshots to `artifacts/screenshots/`.
 
 These flows are Linux-oriented because they require real tunnel devices and container networking privileges.
 

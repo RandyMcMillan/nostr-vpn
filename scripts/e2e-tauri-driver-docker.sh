@@ -27,4 +27,4 @@ docker run --rm \
     cargo build -p nostr-vpn-cli -p nostr-vpn-relay; \
     pnpm --dir crates/nostr-vpn-gui exec tauri build --debug --no-bundle; \
     mkdir -p artifacts/screenshots; \
-    timeout 300s xvfb-run -a -s '-screen 0 1920x1080x24' node crates/nostr-vpn-gui/e2e-tauri/smoke.mjs"
+    timeout 420s xvfb-run -a -s '-screen 0 1920x1080x24' pnpm --dir crates/nostr-vpn-gui test:tauri-driver"

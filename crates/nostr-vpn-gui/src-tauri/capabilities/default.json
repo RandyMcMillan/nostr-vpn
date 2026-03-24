@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "deep-link:default",
     "core:window:allow-show",
     "core:window:allow-hide",
     "core:window:allow-close",

@@ -83,6 +83,7 @@ const TRAY_EXIT_NODE_NONE_MENU_ID: &str = "tray_exit_node_none";
 const TRAY_EXIT_NODE_MENU_ID_PREFIX: &str = "tray_exit_node::";
 const TRAY_QUIT_UI_MENU_ID: &str = "tray_quit_ui";
 const NVPN_BIN_ENV: &str = "NVPN_CLI_PATH";
+const NVPN_GUI_IFACE_ENV: &str = "NVPN_GUI_IFACE";
 #[cfg(target_os = "ios")]
 const NVPN_IOS_FORCE_CONNECT_ENV: &str = "NVPN_IOS_FORCE_CONNECT";
 const AUTOSTART_LAUNCH_ARG: &str = "--autostart";
@@ -96,6 +97,7 @@ const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(test)]
 const IOS_TAURI_ORIGIN: &str = "tauri://localhost";
 const NETWORK_INVITE_PREFIX: &str = "nvpn://invite/";
+const DEBUG_AUTOMATION_DEEP_LINK_PREFIX: &str = "nvpn://debug/";
 const NETWORK_INVITE_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Default)]
@@ -295,6 +297,7 @@ struct NetworkView {
     name: String,
     enabled: bool,
     network_id: String,
+    #[serde(rename = "joinRequestsEnabled")]
     listen_for_join_requests: bool,
     invite_inviter_npub: String,
     outbound_join_request: Option<OutboundJoinRequestView>,
@@ -1033,7 +1036,10 @@ impl NvpnBackend {
             });
         }
         self.persist_config_without_daemon_reload()?;
-        self.session_status = format!("Join request sent to {}.", shorten_middle(&to_npub(&recipient), 18, 12));
+        self.session_status = format!(
+            "Join request sent to {}.",
+            shorten_middle(&to_npub(&recipient), 18, 12)
+        );
         Ok(())
     }
 
@@ -1410,16 +1416,10 @@ impl NvpnBackend {
         }
     }
 
-    fn daemon_start_args(&self) -> Result<[&str; 5]> {
-        Ok([
-            "start",
-            "--daemon",
-            "--connect",
-            "--config",
-            self.config_path
-                .to_str()
-                .ok_or_else(|| anyhow!("config path is not valid UTF-8"))?,
-        ])
+    fn daemon_config_path_arg(&self) -> Result<&str> {
+        self.config_path
+            .to_str()
+            .ok_or_else(|| anyhow!("config path is not valid UTF-8"))
     }
 
     #[cfg(target_os = "android")]
@@ -1462,7 +1462,8 @@ impl NvpnBackend {
 
     #[cfg(target_os = "macos")]
     fn start_daemon_process(&mut self) -> Result<()> {
-        let args = self.daemon_start_args()?;
+        let config_path = self.daemon_config_path_arg()?;
+        let iface_override = nvpn_gui_iface_override();
 
         if let Ok(status) = self.fetch_cli_status()
             && status.daemon.running
@@ -1470,7 +1471,27 @@ impl NvpnBackend {
             return Ok(());
         }
 
-        match self.run_nvpn_command_with_admin_privileges(args) {
+        let result = if let Some(iface) = iface_override.as_deref() {
+            self.run_nvpn_command_with_admin_privileges([
+                "start",
+                "--daemon",
+                "--connect",
+                "--iface",
+                iface,
+                "--config",
+                config_path,
+            ])
+        } else {
+            self.run_nvpn_command_with_admin_privileges([
+                "start",
+                "--daemon",
+                "--connect",
+                "--config",
+                config_path,
+            ])
+        };
+
+        match result {
             Ok(()) => Ok(()),
             Err(error) if is_already_running_message(&error.to_string()) => Ok(()),
             Err(error) => Err(error),
@@ -1483,8 +1504,21 @@ impl NvpnBackend {
         not(target_os = "ios")
     ))]
     fn start_daemon_process(&mut self) -> Result<()> {
-        let args = self.daemon_start_args()?;
-        let output = self.run_nvpn_command(args)?;
+        let config_path = self.daemon_config_path_arg()?;
+        let iface_override = nvpn_gui_iface_override();
+        let output = if let Some(iface) = iface_override.as_deref() {
+            self.run_nvpn_command([
+                "start",
+                "--daemon",
+                "--connect",
+                "--iface",
+                iface,
+                "--config",
+                config_path,
+            ])?
+        } else {
+            self.run_nvpn_command(["start", "--daemon", "--connect", "--config", config_path])?
+        };
 
         if output.status.success() {
             return Ok(());
@@ -1504,7 +1538,27 @@ impl NvpnBackend {
 
         #[cfg(target_os = "linux")]
         if requires_admin_privileges(&message) {
-            match self.run_nvpn_command_with_admin_privileges(args) {
+            let escalated = if let Some(iface) = iface_override.as_deref() {
+                self.run_nvpn_command_with_admin_privileges([
+                    "start",
+                    "--daemon",
+                    "--connect",
+                    "--iface",
+                    iface,
+                    "--config",
+                    config_path,
+                ])
+            } else {
+                self.run_nvpn_command_with_admin_privileges([
+                    "start",
+                    "--daemon",
+                    "--connect",
+                    "--config",
+                    config_path,
+                ])
+            };
+
+            match escalated {
                 Ok(()) => {}
                 Err(error) if is_already_running_message(&error.to_string()) => {}
                 Err(error) => return Err(error),
@@ -2426,14 +2480,11 @@ impl NvpnBackend {
             } else {
                 Some(peer.endpoint.clone())
             };
-            let daemon_handshake_at = peer
-                .last_handshake_at
-                .and_then(epoch_secs_to_system_time)
-                .or(if peer.reachable { Some(now) } else { None });
+            let daemon_handshake_at = peer.last_handshake_at.and_then(epoch_secs_to_system_time);
             status.last_handshake_at = if daemon_handshake_at.is_some() {
                 daemon_handshake_at
-            } else if sticky_online {
-                previous_handshake_at
+            } else if effective_reachable {
+                previous_handshake_at.or(Some(now))
             } else {
                 None
             };
@@ -2941,11 +2992,13 @@ impl NvpnBackend {
                     changed = true;
                 }
             } else {
-                network.inbound_join_requests.push(PendingInboundJoinRequest {
-                    requester: event.sender_pubkey.clone(),
-                    requester_node_name,
-                    requested_at: event.requested_at,
-                });
+                network
+                    .inbound_join_requests
+                    .push(PendingInboundJoinRequest {
+                        requester: event.sender_pubkey.clone(),
+                        requester_node_name,
+                        requested_at: event.requested_at,
+                    });
                 network
                     .inbound_join_requests
                     .sort_by(|left, right| left.requester.cmp(&right.requester));
@@ -2970,10 +3023,7 @@ impl NvpnBackend {
             .iter()
             .filter_map(|network| {
                 let request = network.outbound_join_request.as_ref()?;
-                if matches!(
-                    self.peer_state_for(&request.recipient, own_pubkey_hex.as_deref()),
-                    ConfiguredPeerStatus::Online
-                ) {
+                if self.outbound_join_request_connected(request, own_pubkey_hex.as_deref()) {
                     Some(network.id.clone())
                 } else {
                     None
@@ -2994,6 +3044,32 @@ impl NvpnBackend {
         if let Err(error) = self.persist_config_without_daemon_reload() {
             eprintln!("gui: failed to clear completed join request state: {error}");
         }
+    }
+
+    fn outbound_join_request_connected(
+        &self,
+        request: &PendingOutboundJoinRequest,
+        own_pubkey_hex: Option<&str>,
+    ) -> bool {
+        if !matches!(
+            self.peer_state_for(&request.recipient, own_pubkey_hex),
+            ConfiguredPeerStatus::Online
+        ) {
+            return false;
+        }
+
+        let Some(last_handshake_at) = self
+            .peer_status
+            .get(&request.recipient)
+            .and_then(|status| status.last_handshake_at)
+        else {
+            return false;
+        };
+        let Some(requested_at) = epoch_secs_to_system_time(request.requested_at) else {
+            return false;
+        };
+
+        last_handshake_at > requested_at
     }
 
     fn lan_pairing_remaining_secs(&self) -> u64 {
@@ -3423,6 +3499,67 @@ fn extract_invite_from_deep_link(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DebugAutomationCommand {
+    RequestActiveJoin,
+    AcceptActiveJoin { requester_npub: String },
+    Tick,
+}
+
+fn debug_deep_link_query_value(value: &str, key: &str) -> Option<String> {
+    let (_, query) = value.split_once('?')?;
+    query.split('&').find_map(|entry| {
+        let (name, raw_value) = entry.split_once('=')?;
+        if name != key {
+            return None;
+        }
+        let trimmed = raw_value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed.to_string())
+    })
+}
+
+fn extract_debug_automation_command_from_deep_link(value: &str) -> Option<DebugAutomationCommand> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+
+    let trimmed = value.trim();
+    let payload = trimmed.strip_prefix(DEBUG_AUTOMATION_DEEP_LINK_PREFIX)?;
+    let action = payload.split('?').next()?.trim_matches('/');
+    match action {
+        "request-join" => Some(DebugAutomationCommand::RequestActiveJoin),
+        "accept-join" => {
+            let requester_npub = debug_deep_link_query_value(trimmed, "requester")?;
+            Some(DebugAutomationCommand::AcceptActiveJoin { requester_npub })
+        }
+        "tick" => Some(DebugAutomationCommand::Tick),
+        _ => None,
+    }
+}
+
+fn run_debug_automation_command(
+    backend: &mut NvpnBackend,
+    command: &DebugAutomationCommand,
+) -> Result<()> {
+    match command {
+        DebugAutomationCommand::RequestActiveJoin => {
+            let network_id = backend.config.active_network().id.clone();
+            backend.request_network_join(&network_id)
+        }
+        DebugAutomationCommand::AcceptActiveJoin { requester_npub } => {
+            let network_id = backend.config.active_network().id.clone();
+            backend.accept_join_request(&network_id, requester_npub)
+        }
+        DebugAutomationCommand::Tick => {
+            backend.tick();
+            Ok(())
+        }
+    }
+}
+
 fn import_network_invite_from_deep_link<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     url: &str,
@@ -3441,6 +3578,24 @@ fn import_network_invite_from_deep_link<R: tauri::Runtime>(
     Ok(true)
 }
 
+fn run_debug_automation_from_deep_link<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    url: &str,
+) -> Result<bool> {
+    let Some(command) = extract_debug_automation_command_from_deep_link(url) else {
+        return Ok(false);
+    };
+    let Some(state) = app.try_state::<AppState>() else {
+        return Err(anyhow!("application state is unavailable"));
+    };
+
+    with_backend(state, |backend| run_debug_automation_command(backend, &command))
+        .map_err(|error| anyhow!(error))?;
+    refresh_tray_menu(app);
+    let _ = show_main_window(app);
+    Ok(true)
+}
+
 fn import_network_invites_from_deep_links<R: tauri::Runtime, I, S>(
     app: &tauri::AppHandle<R>,
     urls: I,
@@ -3451,7 +3606,9 @@ where
 {
     let mut imported = 0;
     for url in urls {
-        if import_network_invite_from_deep_link(app, url.as_ref())? {
+        if import_network_invite_from_deep_link(app, url.as_ref())?
+            || run_debug_automation_from_deep_link(app, url.as_ref())?
+        {
             imported += 1;
         }
     }
@@ -4295,6 +4452,28 @@ where
 
 fn started_from_autostart() -> bool {
     started_from_autostart_args(env::args())
+}
+
+fn env_flag_is_truthy(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        let trimmed = value.trim();
+        !trimmed.is_empty()
+            && trimmed != "0"
+            && !trimmed.eq_ignore_ascii_case("false")
+            && !trimmed.eq_ignore_ascii_case("no")
+            && !trimmed.eq_ignore_ascii_case("off")
+    })
+}
+
+fn tauri_automation_enabled() -> bool {
+    env_flag_is_truthy("TAURI_AUTOMATION")
+}
+
+fn nvpn_gui_iface_override() -> Option<String> {
+    std::env::var(NVPN_GUI_IFACE_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn should_surface_existing_instance_args<I, S>(args: I) -> bool
@@ -5373,18 +5552,6 @@ fn ios_force_connect_requested() -> bool {
     env_flag_is_truthy(NVPN_IOS_FORCE_CONNECT_ENV)
 }
 
-#[cfg(target_os = "ios")]
-fn env_flag_is_truthy(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        let trimmed = value.trim();
-        !trimmed.is_empty()
-            && trimmed != "0"
-            && !trimmed.eq_ignore_ascii_case("false")
-            && !trimmed.eq_ignore_ascii_case("no")
-            && !trimmed.eq_ignore_ascii_case("off")
-    })
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     #[cfg(target_os = "ios")]
@@ -5407,26 +5574,37 @@ pub fn run() {
         .try_init();
 
     let launched_from_autostart = started_from_autostart();
-    match resolve_gui_launch_conflicts(launched_from_autostart) {
-        Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
-            terminate_gui_instances(&terminate_pids);
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        Ok(GuiLaunchDisposition::Exit) => return,
-        Err(error) => {
-            eprintln!("gui: failed to resolve GUI launch conflicts: {error}");
+    let automation_enabled = tauri_automation_enabled();
+    if !automation_enabled {
+        match resolve_gui_launch_conflicts(launched_from_autostart) {
+            Ok(GuiLaunchDisposition::Continue { terminate_pids }) => {
+                terminate_gui_instances(&terminate_pids);
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Ok(GuiLaunchDisposition::Exit) => return,
+            Err(error) => {
+                eprintln!("gui: failed to resolve GUI launch conflicts: {error}");
+            }
         }
     }
     let builder = tauri::Builder::default();
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-        if should_surface_existing_instance_args(args.iter()) {
-            let _ = show_main_window(app);
-        }
-    }));
+    let builder = if automation_enabled {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if should_surface_existing_instance_args(args.iter()) {
+                let _ = show_main_window(app);
+            }
+        }))
+    };
     #[cfg(target_os = "android")]
     let builder = builder.plugin(android_vpn::Builder::new().build());
-    let builder = builder.plugin(tauri_plugin_deep_link::init());
+    let builder = if automation_enabled {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_deep_link::init())
+    };
     let app = builder
         .on_page_load(|webview, payload| {
             #[cfg(not(target_os = "ios"))]
@@ -5488,192 +5666,196 @@ pub fn run() {
                 write_ios_probe("setup: state managed");
             }
 
-            #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
-            app.deep_link().register_all()?;
+            if !automation_enabled {
+                #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
+                app.deep_link().register_all()?;
 
-            #[cfg(target_os = "ios")]
-            {
-                eprintln!("gui: setup querying deep links");
-                write_ios_probe("setup: querying deep links");
-            }
-            if let Some(urls) = app.deep_link().get_current()?
-                && let Err(error) = import_network_invites_from_deep_links(
-                    app.handle(),
-                    urls.iter().map(|url| url.as_str()),
-                )
-            {
-                eprintln!("deep-link: failed to import startup URL: {error:#}");
-            }
-
-            let deep_link_handle = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                if let Err(error) = import_network_invites_from_deep_links(
-                    &deep_link_handle,
-                    event.urls().iter().map(|url| url.as_str()),
-                ) {
-                    eprintln!("deep-link: failed to import open URL: {error:#}");
+                #[cfg(target_os = "ios")]
+                {
+                    eprintln!("gui: setup querying deep links");
+                    write_ios_probe("setup: querying deep links");
                 }
-            });
-            #[cfg(target_os = "ios")]
-            {
-                eprintln!("gui: setup deep-link handlers ready");
-                write_ios_probe("setup: deep-link handlers ready");
-            }
+                if let Some(urls) = app.deep_link().get_current()?
+                    && let Err(error) = import_network_invites_from_deep_links(
+                        app.handle(),
+                        urls.iter().map(|url| url.as_str()),
+                    )
+                {
+                    eprintln!("deep-link: failed to import startup URL: {error:#}");
+                }
 
-            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-            app.handle().plugin(tauri_plugin_autostart::init(
-                tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                Some(vec![AUTOSTART_LAUNCH_ARG]),
-            ))?;
+                let deep_link_handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    if let Err(error) = import_network_invites_from_deep_links(
+                        &deep_link_handle,
+                        event.urls().iter().map(|url| url.as_str()),
+                    ) {
+                        eprintln!("deep-link: failed to import open URL: {error:#}");
+                    }
+                });
+                #[cfg(target_os = "ios")]
+                {
+                    eprintln!("gui: setup deep-link handlers ready");
+                    write_ios_probe("setup: deep-link handlers ready");
+                }
 
-            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-            {
-                use tauri_plugin_autostart::ManagerExt;
+                #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+                app.handle().plugin(tauri_plugin_autostart::init(
+                    tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                    Some(vec![AUTOSTART_LAUNCH_ARG]),
+                ))?;
 
-                let auto = app.handle().autolaunch();
-                let currently_enabled = auto.is_enabled().unwrap_or(false);
-                if launch_on_startup_default {
-                    if currently_enabled {
+                #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+                {
+                    use tauri_plugin_autostart::ManagerExt;
+
+                    let auto = app.handle().autolaunch();
+                    let currently_enabled = auto.is_enabled().unwrap_or(false);
+                    if launch_on_startup_default {
+                        if currently_enabled {
+                            let _ = auto.disable();
+                        }
+                        let _ = auto.enable();
+                    } else if !launch_on_startup_default && currently_enabled {
                         let _ = auto.disable();
                     }
-                    let _ = auto.enable();
-                } else if !launch_on_startup_default && currently_enabled {
-                    let _ = auto.disable();
                 }
-            }
 
-            #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
-            {
-                let tray_menu = build_tray_menu(app.handle(), &setup_tray_state)?;
+                #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+                {
+                    let tray_menu = build_tray_menu(app.handle(), &setup_tray_state)?;
 
-                let tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
-                    .tooltip("Nostr VPN")
-                    .menu(&tray_menu)
-                    .on_menu_event(|app, event| {
-                        let menu_id = event.id().as_ref();
-                        match menu_id {
-                            TRAY_OPEN_MENU_ID => {
-                                let _ = show_main_window(app);
-                            }
-                            TRAY_IDENTITY_MENU_ID => {
-                                let runtime_state = current_tray_runtime_state(app);
-                                if let Err(error) =
-                                    copy_text_to_clipboard(&runtime_state.identity_npub)
-                                {
-                                    run_tray_backend_action(app, |_backend| Err(error));
+                    let tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
+                        .tooltip("Nostr VPN")
+                        .menu(&tray_menu)
+                        .on_menu_event(|app, event| {
+                            let menu_id = event.id().as_ref();
+                            match menu_id {
+                                TRAY_OPEN_MENU_ID => {
+                                    let _ = show_main_window(app);
+                                }
+                                TRAY_IDENTITY_MENU_ID => {
+                                    let runtime_state = current_tray_runtime_state(app);
+                                    if let Err(error) =
+                                        copy_text_to_clipboard(&runtime_state.identity_npub)
+                                    {
+                                        run_tray_backend_action(app, |_backend| Err(error));
+                                        refresh_tray_menu(app);
+                                    }
+                                }
+                                TRAY_VPN_TOGGLE_MENU_ID => {
+                                    let runtime_state = current_tray_runtime_state(app);
+                                    run_tray_backend_action(app, |backend| {
+                                        if runtime_state.session_active {
+                                            backend
+                                                .disconnect_session()
+                                                .context("failed to pause VPN session")?;
+                                        } else if runtime_state.service_setup_required {
+                                            backend
+                                                .install_system_service()
+                                                .context("failed to install background service")?;
+                                            backend.tick();
+                                            if !backend.session_active {
+                                                backend
+                                                    .connect_session()
+                                                    .context("failed to resume VPN session")?;
+                                            }
+                                        } else if runtime_state.service_enable_required {
+                                            backend
+                                                .enable_system_service()
+                                                .context("failed to enable background service")?;
+                                            backend.tick();
+                                            if !backend.session_active {
+                                                backend
+                                                    .connect_session()
+                                                    .context("failed to resume VPN session")?;
+                                            }
+                                        } else {
+                                            backend
+                                                .connect_session()
+                                                .context("failed to resume VPN session")?;
+                                        }
+                                        Ok(())
+                                    });
                                     refresh_tray_menu(app);
                                 }
-                            }
-                            TRAY_VPN_TOGGLE_MENU_ID => {
-                                let runtime_state = current_tray_runtime_state(app);
-                                run_tray_backend_action(app, |backend| {
-                                    if runtime_state.session_active {
+                                TRAY_RUN_EXIT_NODE_MENU_ID => {
+                                    let runtime_state = current_tray_runtime_state(app);
+                                    run_tray_backend_action(app, |backend| {
                                         backend
-                                            .disconnect_session()
-                                            .context("failed to pause VPN session")?;
-                                    } else if runtime_state.service_setup_required {
+                                            .update_settings(SettingsPatch {
+                                                advertise_exit_node: Some(
+                                                    !runtime_state.advertise_exit_node,
+                                                ),
+                                                ..Default::default()
+                                            })
+                                            .context("failed to toggle run exit node setting")
+                                    });
+                                    refresh_tray_menu(app);
+                                }
+                                TRAY_EXIT_NODE_NONE_MENU_ID => {
+                                    run_tray_backend_action(app, |backend| {
                                         backend
-                                            .install_system_service()
-                                            .context("failed to install background service")?;
-                                        backend.tick();
-                                        if !backend.session_active {
-                                            backend
-                                                .connect_session()
-                                                .context("failed to resume VPN session")?;
-                                        }
-                                    } else if runtime_state.service_enable_required {
+                                            .update_settings(SettingsPatch {
+                                                exit_node: Some(String::new()),
+                                                ..Default::default()
+                                            })
+                                            .context("failed to clear exit node")
+                                    });
+                                    refresh_tray_menu(app);
+                                }
+                                TRAY_QUIT_UI_MENU_ID => {
+                                    app.exit(0);
+                                }
+                                _ if menu_id.starts_with(TRAY_EXIT_NODE_MENU_ID_PREFIX) => {
+                                    let selected = menu_id
+                                        .strip_prefix(TRAY_EXIT_NODE_MENU_ID_PREFIX)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    run_tray_backend_action(app, |backend| {
                                         backend
-                                            .enable_system_service()
-                                            .context("failed to enable background service")?;
-                                        backend.tick();
-                                        if !backend.session_active {
-                                            backend
-                                                .connect_session()
-                                                .context("failed to resume VPN session")?;
-                                        }
-                                    } else {
-                                        backend
-                                            .connect_session()
-                                            .context("failed to resume VPN session")?;
-                                    }
-                                    Ok(())
-                                });
-                                refresh_tray_menu(app);
+                                            .update_settings(SettingsPatch {
+                                                exit_node: Some(selected),
+                                                ..Default::default()
+                                            })
+                                            .context("failed to set exit node")
+                                    });
+                                    refresh_tray_menu(app);
+                                }
+                                _ => {}
                             }
-                            TRAY_RUN_EXIT_NODE_MENU_ID => {
-                                let runtime_state = current_tray_runtime_state(app);
-                                run_tray_backend_action(app, |backend| {
-                                    backend
-                                        .update_settings(SettingsPatch {
-                                            advertise_exit_node: Some(
-                                                !runtime_state.advertise_exit_node,
-                                            ),
-                                            ..Default::default()
-                                        })
-                                        .context("failed to toggle run exit node setting")
-                                });
-                                refresh_tray_menu(app);
+                        })
+                        .on_tray_icon_event(|tray, event| {
+                            if let TrayIconEvent::Click {
+                                button,
+                                button_state,
+                                ..
+                            } = event
+                                && button == MouseButton::Left
+                                && button_state == MouseButtonState::Up
+                            {
+                                let _ = show_main_window(tray.app_handle());
                             }
-                            TRAY_EXIT_NODE_NONE_MENU_ID => {
-                                run_tray_backend_action(app, |backend| {
-                                    backend
-                                        .update_settings(SettingsPatch {
-                                            exit_node: Some(String::new()),
-                                            ..Default::default()
-                                        })
-                                        .context("failed to clear exit node")
-                                });
-                                refresh_tray_menu(app);
-                            }
-                            TRAY_QUIT_UI_MENU_ID => {
-                                app.exit(0);
-                            }
-                            _ if menu_id.starts_with(TRAY_EXIT_NODE_MENU_ID_PREFIX) => {
-                                let selected = menu_id
-                                    .strip_prefix(TRAY_EXIT_NODE_MENU_ID_PREFIX)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                run_tray_backend_action(app, |backend| {
-                                    backend
-                                        .update_settings(SettingsPatch {
-                                            exit_node: Some(selected),
-                                            ..Default::default()
-                                        })
-                                        .context("failed to set exit node")
-                                });
-                                refresh_tray_menu(app);
-                            }
-                            _ => {}
-                        }
-                    })
-                    .on_tray_icon_event(|tray, event| {
-                        if let TrayIconEvent::Click {
-                            button,
-                            button_state,
-                            ..
-                        } = event
-                            && button == MouseButton::Left
-                            && button_state == MouseButtonState::Up
-                        {
-                            let _ = show_main_window(tray.app_handle());
-                        }
-                    });
+                        });
 
-                #[cfg(target_os = "macos")]
-                let tray_builder = if let Ok(icon) =
-                    Image::from_bytes(include_bytes!("../icons/tray-template.png"))
-                {
-                    tray_builder.icon(icon).icon_as_template(true)
-                } else {
-                    eprintln!("tray: failed to load bundled template icon");
-                    tray_builder
-                };
+                    #[cfg(target_os = "macos")]
+                    let tray_builder = if let Ok(icon) =
+                        Image::from_bytes(include_bytes!("../icons/tray-template.png"))
+                    {
+                        tray_builder.icon(icon).icon_as_template(true)
+                    } else {
+                        eprintln!("tray: failed to load bundled template icon");
+                        tray_builder
+                    };
 
-                tray_builder.build(app)?;
+                    tray_builder.build(app)?;
 
-                if launched_from_autostart {
-                    hide_main_window_to_tray(app.handle());
+                    if launched_from_autostart {
+                        hide_main_window_to_tray(app.handle());
+                    }
                 }
+            } else {
+                eprintln!("gui: automation mode active, skipping desktop shell integrations");
             }
 
             #[cfg(target_os = "ios")]
@@ -5736,15 +5918,17 @@ mod tests {
     use super::{
         ConfiguredPeerStatus, DaemonPeerState, DaemonRuntimeState, GuiLaunchDisposition,
         IOS_TAURI_ORIGIN, LAN_PAIRING_ANNOUNCEMENT_VERSION, LAN_PAIRING_DURATION_SECS,
-        NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend, ParticipantView,
-        PeerPresenceStatus, PendingLaunchAction, RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID,
-        TRAY_RUN_EXIT_NODE_MENU_ID, TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState,
-        active_network_invite_code, apply_network_invite_to_active_network,
-        bundled_nvpn_candidate_paths, cli_binary_installed_at, config_path_from_roots,
-        decode_lan_pairing_announcement, desktop_config_path_from_roots, expected_peer_count,
-        extract_json_document, gui_launch_disposition, gui_requires_service_enable,
-        gui_requires_service_install, ios_runtime_status_detail, ios_vpn_session_control_supported,
-        is_already_running_message, is_mesh_complete, is_not_running_message, network_device_count,
+        MeshJoinRequest, NETWORK_INVITE_PREFIX, NetworkInvite, NetworkView, NvpnBackend,
+        ParticipantView, PeerPresenceStatus, PendingLaunchAction, ReceivedMeshJoinRequest,
+        RuntimePlatform, TRAY_EXIT_NODE_NONE_MENU_ID, TRAY_RUN_EXIT_NODE_MENU_ID,
+        TRAY_VPN_TOGGLE_MENU_ID, TrayMenuItemSpec, TrayRuntimeState, active_network_invite_code,
+        apply_network_invite_to_active_network, bundled_nvpn_candidate_paths,
+        cli_binary_installed_at, config_path_from_roots, decode_lan_pairing_announcement,
+        desktop_config_path_from_roots, expected_peer_count, extract_json_document,
+        epoch_secs_to_system_time, gui_launch_disposition, gui_requires_service_enable,
+        gui_requires_service_install, ios_runtime_status_detail,
+        ios_vpn_session_control_supported, is_already_running_message, is_mesh_complete,
+        is_not_running_message, network_device_count,
         network_online_device_count, parse_advertised_routes_input, parse_exit_node_input,
         parse_network_invite, parse_running_gui_instances, peer_offers_exit_node,
         peer_presence_state_label, peer_state_label, pending_launch_action,
@@ -6470,21 +6654,51 @@ mod tests {
     }
 
     #[test]
-    fn tick_clears_pending_outbound_join_request_after_connection_arrives() {
+    fn tick_keeps_pending_outbound_join_request_when_connection_predates_request() {
         let inviter = "88".repeat(32);
         let mut backend = test_backend(&inviter);
         backend.config.networks[0].invite_inviter = inviter.clone();
+        let requested_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs();
         backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
             recipient: inviter.clone(),
-            requested_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("epoch")
-                .as_secs(),
+            requested_at,
         });
         backend.peer_status.insert(
             inviter.clone(),
             super::PeerLinkStatus {
                 reachable: Some(true),
+                last_handshake_at: epoch_secs_to_system_time(requested_at),
+                ..super::PeerLinkStatus::default()
+            },
+        );
+
+        backend.tick();
+
+        assert!(backend.config.networks[0].outbound_join_request.is_some());
+    }
+
+    #[test]
+    fn tick_clears_pending_outbound_join_request_after_new_connection_arrives() {
+        let inviter = "88".repeat(32);
+        let mut backend = test_backend(&inviter);
+        backend.config.networks[0].invite_inviter = inviter.clone();
+        let requested_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs()
+            .saturating_sub(5);
+        backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
+            recipient: inviter.clone(),
+            requested_at,
+        });
+        backend.peer_status.insert(
+            inviter.clone(),
+            super::PeerLinkStatus {
+                reachable: Some(true),
+                last_handshake_at: epoch_secs_to_system_time(requested_at.saturating_add(1)),
                 ..super::PeerLinkStatus::default()
             },
         );
@@ -6492,6 +6706,92 @@ mod tests {
         backend.tick();
 
         assert!(backend.config.networks[0].outbound_join_request.is_none());
+    }
+
+    #[test]
+    fn clearing_join_requests_keeps_existing_reachable_peer_without_new_handshake() {
+        let inviter = "88".repeat(32);
+        let mut backend = test_backend(&inviter);
+        backend.config.networks[0].invite_inviter = inviter.clone();
+        let requested_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs();
+        let previous_handshake_at = epoch_secs_to_system_time(requested_at.saturating_sub(10));
+        backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
+            recipient: inviter.clone(),
+            requested_at,
+        });
+        backend.session_active = true;
+        backend.peer_status.insert(
+            inviter.clone(),
+            super::PeerLinkStatus {
+                reachable: Some(true),
+                last_handshake_at: previous_handshake_at,
+                ..super::PeerLinkStatus::default()
+            },
+        );
+
+        let mut peer = daemon_peer(&inviter, true, Some(0), None, "198.51.100.10:51820");
+        peer.last_handshake_at = None;
+        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
+
+        backend.refresh_peer_runtime_status();
+        backend.clear_connected_join_requests();
+
+        assert!(backend.config.networks[0].outbound_join_request.is_some());
+        assert_eq!(backend.peer_status[&inviter].last_handshake_at, previous_handshake_at);
+    }
+
+    #[test]
+    fn clearing_join_requests_clears_when_peer_becomes_reachable_without_daemon_timestamp(
+    ) {
+        let inviter = "88".repeat(32);
+        let mut backend = test_backend(&inviter);
+        backend.config.networks[0].invite_inviter = inviter.clone();
+        let requested_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs()
+            .saturating_sub(5);
+        backend.config.networks[0].outbound_join_request = Some(PendingOutboundJoinRequest {
+            recipient: inviter.clone(),
+            requested_at,
+        });
+        backend.session_active = true;
+
+        let mut peer = daemon_peer(&inviter, true, Some(0), None, "198.51.100.10:51820");
+        peer.last_handshake_at = None;
+        backend.daemon_state = Some(daemon_state_with_peer(Some(peer), true));
+
+        backend.refresh_peer_runtime_status();
+        backend.clear_connected_join_requests();
+
+        assert!(backend.config.networks[0].outbound_join_request.is_none());
+        assert!(
+            backend.peer_status[&inviter]
+                .last_handshake_at
+                .is_some_and(|value| value > epoch_secs_to_system_time(requested_at).expect("epoch"))
+        );
+    }
+
+    #[test]
+    fn apply_join_request_event_ignores_mismatched_mesh_id() {
+        let owner = "88".repeat(32);
+        let requester = "99".repeat(32);
+        let mut backend = test_backend(&owner);
+        backend.config.networks[0].network_id = "mesh-home".to_string();
+
+        backend.apply_join_request_event(ReceivedMeshJoinRequest {
+            sender_pubkey: requester,
+            requested_at: 1_726_000_000,
+            request: MeshJoinRequest {
+                network_id: "mesh-other".to_string(),
+                requester_node_name: "alice-phone".to_string(),
+            },
+        });
+
+        assert!(backend.config.networks[0].inbound_join_requests.is_empty());
     }
 
     #[test]
@@ -6540,6 +6840,46 @@ mod tests {
             None
         );
         assert_eq!(super::extract_invite_from_deep_link("nvpn://invite/"), None);
+    }
+
+    #[test]
+    fn extract_debug_automation_command_from_deep_link_accepts_request_join_urls() {
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link("nvpn://debug/request-join"),
+            Some(super::DebugAutomationCommand::RequestActiveJoin)
+        );
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link("nvpn://debug/tick"),
+            Some(super::DebugAutomationCommand::Tick)
+        );
+    }
+
+    #[test]
+    fn extract_debug_automation_command_from_deep_link_accepts_accept_join_urls() {
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link(
+                "nvpn://debug/accept-join?requester=npub1requester"
+            ),
+            Some(super::DebugAutomationCommand::AcceptActiveJoin {
+                requester_npub: "npub1requester".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn extract_debug_automation_command_from_deep_link_ignores_invalid_urls() {
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link("nvpn://invite/payload"),
+            None
+        );
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link("nvpn://debug/accept-join"),
+            None
+        );
+        assert_eq!(
+            super::extract_debug_automation_command_from_deep_link("nvpn://debug/unknown"),
+            None
+        );
     }
 
     #[test]
@@ -6837,6 +7177,21 @@ mod tests {
         let state = backend.ui_state();
 
         assert_eq!(state.app_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn ui_state_serializes_join_request_checkbox_field_for_frontend() {
+        let backend = test_backend(&"44".repeat(32));
+        let value = serde_json::to_value(backend.ui_state()).expect("ui state should serialize");
+        let network = value["networks"][0]
+            .as_object()
+            .expect("first network should serialize as an object");
+
+        assert_eq!(
+            network.get("joinRequestsEnabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(!network.contains_key("listenForJoinRequests"));
     }
 
     #[test]

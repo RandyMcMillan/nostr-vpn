@@ -59,7 +59,9 @@ async fn mesh_join_requests_arrive_over_local_nostr_relay_without_plaintext_leak
     let mut relay_event = None;
     for _ in 0..50 {
         let events = relay.events_snapshot().await;
-        relay_event = events.into_iter().find(|event| event.pubkey == received.sender_pubkey);
+        relay_event = events
+            .into_iter()
+            .find(|event| event.pubkey == received.sender_pubkey);
         if relay_event.is_some() {
             break;
         }
@@ -67,8 +69,10 @@ async fn mesh_join_requests_arrive_over_local_nostr_relay_without_plaintext_leak
     }
 
     let event = relay_event.expect("join request event should be stored on relay");
-    assert!(!event.content.contains("mesh-home"));
-    assert!(!event.content.contains("alice-phone"));
+    let outer_event_json =
+        serde_json::to_string(&event).expect("relay event snapshot should serialize");
+    assert!(!outer_event_json.contains("mesh-home"));
+    assert!(!outer_event_json.contains("alice-phone"));
 
     listener.disconnect().await;
     relay.stop().await;

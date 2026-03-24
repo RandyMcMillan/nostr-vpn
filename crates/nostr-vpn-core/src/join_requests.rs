@@ -91,9 +91,7 @@ impl NostrJoinRequestListener {
                             SingleLetterTag::lowercase(Alphabet::P),
                             vec![self.own_pubkey.clone()],
                         )
-                        .since(
-                            Timestamp::now() - Duration::from_secs(JOIN_REQUEST_LOOKBACK_SECS),
-                        ),
+                        .since(Timestamp::now() - Duration::from_secs(JOIN_REQUEST_LOOKBACK_SECS)),
                 ],
                 None,
             )
