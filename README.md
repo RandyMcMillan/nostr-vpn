@@ -111,6 +111,28 @@ Additional automation:
 
 - `.github/workflows/windows-smoke.yml` can manually build the Windows CLI and GUI on `windows-latest`
 - `.github/workflows/release.yml` publishes Apple Silicon macOS, Windows x64, and Android arm64 APK/AAB app artifacts, plus CLI archives for Apple Silicon macOS, Windows x64, Linux x86_64, and Linux arm64
+- `scripts/publish-zapstore-android.sh` builds a signed Android APK locally and publishes it with `zsp` using `zapstore.yaml`
+
+### Publish Android to Zapstore
+
+The repo includes a committed [`zapstore.yaml`](zapstore.yaml) plus a local-only env template in `.env.zapstore.example`.
+
+Typical local flow:
+
+```bash
+cp .env.zapstore.example .env.zapstore.local
+$EDITOR .env.zapstore.local
+./scripts/publish-zapstore-android.sh
+```
+
+Notes:
+
+- the script reads the Nostr signing key from `~/.keys/nostr` by default
+- if `~/.keys/nostr-vpn-android.jks` does not exist, the script creates it locally
+- Android signing secrets are written only to a temporary `key.properties` file during the build and then removed
+- set `SKIP_PUBLISH=1` to stop after the local signed APK build and validation steps
+- set `INSTALL_ON_DEVICE=1` to install the APK over `adb`
+- set `CAPTURE_SCREENSHOT=1` to save a screenshot to `artifacts/android/nostr-vpn-home.png`
 
 If you touch the Tauri shell:
 
