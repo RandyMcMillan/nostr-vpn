@@ -73,7 +73,6 @@ const PEER_PRESENCE_GRACE_SECS: u64 = 45;
 const SERVICE_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const TRAY_ICON_ID: &str = "nvpn-tray";
 const TRAY_OPEN_MENU_ID: &str = "tray_open_main";
-const TRAY_IDENTITY_MENU_ID: &str = "tray_identity";
 const TRAY_THIS_DEVICE_MENU_ID: &str = "tray_this_device";
 const TRAY_VPN_TOGGLE_MENU_ID: &str = "tray_vpn_toggle";
 const TRAY_RUN_EXIT_NODE_MENU_ID: &str = "tray_run_exit_node";
@@ -443,8 +442,6 @@ struct TrayRuntimeState {
     service_setup_required: bool,
     service_enable_required: bool,
     status_text: String,
-    identity_npub: String,
-    identity_text: String,
     this_device_text: String,
     this_device_copy_value: String,
     advertise_exit_node: bool,
@@ -459,8 +456,6 @@ impl Default for TrayRuntimeState {
             service_setup_required: false,
             service_enable_required: false,
             status_text: "Disconnected".to_string(),
-            identity_npub: String::new(),
-            identity_text: tray_identity_text(""),
             this_device_text: "This Device: unavailable".to_string(),
             this_device_copy_value: String::new(),
             advertise_exit_node: false,
@@ -3260,11 +3255,6 @@ impl NvpnBackend {
 
     fn tray_runtime_state(&self) -> TrayRuntimeState {
         let networks = self.network_rows();
-        let identity = self
-            .config
-            .own_nostr_pubkey_hex()
-            .map(|hex| to_npub(&hex))
-            .unwrap_or_else(|_| self.config.nostr.public_key.clone());
         let service_setup_required = self.gui_requires_service_install();
         let service_enable_required = self.gui_requires_service_enable();
         let this_device_tunnel_ip = display_tunnel_ip(&self.config.node.tunnel_ip);
@@ -3279,8 +3269,6 @@ impl NvpnBackend {
                 service_enable_required,
                 &self.session_status,
             ),
-            identity_npub: identity.clone(),
-            identity_text: tray_identity_text(&identity),
             this_device_text: format!(
                 "This Device: {} ({})",
                 self.config.node_name, this_device_tunnel_ip
@@ -3472,6 +3460,30 @@ fn extract_invite_from_deep_link(value: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+fn extract_app_deep_links_from_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut urls = Vec::new();
+    let mut seen = HashSet::new();
+    for arg in args {
+        let value = arg.as_ref().trim();
+        if value.is_empty() {
+            continue;
+        }
+        if extract_invite_from_deep_link(value).is_none()
+            && extract_debug_automation_command_from_deep_link(value).is_none()
+        {
+            continue;
+        }
+        if seen.insert(value.to_string()) {
+            urls.push(value.to_string());
+        }
+    }
+    urls
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4608,15 +4620,6 @@ fn tray_vpn_toggle_text(session_active: bool) -> &'static str {
     }
 }
 
-fn tray_identity_text(identity_npub: &str) -> String {
-    let identity_npub = identity_npub.trim();
-    if identity_npub.is_empty() {
-        "Copy npub unavailable".to_string()
-    } else {
-        format!("Copy {}", short_text(identity_npub, 16, 8))
-    }
-}
-
 fn copy_text_to_clipboard(text: &str) -> Result<()> {
     let text = text.trim();
     if text.is_empty() {
@@ -4844,11 +4847,6 @@ fn tray_menu_spec(runtime_state: &TrayRuntimeState) -> Vec<TrayMenuItemSpec> {
             enabled: true,
         },
         TrayMenuItemSpec::Separator,
-        TrayMenuItemSpec::Text {
-            id: Some(TRAY_IDENTITY_MENU_ID.to_string()),
-            text: runtime_state.identity_text.clone(),
-            enabled: !runtime_state.identity_npub.trim().is_empty(),
-        },
         TrayMenuItemSpec::Text {
             id: Some(TRAY_THIS_DEVICE_MENU_ID.to_string()),
             text: runtime_state.this_device_text.clone(),
@@ -5521,6 +5519,15 @@ pub fn run() {
         builder
     } else {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let deep_link_urls = extract_app_deep_links_from_args(args.iter());
+            if !deep_link_urls.is_empty()
+                && let Err(error) = import_network_invites_from_deep_links(
+                    app,
+                    deep_link_urls.iter().map(|url| url.as_str()),
+                )
+            {
+                eprintln!("deep-link: failed to import existing-instance URL: {error:#}");
+            }
             if should_surface_existing_instance_args(args.iter()) {
                 let _ = show_main_window(app);
             }
@@ -5603,10 +5610,20 @@ pub fn run() {
                     eprintln!("gui: setup querying deep links");
                     write_ios_probe("setup: querying deep links");
                 }
-                if let Some(urls) = app.deep_link().get_current()?
+                let mut startup_urls = extract_app_deep_links_from_args(env::args());
+                if let Some(urls) = app.deep_link().get_current()? {
+                    for url in urls {
+                        let url = url.as_str().trim();
+                        if url.is_empty() || startup_urls.iter().any(|existing| existing == url) {
+                            continue;
+                        }
+                        startup_urls.push(url.to_string());
+                    }
+                }
+                if !startup_urls.is_empty()
                     && let Err(error) = import_network_invites_from_deep_links(
                         app.handle(),
-                        urls.iter().map(|url| url.as_str()),
+                        startup_urls.iter().map(|url| url.as_str()),
                     )
                 {
                     eprintln!("deep-link: failed to import startup URL: {error:#}");
@@ -5661,15 +5678,6 @@ pub fn run() {
                             match menu_id {
                                 TRAY_OPEN_MENU_ID => {
                                     let _ = show_main_window(app);
-                                }
-                                TRAY_IDENTITY_MENU_ID => {
-                                    let runtime_state = current_tray_runtime_state(app);
-                                    if let Err(error) =
-                                        copy_text_to_clipboard(&runtime_state.identity_npub)
-                                    {
-                                        run_tray_backend_action(app, |_backend| Err(error));
-                                        refresh_tray_menu(app);
-                                    }
                                 }
                                 TRAY_THIS_DEVICE_MENU_ID => {
                                     let runtime_state = current_tray_runtime_state(app);
@@ -5873,8 +5881,8 @@ mod tests {
         should_defer_gui_daemon_start_until_first_tick, should_start_gui_daemon_on_launch,
         should_surface_existing_instance_args, started_from_autostart_args,
         strip_windows_verbatim_prefix, tauri_protocol_request_path, to_npub,
-        tray_exit_node_entries, tray_identity_text, tray_menu_spec, tray_network_groups,
-        tray_status_text, tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
+        tray_exit_node_entries, tray_menu_spec, tray_network_groups, tray_status_text,
+        tray_vpn_status_menu_text, tray_vpn_toggle_text, validate_nvpn_binary,
         windows_daemon_config_import_args, windows_elevated_config_import_args,
         windows_should_use_daemon_owned_config_apply, within_peer_online_grace,
         within_peer_presence_grace,
@@ -6885,6 +6893,22 @@ mod tests {
     }
 
     #[test]
+    fn extract_app_deep_links_from_args_collects_invite_and_debug_urls() {
+        let invite = format!("{NETWORK_INVITE_PREFIX}payload-123");
+        assert_eq!(
+            super::extract_app_deep_links_from_args([
+                "nostr-vpn-gui.exe",
+                &invite,
+                "--autostart",
+                "nvpn://debug/request-join",
+                &invite,
+                "https://example.com",
+            ]),
+            vec![invite, "nvpn://debug/request-join".to_string()]
+        );
+    }
+
+    #[test]
     fn extract_debug_automation_command_from_deep_link_accepts_request_join_urls() {
         assert_eq!(
             super::extract_debug_automation_command_from_deep_link("nvpn://debug/request-join"),
@@ -7080,24 +7104,12 @@ mod tests {
     }
 
     #[test]
-    fn tray_identity_text_formats_copy_action() {
-        assert_eq!(
-            tray_identity_text("npub1j4c4x0w2g6q3jz9q8ruy6xw0jfs6w8szk8dks3l8h0f5syv2sgzq9w8m7n"),
-            "Copy npub1j4c4x0w2g6q...zq9w8m7n"
-        );
-        assert_eq!(tray_identity_text(""), "Copy npub unavailable");
-    }
-
-    #[test]
     fn tray_menu_spec_puts_status_first_and_settings_last() {
         let spec = tray_menu_spec(&TrayRuntimeState {
             session_active: true,
             service_setup_required: false,
             service_enable_required: false,
             status_text: tray_status_text(true, false, false, "Connected"),
-            identity_npub: "npub1j4c4x0w2g6q3jz9q8ruy6xw0jfs6w8szk8dks3l8h0f5syv2sgzq9w8m7n"
-                .to_string(),
-            identity_text: "Copy npub1j4c4x0w2g6q...zq9w8m7n".to_string(),
             this_device_text: "This Device: sirius (10.44.0.10)".to_string(),
             this_device_copy_value: "10.44.0.10".to_string(),
             advertise_exit_node: false,
