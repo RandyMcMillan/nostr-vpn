@@ -31,6 +31,7 @@ SCREENSHOT_PATH="${SCREENSHOT_PATH:-${REPO_ROOT}/artifacts/android/nostr-vpn-hom
 SKIP_PUBLISH="${SKIP_PUBLISH:-0}"
 PNPM_STORE_DIR="${PNPM_STORE_DIR:-${HOME}/.pnpm-store}"
 LINK_SIGNING_CERT="${LINK_SIGNING_CERT:-}"
+ZAPSTORE_IDENTITY_RELAY="${ZAPSTORE_IDENTITY_RELAY:-wss://relay.zapstore.dev}"
 
 if [ -z "${LINK_SIGNING_CERT}" ]; then
   if [ "${SKIP_PUBLISH}" = "1" ]; then
@@ -158,7 +159,8 @@ keytool -importkeystore \
   -destalias "${ANDROID_KEY_ALIAS}"
 
 if [ "${LINK_SIGNING_CERT}" = "1" ]; then
-  KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD}" zsp identity --link-key "${TEMP_P12_PATH}"
+  KEYSTORE_PASSWORD="${ANDROID_KEYSTORE_PASSWORD}" \
+    zsp identity --link-key "${TEMP_P12_PATH}" --relays "${ZAPSTORE_IDENTITY_RELAY}"
 fi
 
 zsp utils extract-apk "${APK_PATH}" >/dev/null
