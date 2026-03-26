@@ -3221,6 +3221,10 @@ fn relay_connection_action(
     }
 }
 
+fn should_prune_stale_presence(relays_paused_for_mesh: bool, mesh_ready: bool) -> bool {
+    !(relays_paused_for_mesh && mesh_ready)
+}
+
 fn daemon_session_active(session_enabled: bool, expected_peers: usize) -> bool {
     session_enabled && expected_peers > 0
 }
@@ -4419,10 +4423,22 @@ async fn connect_session(args: ConnectArgs) -> Result<()> {
             }
             _ = announce_interval.tick() => {
                 let now = unix_timestamp();
-                let removed = presence.prune_stale(
+                let mesh_ready_before_prune = should_pause_relays_for_mesh(
+                    &app,
+                    own_pubkey.as_deref(),
+                    expected_peers,
+                    &presence,
+                    &tunnel_runtime,
                     now,
-                    peer_signal_timeout_secs(args.announce_interval_secs),
                 );
+                let removed = if should_prune_stale_presence(
+                    relays_paused_for_mesh,
+                    mesh_ready_before_prune,
+                ) {
+                    presence.prune_stale(now, peer_signal_timeout_secs(args.announce_interval_secs))
+                } else {
+                    Vec::new()
+                };
                 for participant in &removed {
                     outbound_announces.forget(participant);
                 }
@@ -4787,6 +4803,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
         "Connecting to relays".to_string()
     };
     let mut relay_connected = false;
+    let mut relays_paused_for_mesh = false;
     let mut reconnect_attempt = 0u32;
     let mut reconnect_due = Instant::now()
         + if restored_peer_cache && app.auto_disconnect_relays_when_mesh_ready {
@@ -4846,6 +4863,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                     RelayConnectionAction::StayPausedForMesh => {
                         reconnect_attempt = 0;
                         reconnect_due = Instant::now();
+                        relays_paused_for_mesh = true;
                         session_status = MESH_READY_RELAYS_PAUSED_STATUS.to_string();
                         continue;
                     }
@@ -4864,6 +4882,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 match client.connect(&relays).await {
                     Ok(()) => {
                         relay_connected = true;
+                        relays_paused_for_mesh = false;
                         reconnect_attempt = 0;
                         session_status = if session_active {
                             "Connected".to_string()
@@ -5291,6 +5310,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                 match client.connect(&relays).await {
                                                     Ok(()) => {
                                                         relay_connected = true;
+                                                        relays_paused_for_mesh = false;
                                                         reconnect_attempt = 0;
                                                         reconnect_due = Instant::now();
                                                         session_status = if session_active {
@@ -5328,6 +5348,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                     }
                                                     Err(error) => {
                                                         relay_connected = false;
+                                                        relays_paused_for_mesh = false;
                                                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                                                         let delay = daemon_reconnect_backoff_delay(reconnect_attempt);
                                                         reconnect_due = Instant::now() + delay;
@@ -5340,6 +5361,7 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                                                 }
                                             } else {
                                                 relay_connected = false;
+                                                relays_paused_for_mesh = false;
                                                 reconnect_attempt = 0;
                                                 reconnect_due = Instant::now();
                                                 port_mapping_runtime.stop().await;
@@ -5425,10 +5447,25 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 }
                 if daemon_session_active(session_enabled, expected_peers) {
                     let now = unix_timestamp();
-                    let removed = presence.prune_stale(
+                    let mesh_ready_before_prune = should_pause_relays_for_mesh(
+                        &app,
+                        own_pubkey.as_deref(),
+                        expected_peers,
+                        &presence,
+                        &tunnel_runtime,
                         now,
-                        peer_signal_timeout_secs(args.announce_interval_secs),
                     );
+                    let removed = if should_prune_stale_presence(
+                        relays_paused_for_mesh,
+                        mesh_ready_before_prune,
+                    ) {
+                        presence.prune_stale(
+                            now,
+                            peer_signal_timeout_secs(args.announce_interval_secs),
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     for participant in &removed {
                         outbound_announces.forget(participant);
                     }
@@ -5484,9 +5521,12 @@ async fn daemon_session(args: DaemonArgs) -> Result<()> {
                 {
                     client.disconnect().await;
                     relay_connected = false;
+                    relays_paused_for_mesh = true;
                     reconnect_attempt = 0;
                     reconnect_due = Instant::now();
                     session_status = MESH_READY_RELAYS_PAUSED_STATUS.to_string();
+                } else if relays_paused_for_mesh && !mesh_ready {
+                    relays_paused_for_mesh = false;
                 }
                 if let Err(error) = write_daemon_peer_cache_if_changed(
                     DaemonPeerCacheWrite {
@@ -9856,8 +9896,8 @@ mod tests {
         relay_connection_action, request_daemon_reload, request_daemon_stop,
         restore_daemon_peer_cache, route_targets_for_tunnel_peers,
         route_targets_require_endpoint_bypass, runtime_local_signal_endpoint,
-        stage_daemon_config_apply, take_daemon_control_request, uninstall_cli,
-        update_daemon_config_from_staged_request, utun_interface_candidates,
+        should_prune_stale_presence, stage_daemon_config_apply, take_daemon_control_request,
+        uninstall_cli, update_daemon_config_from_staged_request, utun_interface_candidates,
         windows_service_bin_path, windows_service_disabled_from_qc_output,
         windows_service_status_from_query_output, windows_should_apply_config_via_service,
         write_daemon_peer_cache,
@@ -11139,6 +11179,14 @@ mod tests {
             relay_connection_action(true, false, true, true),
             super::RelayConnectionAction::ReconnectWhenDue
         );
+    }
+
+    #[test]
+    fn paused_mesh_skips_stale_presence_prune() {
+        assert!(!should_prune_stale_presence(true, true));
+        assert!(should_prune_stale_presence(true, false));
+        assert!(should_prune_stale_presence(false, true));
+        assert!(should_prune_stale_presence(false, false));
     }
 
     #[test]
