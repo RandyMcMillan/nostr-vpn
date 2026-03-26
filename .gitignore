@@ -9,6 +9,7 @@ crates/nostr-vpn-gui/src-tauri/gen/android/key.properties
 *.swp
 .pnpm-store/
 artifacts/
+.env.release.local
 .env.zapstore.local
 crates/nostr-vpn-gui/src-tauri/icons/android/
 crates/nostr-vpn-gui/src-tauri/icons/ios/
