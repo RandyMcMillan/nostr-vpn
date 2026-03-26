@@ -2852,7 +2852,7 @@ impl NvpnBackend {
             .elapsed()
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(0);
-        format!("nostr seen {age_secs}s ago")
+        format!("nostr seen {}", compact_age_text(age_secs))
     }
 
     fn peer_state_for(
@@ -2911,7 +2911,7 @@ impl NvpnBackend {
                     .map(|elapsed| elapsed.as_secs());
 
                 match handshake_age {
-                    Some(age_secs) => format!("online (handshake {age_secs}s ago)"),
+                    Some(age_secs) => format!("online (handshake {})", compact_age_text(age_secs)),
                     None => "online".to_string(),
                 }
             }
@@ -2948,15 +2948,16 @@ impl NvpnBackend {
                     match checked_age {
                         Some(age_secs) => {
                             format!(
-                                "offline ({}, {age_secs}s ago)",
-                                shorten_middle(error, 18, 8)
+                                "offline ({}, {})",
+                                shorten_middle(error, 18, 8),
+                                compact_age_text(age_secs)
                             )
                         }
                         None => format!("offline ({})", shorten_middle(error, 18, 8)),
                     }
                 } else {
                     match checked_age {
-                        Some(age_secs) => format!("offline ({age_secs}s ago)"),
+                        Some(age_secs) => format!("offline ({})", compact_age_text(age_secs)),
                         None => "offline".to_string(),
                     }
                 }
@@ -3158,7 +3159,7 @@ impl NvpnBackend {
                     network_name: peer.network_name,
                     network_id: peer.network_id,
                     invite: peer.invite,
-                    last_seen_text: format!("{last_seen_secs}s ago"),
+                    last_seen_text: compact_age_text(last_seen_secs),
                 }
             })
             .collect()
@@ -4100,12 +4101,31 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+fn compact_age_text(age_secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+
+    match age_secs {
+        0..MINUTE => format!("{age_secs}s ago"),
+        MINUTE..HOUR => format!("{}m ago", age_secs / MINUTE),
+        HOUR..DAY => format!("{}h ago", age_secs / HOUR),
+        DAY..WEEK => format!("{}d ago", age_secs / DAY),
+        WEEK..MONTH => format!("{}w ago", age_secs / WEEK),
+        MONTH..YEAR => format!("{}mo ago", age_secs / MONTH),
+        _ => format!("{}y ago", age_secs / YEAR),
+    }
+}
+
 fn join_request_age_text(requested_at: u64) -> String {
     let age_secs = epoch_secs_to_system_time(requested_at)
         .and_then(|requested_at| requested_at.elapsed().ok())
         .map(|elapsed| elapsed.as_secs())
         .unwrap_or(0);
-    format!("{age_secs}s ago")
+    compact_age_text(age_secs)
 }
 
 fn shorten_middle(value: &str, head: usize, tail: usize) -> String {
@@ -6956,7 +6976,7 @@ mod tests {
                 network_name: "Home".to_string(),
                 network_id: "mesh-home".to_string(),
                 invite: invite.clone(),
-                last_seen: SystemTime::now() - Duration::from_secs(2),
+                last_seen: SystemTime::now() - Duration::from_secs(64_000),
             },
         );
 
@@ -6966,6 +6986,19 @@ mod tests {
         assert_eq!(rows[0].network_name, "Home");
         assert_eq!(rows[0].network_id, "mesh-home");
         assert_eq!(rows[0].invite, invite);
+        assert_eq!(rows[0].last_seen_text, "17h ago");
+    }
+
+    #[test]
+    fn compact_age_text_uses_larger_units_for_longer_durations() {
+        assert_eq!(super::compact_age_text(59), "59s ago");
+        assert_eq!(super::compact_age_text(60), "1m ago");
+        assert_eq!(super::compact_age_text(3_600), "1h ago");
+        assert_eq!(super::compact_age_text(64_000), "17h ago");
+        assert_eq!(super::compact_age_text(86_400), "1d ago");
+        assert_eq!(super::compact_age_text(604_800), "1w ago");
+        assert_eq!(super::compact_age_text(2_592_000), "1mo ago");
+        assert_eq!(super::compact_age_text(31_536_000), "1y ago");
     }
 
     #[test]

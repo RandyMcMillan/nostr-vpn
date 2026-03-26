@@ -251,7 +251,7 @@ async function main() {
       DRIVER_BASE,
       sessionId,
       '[data-testid="participant-status-text"]',
-      /nostr seen \d+s ago/i,
+      /nostr seen \d+(?:s|m|h|d|w|mo|y) ago/i,
       'participant presence text',
       30_000,
     )
